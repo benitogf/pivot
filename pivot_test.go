@@ -131,6 +131,7 @@ func ReadThing(t *testing.T, server *katamari.Server, token string, thingID stri
 	var object objects.Object
 
 	err = json.Unmarshal([]byte(body), &object)
+	require.NoError(t, err)
 	aux, err = base64.StdEncoding.DecodeString(object.Data)
 	require.NoError(t, err)
 	return aux
