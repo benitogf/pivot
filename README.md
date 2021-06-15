@@ -1,5 +1,8 @@
 # Pivot
 
+[![Test](https://github.com/benitogf/pivot/actions/workflows/tests.yml/badge.svg)](https://github.com/benitogf/pivot/actions/workflows/tests.yml)
+
+
 A way to synchronize multiple instances of a katamari server
 
 https://storage.googleapis.com/pub-tools-public-publication-data/pdf/65b514eda12d025585183a641b5a9e096a3c4be5.pdf
