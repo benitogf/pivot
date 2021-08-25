@@ -9,12 +9,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/benitogf/katamari"
 	"github.com/benitogf/katamari/key"
 	"github.com/benitogf/katamari/objects"
 	"github.com/gorilla/mux"
 )
+
+var Mu sync.Mutex
 
 // ActivityEntry keeps the time of the last entry
 type ActivityEntry struct {
@@ -399,6 +402,8 @@ func synchronizeItem(client *http.Client, storage katamari.Database, pivot strin
 
 // Synchronize a list of keys
 func Synchronize(client *http.Client, storage katamari.Database, pivot string, keys []string) error {
+	// prevent simultaneous sync operations
+	Mu.Lock()
 	update := false
 	for _, key := range keys {
 		errItem := synchronizeItem(client, storage, pivot, key)
@@ -407,8 +412,10 @@ func Synchronize(client *http.Client, storage katamari.Database, pivot string, k
 		}
 	}
 	if update {
+		Mu.Unlock()
 		return nil
 	}
+	Mu.Unlock()
 	return errors.New("nothing to synchronize")
 }
 
@@ -440,7 +447,7 @@ func SyncWriteFilter(client *http.Client, pivotIP string, getNodes GetNodes) kat
 		// log.Println("sync write", index)
 		if pivotIP == "" {
 			for _, node := range getNodes() {
-				go TriggerNodeSync(client, node)
+				TriggerNodeSync(client, node)
 			}
 		}
 	}
@@ -451,7 +458,7 @@ func SyncDeleteFilter(client *http.Client, pivotIP string, storage katamari.Data
 	return func(index string) error {
 		if pivotIP == "" {
 			for _, node := range getNodes() {
-				go TriggerNodeSync(client, node)
+				TriggerNodeSync(client, node)
 			}
 		}
 
