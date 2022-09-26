@@ -2,9 +2,7 @@ package pivot_test
 
 import (
 	"bytes"
-	"encoding/base64"
-	"encoding/json"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -15,6 +13,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cristalhq/base64"
+	"github.com/goccy/go-json"
 
 	"github.com/benitogf/auth"
 	"github.com/benitogf/jsonpatch"
@@ -72,7 +73,7 @@ func CreateThing(t *testing.T, server *katamari.Server, token string, ip string)
 	response := w.Result()
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	// Read return value of Creation
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
 	var thingObj objects.Object
 	err = json.Unmarshal([]byte(body), &thingObj)
@@ -126,7 +127,7 @@ func ReadThing(t *testing.T, server *katamari.Server, token string, thingID stri
 	require.Equal(t, http.StatusOK, response.StatusCode)
 
 	// Decode data to json object
-	body, err := ioutil.ReadAll(response.Body)
+	body, err := io.ReadAll(response.Body)
 	require.NoError(t, err)
 	var object objects.Object
 
