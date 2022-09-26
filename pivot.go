@@ -2,14 +2,15 @@ package pivot
 
 import (
 	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/cristalhq/base64"
+	"github.com/goccy/go-json"
 
 	"github.com/benitogf/katamari"
 	"github.com/benitogf/katamari/key"
