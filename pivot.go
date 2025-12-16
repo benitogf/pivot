@@ -9,12 +9,11 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cristalhq/base64"
 	"github.com/goccy/go-json"
 
-	"github.com/benitogf/katamari"
-	"github.com/benitogf/katamari/key"
-	"github.com/benitogf/katamari/objects"
+	"github.com/benitogf/ooo"
+	"github.com/benitogf/ooo/key"
+	"github.com/benitogf/ooo/meta"
 	"github.com/gorilla/mux"
 )
 
@@ -35,7 +34,7 @@ func max(a, b int64) int64 {
 	return b
 }
 
-func lastActivity(objs []objects.Object) int64 {
+func lastActivity(objs []meta.Object) int64 {
 	if len(objs) > 0 {
 		return max(objs[0].Created, objs[0].Updated)
 	}
@@ -43,20 +42,20 @@ func lastActivity(objs []objects.Object) int64 {
 	return 0
 }
 
-func checkLastDelete(storage katamari.Database, lastEntry int64, key string) int64 {
+func checkLastDelete(storage ooo.Database, lastEntry int64, key string) int64 {
 	lastDelete, err := storage.Get("pivot:" + key)
 	if err != nil {
 		// log.Println("failed to get last delete of ", key, err)
 		return lastEntry
 	}
 
-	obj, err := objects.DecodeRaw(lastDelete)
+	obj, err := meta.Decode(lastDelete)
 	if err != nil {
 		// log.Println("failed to decode object of last delete for ", key, lastDelete, err)
 		return lastEntry
 	}
 
-	lastDeleteNum, err := strconv.Atoi(obj.Data)
+	lastDeleteNum, err := strconv.Atoi(string(obj.Data))
 	if err != nil {
 		// log.Println("failed to decode last delete of ", key, lastDelete, err)
 		return lastEntry
@@ -65,7 +64,7 @@ func checkLastDelete(storage katamari.Database, lastEntry int64, key string) int
 	return max(lastEntry, int64(lastDeleteNum))
 }
 
-func checkActivity(storage katamari.Database, _key string) (ActivityEntry, error) {
+func checkActivity(storage ooo.Database, _key string) (ActivityEntry, error) {
 	var activity ActivityEntry
 	entries, err := storage.Get(_key)
 	if err != nil {
@@ -76,10 +75,7 @@ func checkActivity(storage katamari.Database, _key string) (ActivityEntry, error
 
 	if key.LastIndex(_key) == "*" {
 		baseKey = strings.Replace(_key, "/*", "", 1)
-		objs, err := objects.DecodeListRaw(entries)
-		if _key != "users/*" {
-			objs, err = objects.DecodeListData(objs)
-		}
+		objs, err := meta.DecodeList(entries)
 		if err != nil {
 			// log.Println("failed to decode "+_key+" objects list", err)
 			return activity, err
@@ -89,7 +85,7 @@ func checkActivity(storage katamari.Database, _key string) (ActivityEntry, error
 		return activity, nil
 	}
 
-	obj, err := objects.DecodeRaw(entries)
+	obj, err := meta.Decode(entries)
 	if err != nil {
 		// log.Println("failed to decode "+_key+" objects list", err)
 		return activity, err
@@ -118,8 +114,8 @@ func checkPivotActivity(client *http.Client, pivot string, key string) (Activity
 	return activity, err
 }
 
-func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]objects.Object, error) {
-	var objs []objects.Object
+func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]meta.Object, error) {
+	var objs []meta.Object
 	resp, err := client.Get("http://" + pivot + "/" + key)
 	if err != nil {
 		// log.Println("failed to get "+key+" from pivot", err)
@@ -131,13 +127,9 @@ func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]objec
 		return objs, errors.New("failed to get " + key + " from pivot " + resp.Status)
 	}
 
-	objs, err = objects.DecodeListFromReader(resp.Body)
+	objs, err = meta.DecodeListFromReader(resp.Body)
 	if err != nil {
 		return objs, err
-	}
-
-	if key != "users/*" {
-		return objects.DecodeListData(objs)
 	}
 
 	return objs, nil
@@ -159,8 +151,8 @@ func TriggerNodeSync(client *http.Client, node string) {
 	}
 }
 
-func getEntryFromPivot(client *http.Client, pivot string, key string) (objects.Object, error) {
-	var obj objects.Object
+func getEntryFromPivot(client *http.Client, pivot string, key string) (meta.Object, error) {
+	var obj meta.Object
 	resp, err := client.Get("http://" + pivot + "/" + key)
 	if err != nil {
 		// log.Println("failed to get "+key+" from pivot", err)
@@ -172,11 +164,11 @@ func getEntryFromPivot(client *http.Client, pivot string, key string) (objects.O
 		return obj, errors.New("failed to get " + key + " from pivot " + resp.Status)
 	}
 
-	return objects.DecodeFromReader(resp.Body)
+	return meta.DecodeFromReader(resp.Body)
 }
 
 // get from pivot and write to local
-func syncLocalEntries(client *http.Client, storage katamari.Database, pivot string, _key string, lastEntry int64) error {
+func syncLocalEntries(client *http.Client, storage ooo.Database, pivot string, _key string, lastEntry int64) error {
 	if key.LastIndex(_key) == "*" {
 		baseKey := strings.Replace(_key, "/*", "", 1)
 		objsPivot, err := getEntriesFromPivot(client, pivot, _key)
@@ -191,10 +183,7 @@ func syncLocalEntries(client *http.Client, storage katamari.Database, pivot stri
 			return err
 		}
 
-		objsLocal, err := objects.DecodeListRaw(localData)
-		if _key != "users/*" {
-			objsLocal, err = objects.DecodeListData(objsLocal)
-		}
+		objsLocal, err := meta.DecodeList(localData)
 		if err != nil {
 			// log.Println("sync local " + _key + " failed to decode local entries")
 			return err
@@ -207,15 +196,12 @@ func syncLocalEntries(client *http.Client, storage katamari.Database, pivot stri
 
 		objsToSend := getEntriesPositiveDiff(objsLocal, objsPivot)
 		for _, obj := range objsToSend {
-			if _key != "users/*" {
-				obj.Data = base64.StdEncoding.EncodeToString([]byte(obj.Data))
-			}
-			storage.Pivot(baseKey+"/"+obj.Index, obj.Data, obj.Created, obj.Updated)
+			storage.SetWithMeta(baseKey+"/"+obj.Index, obj.Data, obj.Created, obj.Updated)
 			// if err != nil {
 			// 	log.Println("failed to store entry from pivot", err)
 			// }
 		}
-		storage.Set("pivot:"+baseKey, strconv.FormatInt(lastEntry, 10))
+		storage.Set("pivot:"+baseKey, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
 		return nil
 	}
 
@@ -224,16 +210,16 @@ func syncLocalEntries(client *http.Client, storage katamari.Database, pivot stri
 		// log.Println("sync local " + _key + " failed to get from pivot")
 		return err
 	}
-	storage.Pivot(_key, obj.Data, obj.Created, obj.Updated)
+	storage.SetWithMeta(_key, obj.Data, obj.Created, obj.Updated)
 	// if err != nil {
 	// 	log.Println("failed to store entry from pivot", err)
 	// }
-	storage.Set("pivot:"+_key, strconv.FormatInt(lastEntry, 10))
+	storage.Set("pivot:"+_key, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
 
 	return nil
 }
 
-func sendToPivot(client *http.Client, key string, pivot string, obj objects.Object) error {
+func sendToPivot(client *http.Client, key string, pivot string, obj meta.Object) error {
 	buf := new(bytes.Buffer)
 	json.NewEncoder(buf).Encode(obj)
 	resp, err := client.Post("http://"+pivot+"/pivot/"+key, "application/json", buf)
@@ -275,7 +261,7 @@ func sendDelete(client *http.Client, key, pivot string, lastEntry int64) error {
 	return nil
 }
 
-func getEntriesNegativeDiff(objsDst, objsSrc []objects.Object) []string {
+func getEntriesNegativeDiff(objsDst, objsSrc []meta.Object) []string {
 	var result []string
 	for _, objDst := range objsDst {
 		found := false
@@ -292,8 +278,8 @@ func getEntriesNegativeDiff(objsDst, objsSrc []objects.Object) []string {
 	return result
 }
 
-func getEntriesPositiveDiff(objsDst, objsSrc []objects.Object) []objects.Object {
-	var result []objects.Object
+func getEntriesPositiveDiff(objsDst, objsSrc []meta.Object) []meta.Object {
+	var result []meta.Object
 	for _, objSrc := range objsSrc {
 		needsUpdate := false
 		found := false
@@ -314,7 +300,7 @@ func getEntriesPositiveDiff(objsDst, objsSrc []objects.Object) []objects.Object 
 }
 
 // get from local and send to pivot (updates only, no new entries or deletes)
-func syncPivotEntries(client *http.Client, storage katamari.Database, pivot string, _key string, lastEntry int64) error {
+func syncPivotEntries(client *http.Client, storage ooo.Database, pivot string, _key string, lastEntry int64) error {
 	localData, err := storage.Get(_key)
 	if err != nil {
 		// log.Println("sync pivot " + _key + " failed to read local entries")
@@ -322,10 +308,7 @@ func syncPivotEntries(client *http.Client, storage katamari.Database, pivot stri
 	}
 	if key.LastIndex(_key) == "*" {
 		baseKey := strings.Replace(_key, "/*", "", 1)
-		objsLocal, err := objects.DecodeListRaw(localData)
-		if _key != "users/*" {
-			objsLocal, err = objects.DecodeListData(objsLocal)
-		}
+		objsLocal, err := meta.DecodeList(localData)
 		if err != nil {
 			// log.Println("sync pivot " + _key + " failed to decode local entries")
 			return err
@@ -344,16 +327,13 @@ func syncPivotEntries(client *http.Client, storage katamari.Database, pivot stri
 
 		objsToSend := getEntriesPositiveDiff(objsPivot, objsLocal)
 		for _, obj := range objsToSend {
-			if _key != "users/*" {
-				obj.Data = base64.StdEncoding.EncodeToString([]byte(obj.Data))
-			}
 			sendToPivot(client, baseKey+"/"+obj.Index, pivot, obj)
 		}
 
 		return nil
 	}
 
-	obj, err := objects.DecodeRaw(localData)
+	obj, err := meta.Decode(localData)
 	if err != nil {
 		// log.Println("sync pivot " + _key + " failed to decode local entries")
 		return err
@@ -363,7 +343,7 @@ func syncPivotEntries(client *http.Client, storage katamari.Database, pivot stri
 	return nil
 }
 
-func synchronizeItem(client *http.Client, storage katamari.Database, pivot string, key string) error {
+func synchronizeItem(client *http.Client, storage ooo.Database, pivot string, key string) error {
 	update := false
 	_key := strings.Replace(key, "/*", "", 1)
 	//check
@@ -402,7 +382,7 @@ func synchronizeItem(client *http.Client, storage katamari.Database, pivot strin
 }
 
 // Synchronize a list of keys
-func Synchronize(client *http.Client, storage katamari.Database, pivot string, keys []string) error {
+func Synchronize(client *http.Client, storage ooo.Database, pivot string, keys []string) error {
 	// prevent simultaneous sync operations
 	Mu.Lock()
 	update := false
@@ -421,8 +401,8 @@ func Synchronize(client *http.Client, storage katamari.Database, pivot string, k
 }
 
 // SyncReadFilter filter to synchronize with pivot on read
-func SyncReadFilter(client *http.Client, storage katamari.Database, pivot string, keys []string) katamari.Apply {
-	return func(index string, data []byte) ([]byte, error) {
+func SyncReadFilter(client *http.Client, storage ooo.Database, pivot string, keys []string) ooo.Apply {
+	return func(index string, data json.RawMessage) (json.RawMessage, error) {
 		if pivot != "" {
 			// log.Println("read filter", index)
 			err := Synchronize(client, storage, pivot, keys)
@@ -443,7 +423,7 @@ func SyncReadFilter(client *http.Client, storage katamari.Database, pivot string
 }
 
 // SyncWriteFilter filter to synchronize nodes on write
-func SyncWriteFilter(client *http.Client, pivotIP string, getNodes GetNodes) katamari.Notify {
+func SyncWriteFilter(client *http.Client, pivotIP string, getNodes GetNodes) ooo.Notify {
 	return func(index string) {
 		// log.Println("sync write", index)
 		if pivotIP == "" {
@@ -455,7 +435,7 @@ func SyncWriteFilter(client *http.Client, pivotIP string, getNodes GetNodes) kat
 }
 
 // SyncDeleteFilter update the last delete time on each delete
-func SyncDeleteFilter(client *http.Client, pivotIP string, storage katamari.Database, key string, getNodes GetNodes) katamari.ApplyDelete {
+func SyncDeleteFilter(client *http.Client, pivotIP string, storage ooo.Database, key string, getNodes GetNodes) ooo.ApplyDelete {
 	return func(index string) error {
 		if pivotIP == "" {
 			for _, node := range getNodes() {
@@ -463,13 +443,13 @@ func SyncDeleteFilter(client *http.Client, pivotIP string, storage katamari.Data
 			}
 		}
 
-		storage.Set("pivot:"+key, katamari.Time())
+		storage.Set("pivot:"+key, json.RawMessage(ooo.Time()))
 		return nil
 	}
 }
 
 // Pivot endpoint to trigger a synchronize from the pivot server
-func Pivot(client *http.Client, storage katamari.Database, pivot string, keys []string) func(w http.ResponseWriter, r *http.Request) {
+func Pivot(client *http.Client, storage ooo.Database, pivot string, keys []string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pivot == "" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -483,9 +463,9 @@ func Pivot(client *http.Client, storage katamari.Database, pivot string, keys []
 }
 
 // Get WILL
-func Get(storage katamari.Database, key string) func(w http.ResponseWriter, r *http.Request) {
+func Get(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var objs []objects.Object
+		var objs []meta.Object
 		raw, err := storage.Get(key)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -506,9 +486,9 @@ func Get(storage katamari.Database, key string) func(w http.ResponseWriter, r *h
 }
 
 // Set set data on the pivot instance
-func Set(storage katamari.Database, key string) func(w http.ResponseWriter, r *http.Request) {
+func Set(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		decoded, err := objects.DecodeFromReader(r.Body)
+		decoded, err := meta.DecodeFromReader(r.Body)
 		if err != nil {
 			// log.Println("failed to decode "+key+" entry on pivot", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -519,7 +499,7 @@ func Set(storage katamari.Database, key string) func(w http.ResponseWriter, r *h
 		if index == "" {
 			itemKey = key
 		}
-		_, err = storage.Pivot(itemKey, decoded.Data, decoded.Created, decoded.Updated)
+		_, err = storage.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
 			// log.Println("failed to store on pivot "+key+" entry", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -530,13 +510,13 @@ func Set(storage katamari.Database, key string) func(w http.ResponseWriter, r *h
 }
 
 // Delete delete data on the pivot instance
-func Delete(storage katamari.Database, key string) func(w http.ResponseWriter, r *http.Request) {
+func Delete(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		index := mux.Vars(r)["index"]
 		time := mux.Vars(r)["time"]
 		itemKey := key + "/" + index
 		err := storage.Del(itemKey)
-		storage.Set("pivot:"+key, time)
+		storage.Set("pivot:"+key, json.RawMessage(time))
 		if err != nil {
 			// log.Println("failed to delete on pivot "+key+" entry", err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -547,7 +527,7 @@ func Delete(storage katamari.Database, key string) func(w http.ResponseWriter, r
 }
 
 // Activity route to get activity info from the pivot instance
-func Activity(storage katamari.Database, key string) func(w http.ResponseWriter, r *http.Request) {
+func Activity(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if storage != nil && storage.Active() {
 			activity, _ := checkActivity(storage, key)
@@ -558,7 +538,7 @@ func Activity(storage katamari.Database, key string) func(w http.ResponseWriter,
 }
 
 // Router will add the router needed to synchronize the keys
-func Router(router *mux.Router, storage katamari.Database, client *http.Client, pivot string, keys []string) {
+func Router(router *mux.Router, storage ooo.Database, client *http.Client, pivot string, keys []string) {
 	router.HandleFunc("/pivot", Pivot(client, storage, pivot, keys)).Methods("GET")
 	for _, key := range keys {
 		baseKey := strings.Replace(key, "/*", "", 1)
