@@ -2,6 +2,8 @@ module github.com/benitogf/pivot
 
 go 1.25
 
+replace github.com/benitogf/ooo => ../ooo
+
 require (
 	github.com/benitogf/auth v0.0.0-20251216152326-c72d27703287
 	github.com/benitogf/ooo v0.0.0-20251124052607-b19fb995a95c

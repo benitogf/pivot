@@ -2,14 +2,14 @@ package pivot
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/goccy/go-json"
+	"sync/atomic"
 
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/key"
@@ -27,11 +27,18 @@ type ActivityEntry struct {
 // GetNodes function that returns the nodes ips
 type GetNodes func() []string
 
-func max(a, b int64) int64 {
-	if a > b {
-		return a
+type Key struct {
+	Path     string
+	Database ooo.Database
+}
+
+func FindStorageFor(keys []Key, index string) (ooo.Database, error) {
+	for _, _key := range keys {
+		if key.Match(_key.Path, index) {
+			return _key.Database, nil
+		}
 	}
-	return b
+	return nil, errors.New("failed to find storage for " + index)
 }
 
 func lastActivity(objs []meta.Object) int64 {
@@ -64,24 +71,24 @@ func checkLastDelete(storage ooo.Database, lastEntry int64, key string) int64 {
 	return max(lastEntry, int64(lastDeleteNum))
 }
 
-func checkActivity(storage ooo.Database, _key string) (ActivityEntry, error) {
+func checkActivity(_key Key) (ActivityEntry, error) {
 	var activity ActivityEntry
-	entries, err := storage.Get(_key)
+	entries, err := _key.Database.Get(_key.Path)
 	if err != nil {
 		// log.Println("failed to fetch local "+_key, err)
 		return activity, nil
 	}
 	baseKey := _key
 
-	if key.LastIndex(_key) == "*" {
-		baseKey = strings.Replace(_key, "/*", "", 1)
+	if key.LastIndex(_key.Path) == "*" {
+		_baseKey := strings.Replace(_key.Path, "/*", "", 1)
 		objs, err := meta.DecodeList(entries)
 		if err != nil {
 			// log.Println("failed to decode "+_key+" objects list", err)
 			return activity, err
 		}
 
-		activity.LastEntry = checkLastDelete(storage, lastActivity(objs), baseKey)
+		activity.LastEntry = checkLastDelete(_key.Database, lastActivity(objs), _baseKey)
 		return activity, nil
 	}
 
@@ -91,7 +98,7 @@ func checkActivity(storage ooo.Database, _key string) (ActivityEntry, error) {
 		return activity, err
 	}
 
-	activity.LastEntry = checkLastDelete(storage, max(obj.Created, obj.Updated), baseKey)
+	activity.LastEntry = checkLastDelete(_key.Database, max(obj.Created, obj.Updated), baseKey.Path)
 	return activity, nil
 }
 
@@ -168,18 +175,18 @@ func getEntryFromPivot(client *http.Client, pivot string, key string) (meta.Obje
 }
 
 // get from pivot and write to local
-func syncLocalEntries(client *http.Client, storage ooo.Database, pivot string, _key string, lastEntry int64) error {
-	if key.LastIndex(_key) == "*" {
-		baseKey := strings.Replace(_key, "/*", "", 1)
-		objsPivot, err := getEntriesFromPivot(client, pivot, _key)
+func syncLocalEntries(client *http.Client, pivot string, _key Key, lastEntry int64) error {
+	if key.LastIndex(_key.Path) == "*" {
+		baseKey := strings.Replace(_key.Path, "/*", "", 1)
+		objsPivot, err := getEntriesFromPivot(client, pivot, _key.Path)
 		if err != nil {
 			// log.Println("sync local " + baseKey + " failed to get from pivot")
 			return err
 		}
 
-		localData, err := storage.Get(_key)
+		localData, err := _key.Database.Get(_key.Path)
 		if err != nil {
-			// log.Println("sync local " + _key + " failed to read local entries")
+			// log.Println("sync local " + _key.Path + " failed to read local entries")
 			return err
 		}
 
@@ -191,30 +198,30 @@ func syncLocalEntries(client *http.Client, storage ooo.Database, pivot string, _
 
 		objsToDelete := getEntriesNegativeDiff(objsLocal, objsPivot)
 		for _, index := range objsToDelete {
-			storage.Del(baseKey + "/" + index)
+			_key.Database.Del(baseKey + "/" + index)
 		}
 
 		objsToSend := getEntriesPositiveDiff(objsLocal, objsPivot)
 		for _, obj := range objsToSend {
-			storage.SetWithMeta(baseKey+"/"+obj.Index, obj.Data, obj.Created, obj.Updated)
+			_key.Database.SetWithMeta(baseKey+"/"+obj.Index, obj.Data, obj.Created, obj.Updated)
 			// if err != nil {
 			// 	log.Println("failed to store entry from pivot", err)
 			// }
 		}
-		storage.Set("pivot:"+baseKey, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
+		_key.Database.Set("pivot:"+baseKey, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
 		return nil
 	}
 
-	obj, err := getEntryFromPivot(client, pivot, _key)
+	obj, err := getEntryFromPivot(client, pivot, _key.Path)
 	if err != nil {
-		// log.Println("sync local " + _key + " failed to get from pivot")
+		// log.Println("sync local " + _key.Path + " failed to get from pivot")
 		return err
 	}
-	storage.SetWithMeta(_key, obj.Data, obj.Created, obj.Updated)
+	_key.Database.SetWithMeta(_key.Path, obj.Data, obj.Created, obj.Updated)
 	// if err != nil {
 	// 	log.Println("failed to store entry from pivot", err)
 	// }
-	storage.Set("pivot:"+_key, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
+	_key.Database.Set("pivot:"+_key.Path, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
 
 	return nil
 }
@@ -300,21 +307,21 @@ func getEntriesPositiveDiff(objsDst, objsSrc []meta.Object) []meta.Object {
 }
 
 // get from local and send to pivot (updates only, no new entries or deletes)
-func syncPivotEntries(client *http.Client, storage ooo.Database, pivot string, _key string, lastEntry int64) error {
-	localData, err := storage.Get(_key)
+func syncPivotEntries(client *http.Client, pivot string, _key Key, lastEntry int64) error {
+	localData, err := _key.Database.Get(_key.Path)
 	if err != nil {
 		// log.Println("sync pivot " + _key + " failed to read local entries")
 		return err
 	}
-	if key.LastIndex(_key) == "*" {
-		baseKey := strings.Replace(_key, "/*", "", 1)
+	if key.LastIndex(_key.Path) == "*" {
+		baseKey := strings.Replace(_key.Path, "/*", "", 1)
 		objsLocal, err := meta.DecodeList(localData)
 		if err != nil {
 			// log.Println("sync pivot " + _key + " failed to decode local entries")
 			return err
 		}
 
-		objsPivot, err := getEntriesFromPivot(client, pivot, _key)
+		objsPivot, err := getEntriesFromPivot(client, pivot, _key.Path)
 		if err != nil {
 			// log.Println("sync pivot " + baseKey + " failed to get from pivot")
 			return err
@@ -343,23 +350,23 @@ func syncPivotEntries(client *http.Client, storage ooo.Database, pivot string, _
 	return nil
 }
 
-func synchronizeItem(client *http.Client, storage ooo.Database, pivot string, key string) error {
+func synchronizeItem(client *http.Client, pivot string, key Key) error {
 	update := false
-	_key := strings.Replace(key, "/*", "", 1)
+	_key := strings.Replace(key.Path, "/*", "", 1)
 	//check
 	activityPivot, err := checkPivotActivity(client, pivot, _key)
 	if err != nil {
 		// log.Println(err)
 		return errors.New("failed to check activity for " + _key + " on pivot")
 	}
-	activityLocal, err := checkActivity(storage, key)
+	activityLocal, err := checkActivity(key)
 	if err != nil {
 		return errors.New("failed to check activity for " + _key + " on local")
 	}
 
 	// sync
 	if activityLocal.LastEntry > activityPivot.LastEntry {
-		err := syncPivotEntries(client, storage, pivot, key, activityLocal.LastEntry)
+		err := syncPivotEntries(client, pivot, key, activityLocal.LastEntry)
 		if err != nil {
 			return err
 		}
@@ -367,7 +374,7 @@ func synchronizeItem(client *http.Client, storage ooo.Database, pivot string, ke
 	}
 
 	if activityLocal.LastEntry < activityPivot.LastEntry {
-		err := syncLocalEntries(client, storage, pivot, key, activityPivot.LastEntry)
+		err := syncLocalEntries(client, pivot, key, activityPivot.LastEntry)
 		if err != nil {
 			return err
 		}
@@ -378,34 +385,41 @@ func synchronizeItem(client *http.Client, storage ooo.Database, pivot string, ke
 		return nil
 	}
 
-	return errors.New("nothing to synchronize for " + key)
+	return errors.New("nothing to synchronize for " + key.Path)
 }
 
 // Synchronize a list of keys
-func Synchronize(client *http.Client, storage ooo.Database, pivot string, keys []string) error {
-	// prevent simultaneous sync operations
-	Mu.Lock()
+func Synchronize(client *http.Client, pivot string, keys []Key) error {
+	// prevent simultaneous sync operations - use TryLock to avoid deadlock
+	// when BeforeRead triggers Synchronize during an ongoing sync
+	if !Mu.TryLock() {
+		return nil
+	}
+	defer Mu.Unlock()
+
 	update := false
 	for _, key := range keys {
-		errItem := synchronizeItem(client, storage, pivot, key)
+		errItem := synchronizeItem(client, pivot, key)
 		if errItem == nil {
 			update = true
 		}
 	}
 	if update {
-		Mu.Unlock()
 		return nil
 	}
-	Mu.Unlock()
 	return errors.New("nothing to synchronize")
 }
 
 // SyncReadFilter filter to synchronize with pivot on read
-func SyncReadFilter(client *http.Client, storage ooo.Database, pivot string, keys []string) ooo.Apply {
+func SyncReadFilter(client *http.Client, pivot string, keys []Key) ooo.Apply {
 	return func(index string, data json.RawMessage) (json.RawMessage, error) {
 		if pivot != "" {
-			// log.Println("read filter", index)
-			err := Synchronize(client, storage, pivot, keys)
+			err := Synchronize(client, pivot, keys)
+			if err != nil {
+				return data, nil
+			}
+
+			storage, err := FindStorageFor(keys, index)
 			if err != nil {
 				return data, nil
 			}
@@ -448,8 +462,65 @@ func SyncDeleteFilter(client *http.Client, pivotIP string, storage ooo.Database,
 	}
 }
 
+// StorageSyncCallback is the callback type for storage sync events
+type StorageSyncCallback func(event ooo.StorageEvent)
+
+// StorageSync creates a StorageSyncCallback that triggers synchronization on storage events.
+// This replaces the need for SyncWriteFilter and SyncDeleteFilter.
+// For pivot servers (pivotIP == ""), it notifies all nodes on any storage change.
+// For node servers, it synchronizes with the pivot on any storage change.
+func StorageSync(client *http.Client, pivotIP string, keys []Key, getNodes GetNodes) StorageSyncCallback {
+	return func(event ooo.StorageEvent) {
+		// Find matching key and its database for this event
+		var matchedKey string
+		var matchedDB ooo.Database
+		for _, k := range keys {
+			if key.Match(k.Path, event.Key) {
+				matchedKey = strings.Replace(k.Path, "/*", "", 1)
+				matchedDB = k.Database
+				break
+			}
+		}
+
+		if matchedKey == "" || matchedDB == nil {
+			return
+		}
+
+		// Track delete timestamps for proper sync
+		if event.Operation == "del" {
+			matchedDB.Set("pivot:"+matchedKey, json.RawMessage(ooo.Time()))
+		}
+
+		if pivotIP == "" {
+			// This is the pivot server - notify all nodes synchronously
+			// so that data is available on nodes before returning
+			for _, node := range getNodes() {
+				TriggerNodeSync(client, node)
+			}
+		} else {
+			// This is a node - synchronize with pivot
+			go Synchronize(client, pivotIP, keys)
+		}
+	}
+}
+
+// WatchStorage watches a storage's events and calls the callback for each event.
+// Use this to watch additional storages beyond the main server.Storage.
+// This replaces ooo.WatchStorageNoop for storages that need sync.
+func WatchStorage(storage ooo.Database, callback StorageSyncCallback) {
+	for {
+		event := <-storage.Watch()
+		if !storage.Active() {
+			break
+		}
+		if event.Key != "" {
+			callback(event)
+		}
+	}
+}
+
 // Pivot endpoint to trigger a synchronize from the pivot server
-func Pivot(client *http.Client, storage ooo.Database, pivot string, keys []string) func(w http.ResponseWriter, r *http.Request) {
+func Pivot(client *http.Client, pivot string, keys []Key) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pivot == "" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -457,7 +528,7 @@ func Pivot(client *http.Client, storage ooo.Database, pivot string, keys []strin
 			return
 		}
 
-		Synchronize(client, storage, pivot, keys)
+		Synchronize(client, pivot, keys)
 		w.WriteHeader(http.StatusOK)
 	}
 }
@@ -527,31 +598,105 @@ func Delete(storage ooo.Database, key string) func(w http.ResponseWriter, r *htt
 }
 
 // Activity route to get activity info from the pivot instance
-func Activity(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
+func Activity(key Key) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if storage != nil && storage.Active() {
-			activity, _ := checkActivity(storage, key)
-			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(activity)
+		if key.Database == nil || !key.Database.Active() {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		activity, _ := checkActivity(key)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(activity)
+	}
+}
+
+// Setup configures pivot synchronization for a server.
+// It sets up OnStorageEvent for write/delete sync on server.Storage,
+// HTTP routes for the pivot protocol, and returns a BeforeRead callback
+// for sync-on-read at the storage level.
+// Each key must have its Database field set to the storage it uses.
+// For keys using server.Storage, OnStorageEvent handles write sync automatically.
+// For keys using separate storages, use SetupStorage to get callbacks for that storage.
+func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(key string) {
+	pivotIP := server.Pivot
+	client := server.Client
+
+	// Set up OnStorageEvent for write/delete synchronization on server.Storage
+	syncCallback := StorageSync(client, pivotIP, keys, getNodes)
+	server.OnStorageEvent = ooo.StorageEventCallback(syncCallback)
+
+	// Set up HTTP routes for pivot protocol
+	server.Router.HandleFunc("/pivot", Pivot(client, pivotIP, keys)).Methods("GET")
+	for _, k := range keys {
+		baseKey := strings.Replace(k.Path, "/*", "", 1)
+		server.Router.HandleFunc("/activity/"+baseKey, Activity(k)).Methods("GET")
+		if baseKey != k.Path {
+			server.Router.HandleFunc("/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey)).Methods("POST")
+			server.Router.HandleFunc("/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
+		} else {
+			server.Router.HandleFunc("/pivot/"+baseKey, Set(k.Database, baseKey)).Methods("POST")
+			server.Router.HandleFunc("/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
+		}
+		// For keys with external storage (not server.Storage), expose GET route
+		// so nodes can fetch data during sync
+		if k.Database != nil && k.Database != server.Storage {
+			server.Router.HandleFunc("/"+k.Path, Get(k.Database, k.Path)).Methods("GET")
+		}
+	}
+
+	// Return BeforeRead callback for sync-on-read at storage level
+	var syncing int32 // Guard to prevent recursive sync
+	return func(readKey string) {
+		if pivotIP == "" {
+			return
+		}
+		// Prevent recursive sync (Synchronize calls storage.Get which triggers BeforeRead)
+		if !atomic.CompareAndSwapInt32(&syncing, 0, 1) {
+			return
+		}
+		defer atomic.StoreInt32(&syncing, 0)
+
+		// Check if this key matches any of our sync keys
+		for _, k := range keys {
+			if key.Match(k.Path, readKey) {
+				Synchronize(client, pivotIP, keys)
+				return
+			}
 		}
 	}
 }
 
-// Router will add the router needed to synchronize the keys
-func Router(router *mux.Router, storage ooo.Database, client *http.Client, pivot string, keys []string) {
-	router.HandleFunc("/pivot", Pivot(client, storage, pivot, keys)).Methods("GET")
-	for _, key := range keys {
-		baseKey := strings.Replace(key, "/*", "", 1)
-		if key == "users/*" {
-			router.HandleFunc("/users/*", Get(storage, key)).Methods("GET")
+// SetupStorage configures sync for a separate storage (not server.Storage).
+// Returns a BeforeRead callback to be passed to StorageOpt.BeforeRead.
+// Call this BEFORE starting the storage, then start the storage with the returned BeforeRead.
+// After starting the storage, call the returned startWatch function to begin watching for writes.
+func SetupStorage(client *http.Client, pivotIP string, keys []Key, getNodes GetNodes) (beforeRead func(key string), startWatch func(storage ooo.Database)) {
+	syncCallback := StorageSync(client, pivotIP, keys, getNodes)
+	var syncing int32 // Guard to prevent recursive sync
+
+	// BeforeRead callback for sync-on-read
+	beforeRead = func(readKey string) {
+		if pivotIP == "" {
+			return
 		}
-		router.HandleFunc("/activity/"+baseKey, Activity(storage, key)).Methods("GET")
-		if baseKey != key {
-			router.HandleFunc("/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(storage, baseKey)).Methods("POST")
-			router.HandleFunc("/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(storage, baseKey)).Methods("DELETE")
-		} else {
-			router.HandleFunc("/pivot/"+baseKey, Set(storage, baseKey)).Methods("POST")
-			router.HandleFunc("/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(storage, baseKey)).Methods("DELETE")
+		// Prevent recursive sync (Synchronize calls storage.Get which triggers BeforeRead)
+		if !atomic.CompareAndSwapInt32(&syncing, 0, 1) {
+			return
+		}
+		defer atomic.StoreInt32(&syncing, 0)
+
+		for _, k := range keys {
+			if key.Match(k.Path, readKey) {
+				Synchronize(client, pivotIP, keys)
+				return
+			}
 		}
 	}
+
+	// Function to start watching after storage is started
+	startWatch = func(storage ooo.Database) {
+		go WatchStorage(storage, syncCallback)
+	}
+
+	return beforeRead, startWatch
 }
