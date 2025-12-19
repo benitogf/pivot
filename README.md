@@ -13,7 +13,9 @@ https://storage.googleapis.com/pub-tools-public-publication-data/pdf/65b514eda12
 >
 > This leads to three kinds of systems: CA, CP and AP, based on what letter you leave out. Note that you are not entitled to 2 of 3, and many systems have zero or one of the properties.
 
-This distribution system is CP, if a node is not available it should not accept writes or deletes.
+This distribution system prioritizes availability and partition tolerance (AP). 
+Nodes accept writes even when the pivot is unreachable, with data synchronizing 
+when connectivity is restored using last-write-wins conflict resolution.
 
 ## Usage
 

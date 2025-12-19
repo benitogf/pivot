@@ -78,7 +78,6 @@ func FakeServer(t *testing.T, pivotIP string, authWg *sync.WaitGroup) *ooo.Serve
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
-	server.Pivot = pivotIP
 	server.Storage = &ooo.MemoryStorage{}
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
@@ -105,12 +104,14 @@ func FakeServer(t *testing.T, pivotIP string, authWg *sync.WaitGroup) *ooo.Serve
 	// Configure pivot with Config API
 	// - Keys with nil Database default to server.Storage
 	// - NodesKey is automatically added to sync keys
+	// - PivotIP: empty string = this is the pivot server, otherwise = address of pivot
 	config := pivot.Config{
 		Keys: []pivot.Key{
 			{Path: "users/*", Database: authStorage},
 			{Path: "settings"},
 		},
 		NodesKey: "things/*", // Node discovery path (reads IP from entries)
+		PivotIP:  pivotIP,
 	}
 
 	// Setup pivot - sets server.DbOpt, returns callbacks for external storages
