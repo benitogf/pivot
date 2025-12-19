@@ -17,20 +17,31 @@ import (
 	"github.com/gorilla/mux"
 )
 
-var Mu sync.Mutex
-
 // ActivityEntry keeps the time of the last entry
 type ActivityEntry struct {
 	LastEntry int64 `json:"lastEntry"`
 }
 
-// GetNodes function that returns the nodes ips
-type GetNodes func() []string
+// Node is the expected structure for entries in the NodesKey path.
+// User data stored at NodesKey must include an "ip" field.
+type Node struct {
+	IP string `json:"ip"`
+}
 
+// Key defines a path to synchronize and its associated database.
 type Key struct {
 	Path     string
-	Database ooo.Database
+	Database ooo.Database // nil means server.Storage
 }
+
+// Config holds the configuration for pivot synchronization.
+type Config struct {
+	Keys     []Key  // Keys to sync (not including NodesKey)
+	NodesKey string // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
+}
+
+// getNodes function type used internally for node discovery
+type getNodes func() []string
 
 func FindStorageFor(keys []Key, index string) (ooo.Database, error) {
 	for _, _key := range keys {
@@ -147,7 +158,6 @@ func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]meta.
 func TriggerNodeSync(client *http.Client, node string) {
 	resp, err := client.Get("http://" + node + "/pivot")
 	if err != nil {
-		// log.Println("failed to trigger sync from pivot on ", node, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -387,15 +397,8 @@ func synchronizeItem(client *http.Client, pivot string, key Key) error {
 	return errors.New("nothing to synchronize for " + key.Path)
 }
 
-// Synchronize a list of keys
-func Synchronize(client *http.Client, pivot string, keys []Key) error {
-	// prevent simultaneous sync operations - use TryLock to avoid deadlock
-	// when BeforeRead triggers Synchronize during an ongoing sync
-	if !Mu.TryLock() {
-		return nil
-	}
-	defer Mu.Unlock()
-
+// synchronizeKeys performs the actual synchronization without mutex handling
+func synchronizeKeys(client *http.Client, pivot string, keys []Key) error {
 	update := false
 	for _, key := range keys {
 		errItem := synchronizeItem(client, pivot, key)
@@ -409,55 +412,30 @@ func Synchronize(client *http.Client, pivot string, keys []Key) error {
 	return errors.New("nothing to synchronize")
 }
 
-// SyncReadFilter filter to synchronize with pivot on read
-func SyncReadFilter(client *http.Client, pivot string, keys []Key) ooo.Apply {
-	return func(index string, data json.RawMessage) (json.RawMessage, error) {
-		if pivot != "" {
-			err := Synchronize(client, pivot, keys)
-			if err != nil {
-				return data, nil
-			}
-
-			storage, err := FindStorageFor(keys, index)
-			if err != nil {
-				return data, nil
-			}
-
-			updatedData, err := storage.Get(index)
-			if err != nil {
-				return data, nil
-			}
-
-			return updatedData, nil
-		}
-
-		return data, nil
-	}
+// syncFuncs holds the synchronize functions for a server
+type syncFuncs struct {
+	// sync waits for the lock - used by /pivot handler
+	sync func() error
+	// trySync skips if locked - used by BeforeRead and StorageSync
+	trySync func() error
 }
 
-// SyncWriteFilter filter to synchronize nodes on write
-func SyncWriteFilter(client *http.Client, pivotIP string, getNodes GetNodes) ooo.Notify {
-	return func(index string) {
-		// log.Println("sync write", index)
-		if pivotIP == "" {
-			for _, node := range getNodes() {
-				TriggerNodeSync(client, node)
+// makeSyncFuncs creates synchronize functions with a shared per-server mutex
+func makeSyncFuncs(client *http.Client, pivot string, keys []Key) syncFuncs {
+	var mu sync.Mutex
+	return syncFuncs{
+		sync: func() error {
+			mu.Lock()
+			defer mu.Unlock()
+			return synchronizeKeys(client, pivot, keys)
+		},
+		trySync: func() error {
+			if !mu.TryLock() {
+				return nil
 			}
-		}
-	}
-}
-
-// SyncDeleteFilter update the last delete time on each delete
-func SyncDeleteFilter(client *http.Client, pivotIP string, storage ooo.Database, key string, getNodes GetNodes) ooo.ApplyDelete {
-	return func(index string) error {
-		if pivotIP == "" {
-			for _, node := range getNodes() {
-				TriggerNodeSync(client, node)
-			}
-		}
-
-		storage.Set("pivot:"+key, json.RawMessage(ooo.Time()))
-		return nil
+			defer mu.Unlock()
+			return synchronizeKeys(client, pivot, keys)
+		},
 	}
 }
 
@@ -468,7 +446,7 @@ type StorageSyncCallback func(event ooo.StorageEvent)
 // This replaces the need for SyncWriteFilter and SyncDeleteFilter.
 // For pivot servers (pivotIP == ""), it notifies all nodes on any storage change.
 // For node servers, it synchronizes with the pivot on any storage change.
-func StorageSync(client *http.Client, pivotIP string, keys []Key, getNodes GetNodes) StorageSyncCallback {
+func StorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes getNodes, synchronize func() error) StorageSyncCallback {
 	return func(event ooo.StorageEvent) {
 		// Find matching key and its database for this event
 		var matchedKey string
@@ -493,18 +471,17 @@ func StorageSync(client *http.Client, pivotIP string, keys []Key, getNodes GetNo
 		if pivotIP == "" {
 			// This is the pivot server - notify all nodes synchronously
 			// so that data is available on nodes before returning
-			for _, node := range getNodes() {
+			for _, node := range _getNodes() {
 				TriggerNodeSync(client, node)
 			}
 		} else {
 			// This is a node - synchronize with pivot
-			go Synchronize(client, pivotIP, keys)
+			go synchronize()
 		}
 	}
 }
 
-// Pivot endpoint to trigger a synchronize from the pivot server
-func Pivot(client *http.Client, pivot string, keys []Key) func(w http.ResponseWriter, r *http.Request) {
+func Pivot(pivot string, synchronize func() error) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pivot == "" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -512,12 +489,11 @@ func Pivot(client *http.Client, pivot string, keys []Key) func(w http.ResponseWr
 			return
 		}
 
-		Synchronize(client, pivot, keys)
+		synchronize()
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
-// Get WILL
 func Get(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var objs []meta.Object
@@ -594,30 +570,113 @@ func Activity(key Key) func(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Setup configures pivot synchronization for a server.
-// It sets up OnStorageEvent, HTTP routes, server.DbOpt, and returns a BeforeRead
-// callback that can be used for external storages.
+// SetupResult contains the callbacks returned by Setup for use with external storages.
+type SetupResult struct {
+	BeforeRead   func(string)        // Callback for sync-on-read
+	SyncCallback StorageSyncCallback // Callback for storage events (write/delete sync)
+}
+
+// Setup configures pivot synchronization using Config.
+// NodesKey is automatically added to sync keys and uses server.Storage.
+// Keys with nil Database default to server.Storage.
+// The internal getNodes function reads from NodesKey and extracts "ip" field.
 //
 // Usage:
 //
-//	keys := []pivot.Key{
-//	    {Path: "users/*", Database: authStore},
-//	    {Path: "things/*", Database: server.Storage},
+//	config := pivot.Config{
+//	    Keys: []pivot.Key{
+//	        {Path: "users/*", Database: authStore},
+//	        {Path: "settings"},  // nil Database = server.Storage
+//	    },
+//	    NodesKey: "things/*",  // Automatically synced via server.Storage
 //	}
 //
-//	beforeRead := pivot.Setup(server, keys, getNodes)
-//	authStore.Start(ooo.StorageOpt{BeforeRead: beforeRead})
+//	result := pivot.Setup(server, config)
+//	authStore.Start(ooo.StorageOpt{BeforeRead: result.BeforeRead})
+//	go func() {
+//	    for event := range authStore.Watch() {
+//	        result.SyncCallback(event)
+//	    }
+//	}()
 //	server.Start("localhost:8080")
-func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(string) {
+//
+// buildKeys constructs the full keys list from config.
+// Keys with nil Database are filled with server.Storage.
+// NodesKey is appended if not already present.
+func buildKeys(server *ooo.Server, config Config) []Key {
+	keys := make([]Key, len(config.Keys))
+	copy(keys, config.Keys)
+
+	// Fill nil Database with server.Storage
+	for i := range keys {
+		if keys[i].Database == nil {
+			keys[i].Database = server.Storage
+		}
+	}
+
+	// Append NodesKey if not already present
+	if config.NodesKey != "" {
+		found := false
+		for _, k := range keys {
+			if k.Path == config.NodesKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			keys = append(keys, Key{Path: config.NodesKey, Database: server.Storage})
+		}
+	}
+
+	return keys
+}
+
+// makeGetNodes creates a function that returns node IPs from the NodesKey path.
+func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
+	return func() []string {
+		var result []string
+		if nodesKey == "" {
+			return result
+		}
+		raw, err := server.Storage.Get(nodesKey)
+		if err != nil {
+			return result
+		}
+		var nodes []struct {
+			Data Node `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &nodes); err != nil {
+			return result
+		}
+		for _, n := range nodes {
+			if n.Data.IP != "" {
+				result = append(result, n.Data.IP)
+			}
+		}
+		return result
+	}
+}
+
+func Setup(server *ooo.Server, config Config) SetupResult {
+	keys := buildKeys(server, config)
+	getNodes := makeGetNodes(server, config.NodesKey)
+
 	pivotIP := server.Pivot
 	client := server.Client
-	syncCallback := StorageSync(client, pivotIP, keys, getNodes)
+
+	// Create per-server synchronize functions with shared mutex
+	// sync waits for lock (used by /pivot handler)
+	// trySync skips if locked (used by BeforeRead and StorageSync)
+	sf := makeSyncFuncs(client, pivotIP, keys)
+
+	syncCallback := StorageSync(client, pivotIP, keys, getNodes, sf.trySync)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
 	server.OnStorageEvent = ooo.StorageEventCallback(syncCallback)
 
 	// Set up HTTP routes for pivot protocol
-	server.Router.HandleFunc("/pivot", Pivot(client, pivotIP, keys)).Methods("GET")
+	// /pivot handler uses sync (waits for lock) to ensure sync completes
+	server.Router.HandleFunc("/pivot", Pivot(pivotIP, sf.sync)).Methods("GET")
 	for _, k := range keys {
 		baseKey := strings.Replace(k.Path, "/*", "", 1)
 		server.Router.HandleFunc("/activity/"+baseKey, Activity(k)).Methods("GET")
@@ -641,6 +700,7 @@ func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(string) {
 	}
 
 	// Create BeforeRead callback for sync-on-read
+	// Uses trySync to avoid blocking if sync is already in progress
 	var syncing int32
 	beforeRead := func(readKey string) {
 		if pivotIP == "" {
@@ -652,14 +712,14 @@ func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(string) {
 		defer atomic.StoreInt32(&syncing, 0)
 		for _, k := range keys {
 			if key.Match(k.Path, readKey) {
-				Synchronize(client, pivotIP, keys)
+				sf.trySync()
 				return
 			}
 		}
 	}
 
-	// Set server.DbOpt for server.Storage
-	server.DbOpt = ooo.StorageOpt{BeforeRead: beforeRead}
-
-	return beforeRead
+	return SetupResult{
+		BeforeRead:   beforeRead,
+		SyncCallback: syncCallback,
+	}
 }

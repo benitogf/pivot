@@ -71,23 +71,10 @@ func Authorize(t *testing.T, server *ooo.Server, account string) string {
 	return c.Token
 }
 
-func makeGetNodes(server *ooo.Server) func() []string {
-	return func() []string {
-		var result []string
-		things, err := oio.GetList[Thing](server, "things/*")
-		if err != nil {
-			return result
-		}
-		for _, thing := range things {
-			result = append(result, thing.Data.IP)
-		}
-		return result
-	}
-}
-
 // FakeServer creates a server using storage-level synchronization via pivot.Setup.
 // This approach uses BeforeRead for sync-on-read and storage.Watch() for write sync.
-func FakeServer(t *testing.T, pivotIP string) *ooo.Server {
+// The authWg parameter is used to signal when external storage events have been processed (pivot only).
+func FakeServer(t *testing.T, pivotIP string, authWg *sync.WaitGroup) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -115,25 +102,32 @@ func FakeServer(t *testing.T, pivotIP string) *ooo.Server {
 		authStorage,
 	)
 
-	// Define sync keys with their databases
-	keys := []pivot.Key{
-		{Path: "users/*", Database: authStorage},
-		{Path: "things/*", Database: server.Storage},
-		{Path: "settings", Database: server.Storage},
+	// Configure pivot with Config API
+	// - Keys with nil Database default to server.Storage
+	// - NodesKey is automatically added to sync keys
+	config := pivot.Config{
+		Keys: []pivot.Key{
+			{Path: "users/*", Database: authStorage},
+			{Path: "settings"},
+		},
+		NodesKey: "things/*", // Node discovery path (reads IP from entries)
 	}
 
-	// Setup pivot - sets server.DbOpt, returns BeforeRead callback for external storages
-	beforeRead := pivot.Setup(server, keys, makeGetNodes(server))
+	// Setup pivot - sets server.DbOpt, returns callbacks for external storages
+	result := pivot.Setup(server, config)
 
+	server.BeforeRead = result.BeforeRead
 	// Start external storages with the BeforeRead callback
-	err := authStorage.Start(ooo.StorageOpt{BeforeRead: beforeRead})
+	err := authStorage.Start(ooo.StorageOpt{BeforeRead: result.BeforeRead})
 	require.NoError(t, err)
 
-	// Watch external storage for write sync
-	syncCallback := pivot.StorageSync(server.Client, pivotIP, keys, makeGetNodes(server))
+	// Watch external storage for write sync using result.SyncCallback
 	go func() {
 		for event := range authStorage.Watch() {
-			syncCallback(event)
+			result.SyncCallback(event)
+			if authWg != nil {
+				authWg.Done()
+			}
 		}
 	}()
 
@@ -151,7 +145,6 @@ func FakeServer(t *testing.T, pivotIP string) *ooo.Server {
 
 // Global state variables for test
 var (
-	wg            sync.WaitGroup
 	pivotThings   []client.Meta[Thing]
 	nodeThings    []client.Meta[Thing]
 	pivotSettings []client.Meta[Settings]
@@ -159,21 +152,29 @@ var (
 )
 
 func TestBasicPivotSync(t *testing.T) {
-	pivotServer := FakeServer(t, "")
+	var wg sync.WaitGroup
+
+	pivotServer := FakeServer(t, "", &wg)
 	defer pivotServer.Close(os.Interrupt)
 
-	nodeServer := FakeServer(t, pivotServer.Address)
+	nodeServer := FakeServer(t, pivotServer.Address, &wg)
 	defer nodeServer.Close(os.Interrupt)
 
 	// Register first user and get auth token (used for initial setup)
+	// Expect 1 authStorage event on pivot (no node registered yet, so no sync)
+	wg.Add(1)
 	token := RegisterUser(t, pivotServer, "root")
 	require.NotEqual(t, "", token)
+	wg.Wait()
 	authHeader := http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
 
-	// Authorize on node server - the user should now be synced
+	// Authorize on node server - triggers BeforeRead sync which writes to node's authStorage
+	// Expect 1 authStorage event on node (sync from pivot)
+	wg.Add(1)
 	token = Authorize(t, nodeServer, "root")
 	require.NotEqual(t, "", token)
+	wg.Wait()
 	authHeader = http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
 
@@ -235,8 +236,11 @@ func TestBasicPivotSync(t *testing.T) {
 
 	// Now register a second user on pivot - this will trigger sync to node via StorageSync
 	// because getNodes() now returns the node's address from things
+	// Expect 2 authStorage events: 1 on pivot (write) + 1 on node (sync)
+	wg.Add(2)
 	token2 := RegisterUser(t, pivotServer, "testuser")
 	require.NotEqual(t, "", token2)
+	wg.Wait()
 
 	// Authorize on node server - the user should now be synced
 	token = Authorize(t, nodeServer, "testuser")
