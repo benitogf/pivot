@@ -42,11 +42,14 @@ func FindStorageFor(keys []Key, index string) (ooo.Database, error) {
 }
 
 func lastActivity(objs []meta.Object) int64 {
-	if len(objs) > 0 {
-		return max(objs[0].Created, objs[0].Updated)
+	var maxTime int64
+	for _, obj := range objs {
+		objTime := max(obj.Created, obj.Updated)
+		if objTime > maxTime {
+			maxTime = objTime
+		}
 	}
-
-	return 0
+	return maxTime
 }
 
 func checkLastDelete(storage ooo.Database, lastEntry int64, key string) int64 {
@@ -75,7 +78,6 @@ func checkActivity(_key Key) (ActivityEntry, error) {
 	var activity ActivityEntry
 	entries, err := _key.Database.Get(_key.Path)
 	if err != nil {
-		// log.Println("failed to fetch local "+_key, err)
 		return activity, nil
 	}
 	baseKey := _key
@@ -125,7 +127,6 @@ func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]meta.
 	var objs []meta.Object
 	resp, err := client.Get("http://" + pivot + "/" + key)
 	if err != nil {
-		// log.Println("failed to get "+key+" from pivot", err)
 		return objs, err
 	}
 	defer resp.Body.Close()
@@ -144,7 +145,6 @@ func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]meta.
 
 // TriggerNodeSync will call pivot on a node server
 func TriggerNodeSync(client *http.Client, node string) {
-	// log.Println("node sync", node)
 	resp, err := client.Get("http://" + node + "/pivot")
 	if err != nil {
 		// log.Println("failed to trigger sync from pivot on ", node, err)
@@ -356,7 +356,6 @@ func synchronizeItem(client *http.Client, pivot string, key Key) error {
 	//check
 	activityPivot, err := checkPivotActivity(client, pivot, _key)
 	if err != nil {
-		// log.Println(err)
 		return errors.New("failed to check activity for " + _key + " on pivot")
 	}
 	activityLocal, err := checkActivity(key)
@@ -504,21 +503,6 @@ func StorageSync(client *http.Client, pivotIP string, keys []Key, getNodes GetNo
 	}
 }
 
-// WatchStorage watches a storage's events and calls the callback for each event.
-// Use this to watch additional storages beyond the main server.Storage.
-// This replaces ooo.WatchStorageNoop for storages that need sync.
-func WatchStorage(storage ooo.Database, callback StorageSyncCallback) {
-	for {
-		event := <-storage.Watch()
-		if !storage.Active() {
-			break
-		}
-		if event.Key != "" {
-			callback(event)
-		}
-	}
-}
-
 // Pivot endpoint to trigger a synchronize from the pivot server
 func Pivot(client *http.Client, pivot string, keys []Key) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -611,18 +595,25 @@ func Activity(key Key) func(w http.ResponseWriter, r *http.Request) {
 }
 
 // Setup configures pivot synchronization for a server.
-// It sets up OnStorageEvent for write/delete sync on server.Storage,
-// HTTP routes for the pivot protocol, and returns a BeforeRead callback
-// for sync-on-read at the storage level.
-// Each key must have its Database field set to the storage it uses.
-// For keys using server.Storage, OnStorageEvent handles write sync automatically.
-// For keys using separate storages, use SetupStorage to get callbacks for that storage.
-func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(key string) {
+// It sets up OnStorageEvent, HTTP routes, server.DbOpt, and returns a BeforeRead
+// callback that can be used for external storages.
+//
+// Usage:
+//
+//	keys := []pivot.Key{
+//	    {Path: "users/*", Database: authStore},
+//	    {Path: "things/*", Database: server.Storage},
+//	}
+//
+//	beforeRead := pivot.Setup(server, keys, getNodes)
+//	authStore.Start(ooo.StorageOpt{BeforeRead: beforeRead})
+//	server.Start("localhost:8080")
+func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(string) {
 	pivotIP := server.Pivot
 	client := server.Client
+	syncCallback := StorageSync(client, pivotIP, keys, getNodes)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
-	syncCallback := StorageSync(client, pivotIP, keys, getNodes)
 	server.OnStorageEvent = ooo.StorageEventCallback(syncCallback)
 
 	// Set up HTTP routes for pivot protocol
@@ -638,53 +629,27 @@ func Setup(server *ooo.Server, keys []Key, getNodes GetNodes) func(key string) {
 			server.Router.HandleFunc("/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
 		}
 		// For keys with external storage (not server.Storage), expose GET route
-		// so nodes can fetch data during sync
 		if k.Database != nil && k.Database != server.Storage {
-			server.Router.HandleFunc("/"+k.Path, Get(k.Database, k.Path)).Methods("GET")
-		}
-	}
-
-	// Return BeforeRead callback for sync-on-read at storage level
-	var syncing int32 // Guard to prevent recursive sync
-	return func(readKey string) {
-		if pivotIP == "" {
-			return
-		}
-		// Prevent recursive sync (Synchronize calls storage.Get which triggers BeforeRead)
-		if !atomic.CompareAndSwapInt32(&syncing, 0, 1) {
-			return
-		}
-		defer atomic.StoreInt32(&syncing, 0)
-
-		// Check if this key matches any of our sync keys
-		for _, k := range keys {
-			if key.Match(k.Path, readKey) {
-				Synchronize(client, pivotIP, keys)
-				return
+			if baseKey != k.Path {
+				// List pattern like "users/*" - register as "/users/*" to handle the wildcard
+				server.Router.HandleFunc("/"+baseKey+"/{path:.*}", Get(k.Database, k.Path)).Methods("GET")
+				server.Router.HandleFunc("/"+baseKey, Get(k.Database, k.Path)).Methods("GET")
+			} else {
+				server.Router.HandleFunc("/"+k.Path, Get(k.Database, k.Path)).Methods("GET")
 			}
 		}
 	}
-}
 
-// SetupStorage configures sync for a separate storage (not server.Storage).
-// Returns a BeforeRead callback to be passed to StorageOpt.BeforeRead.
-// Call this BEFORE starting the storage, then start the storage with the returned BeforeRead.
-// After starting the storage, call the returned startWatch function to begin watching for writes.
-func SetupStorage(client *http.Client, pivotIP string, keys []Key, getNodes GetNodes) (beforeRead func(key string), startWatch func(storage ooo.Database)) {
-	syncCallback := StorageSync(client, pivotIP, keys, getNodes)
-	var syncing int32 // Guard to prevent recursive sync
-
-	// BeforeRead callback for sync-on-read
-	beforeRead = func(readKey string) {
+	// Create BeforeRead callback for sync-on-read
+	var syncing int32
+	beforeRead := func(readKey string) {
 		if pivotIP == "" {
 			return
 		}
-		// Prevent recursive sync (Synchronize calls storage.Get which triggers BeforeRead)
 		if !atomic.CompareAndSwapInt32(&syncing, 0, 1) {
 			return
 		}
 		defer atomic.StoreInt32(&syncing, 0)
-
 		for _, k := range keys {
 			if key.Match(k.Path, readKey) {
 				Synchronize(client, pivotIP, keys)
@@ -693,10 +658,8 @@ func SetupStorage(client *http.Client, pivotIP string, keys []Key, getNodes GetN
 		}
 	}
 
-	// Function to start watching after storage is started
-	startWatch = func(storage ooo.Database) {
-		go WatchStorage(storage, syncCallback)
-	}
+	// Set server.DbOpt for server.Storage
+	server.DbOpt = ooo.StorageOpt{BeforeRead: beforeRead}
 
-	return beforeRead, startWatch
+	return beforeRead
 }

@@ -8,8 +8,6 @@ github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 h1:0ERndS9JkEvEq
 github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559/go.mod h1:gg2qmcNCGq/FXh5kQpsaEIf6GebYe2JMKrDSqZkuImc=
 github.com/benitogf/jsonpatch v0.0.0-20250219100646-458e71efe70d h1:ZpQQZiG0Lca3Vb9EPVD2aOwRQiDBRXrpTCg1tF397Hk=
 github.com/benitogf/jsonpatch v0.0.0-20250219100646-458e71efe70d/go.mod h1:O1Z+hTPUrXzHUjmKlpmNYK9wcncZ5rS3K8PqItDO0x0=
-github.com/benitogf/ooo v0.0.0-20251124052607-b19fb995a95c h1:V5OrDdzZ3PCTO3jvPddqh4l9ou/BGcAdY+ETs1zQIQ8=
-github.com/benitogf/ooo v0.0.0-20251124052607-b19fb995a95c/go.mod h1:j6JBofwK7qqwDTALTBUk3f00qcOklU7FL7vh6c49JnU=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
