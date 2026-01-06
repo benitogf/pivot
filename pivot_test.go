@@ -5,16 +5,16 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/benitogf/auth"
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/client"
-	oio "github.com/benitogf/ooo/io"
+	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/pivot"
 	"github.com/goccy/go-json"
 	"github.com/gorilla/mux"
@@ -39,13 +39,12 @@ func RegisterUser(t *testing.T, server *ooo.Server, account string) string {
         "email": "%s@test.cc",
         "phone": "555"
     }`, account, account, account))
-	req, err := http.NewRequest("POST", "/register", bytes.NewBuffer(payload))
+	// Use real HTTP request to ensure sync callbacks work properly
+	resp, err := server.Client.Post("http://"+server.Address+"/register", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
-	w := httptest.NewRecorder()
-	server.Router.ServeHTTP(w, req)
-	response := w.Result()
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	dec := json.NewDecoder(response.Body)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	dec := json.NewDecoder(resp.Body)
 	err = dec.Decode(&c)
 	require.NoError(t, err)
 	require.NotEmpty(t, c.Token)
@@ -58,13 +57,12 @@ func Authorize(t *testing.T, server *ooo.Server, account string) string {
         "account":"%s",
         "password": "000"
     }`, account))
-	req, err := http.NewRequest("POST", "/authorize", bytes.NewBuffer(payload))
+	// Use real HTTP request to ensure sync-on-read works properly
+	resp, err := server.Client.Post("http://"+server.Address+"/authorize", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
-	w := httptest.NewRecorder()
-	server.Router.ServeHTTP(w, req)
-	response := w.Result()
-	require.Equal(t, http.StatusOK, response.StatusCode)
-	dec := json.NewDecoder(response.Body)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	dec := json.NewDecoder(resp.Body)
 	err = dec.Decode(&c)
 	require.NoError(t, err)
 	require.NotEmpty(t, c.Token)
@@ -72,13 +70,12 @@ func Authorize(t *testing.T, server *ooo.Server, account string) string {
 }
 
 // FakeServer creates a server using storage-level synchronization via pivot.Setup.
-// This approach uses BeforeRead for sync-on-read and storage.Watch() for write sync.
-// The authWg parameter is used to signal when external storage events have been processed (pivot only).
-func FakeServer(t *testing.T, pivotIP string, authWg *sync.WaitGroup) *ooo.Server {
+// Optional afterAuthWrite is called after each auth storage write (for test synchronization).
+func FakeServer(t *testing.T, pivotIP string, afterAuthWrite func(key string)) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
-	server.Storage = &ooo.MemoryStorage{}
+	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
 		Timeout: time.Second * 10,
@@ -94,49 +91,33 @@ func FakeServer(t *testing.T, pivotIP string, authWg *sync.WaitGroup) *ooo.Serve
 		return true
 	}
 
-	// Create auth store (not started yet)
-	authStorage := &ooo.MemoryStorage{}
+	// Create auth store
+	authStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	_auth := auth.New(
 		auth.NewJwtStore("key", time.Minute*10),
 		authStorage,
 	)
 
-	// Configure pivot with Config API
-	// - Keys with nil Database default to server.Storage
-	// - NodesKey is automatically added to sync keys
-	// - PivotIP: empty string = this is the pivot server, otherwise = address of pivot
+	// Configure pivot synchronization
 	config := pivot.Config{
 		Keys: []pivot.Key{
 			{Path: "users/*", Database: authStorage},
 			{Path: "settings"},
 		},
-		NodesKey: "things/*", // Node discovery path (reads IP from entries)
+		NodesKey: "things/*",
 		PivotIP:  pivotIP,
 	}
 
-	// Setup pivot - sets server.DbOpt, returns callbacks for external storages
-	result := pivot.Setup(server, config)
+	// Setup pivot - modifies server (routes, OnStorageEvent, BeforeRead)
+	pivot.Setup(server, config)
 
-	server.BeforeRead = result.BeforeRead
-	// Start external storages with the BeforeRead callback
-	err := authStorage.Start(ooo.StorageOpt{BeforeRead: result.BeforeRead})
+	// Use Attach for simplified external storage setup
+	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterAuthWrite})
 	require.NoError(t, err)
 
-	// Watch external storage for write sync using result.SyncCallback
-	go func() {
-		for event := range authStorage.Watch() {
-			result.SyncCallback(event)
-			if authWg != nil {
-				authWg.Done()
-			}
-		}
-	}()
-
-	// WriteFilter and ReadFilter needed to allow reads/writes
-	server.WriteFilter("things/*", ooo.NoopFilter)
-	server.WriteFilter("settings", ooo.NoopFilter)
-	server.ReadFilter("things/*", ooo.NoopFilter)
-	server.ReadFilter("settings", ooo.NoopFilter)
+	server.OpenFilter("things/*")
+	server.OpenFilter("settings")
+	server.OpenFilter("users/*")
 
 	_auth.Routes(server)
 
@@ -144,143 +125,211 @@ func FakeServer(t *testing.T, pivotIP string, authWg *sync.WaitGroup) *ooo.Serve
 	return server
 }
 
-// Global state variables for test
-var (
-	pivotThings   []client.Meta[Thing]
-	nodeThings    []client.Meta[Thing]
-	pivotSettings []client.Meta[Settings]
-	nodeSettings  []client.Meta[Settings]
-)
-
 func TestBasicPivotSync(t *testing.T) {
-	var wg sync.WaitGroup
+	// WaitGroup for websocket events
+	var wsWg sync.WaitGroup
+	// WaitGroup for auth storage writes
+	var authWg sync.WaitGroup
 
-	pivotServer := FakeServer(t, "", &wg)
+	// State variables for subscriptions (protected by mutex for concurrent writes)
+	var pivotThings []client.Meta[Thing]
+	var nodeThings []client.Meta[Thing]
+	var pivotSettings []client.Meta[Settings]
+	var nodeSettings []client.Meta[Settings]
+	var mu sync.Mutex
+
+	// Callback for auth storage writes - signals WaitGroup when expected
+	// Use atomic counter to safely handle writes from sync
+	var pendingWrites int32
+	afterAuthWrite := func(key string) {
+		if atomic.AddInt32(&pendingWrites, -1) >= 0 {
+			authWg.Done()
+		}
+	}
+
+	pivotServer := FakeServer(t, "", afterAuthWrite)
 	defer pivotServer.Close(os.Interrupt)
 
-	nodeServer := FakeServer(t, pivotServer.Address, &wg)
+	nodeServer := FakeServer(t, pivotServer.Address, afterAuthWrite)
 	defer nodeServer.Close(os.Interrupt)
 
-	// Register first user and get auth token (used for initial setup)
-	// Expect 1 authStorage event on pivot (no node registered yet, so no sync)
-	wg.Add(1)
+	// Register first user on pivot - expect 1 auth write
+	atomic.StoreInt32(&pendingWrites, 1)
+	authWg.Add(1)
 	token := RegisterUser(t, pivotServer, "root")
 	require.NotEqual(t, "", token)
-	wg.Wait()
+	authWg.Wait()
 	authHeader := http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
 
-	// Authorize on node server - triggers BeforeRead sync which writes to node's authStorage
-	// Expect 1 authStorage event on node (sync from pivot)
-	wg.Add(1)
+	// Authorize on node (triggers sync-on-read for user data) - expect 1 auth write from sync
+	atomic.StoreInt32(&pendingWrites, 1)
+	authWg.Add(1)
 	token = Authorize(t, nodeServer, "root")
 	require.NotEqual(t, "", token)
-	wg.Wait()
+	authWg.Wait()
 	authHeader = http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
 
 	ctx := t.Context()
-	defer ctx.Done()
-	// Expect 4 initial snapshots (1 per subscription)
-	wg.Add(4)
 
-	// Subscribe to things on pivot server with auth
-	go client.Subscribe(ctx, "ws", pivotServer.Address, "things/*", authHeader, func(data []client.Meta[Thing]) {
-		pivotThings = data
-		wg.Done()
+	// Expect 4 initial snapshots from subscriptions
+	wsWg.Add(4)
+
+	// Subscribe to things on pivot
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "things/*", client.SubscribeListEvents[Thing]{
+		OnMessage: func(data []client.Meta[Thing]) {
+			mu.Lock()
+			pivotThings = data
+			mu.Unlock()
+			wsWg.Done()
+		},
 	})
 
-	// Subscribe to things on node server with auth
-	go client.Subscribe(ctx, "ws", nodeServer.Address, "things/*", authHeader, func(data []client.Meta[Thing]) {
-		nodeThings = data
-		wg.Done()
+	// Subscribe to things on node
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "things/*", client.SubscribeListEvents[Thing]{
+		OnMessage: func(data []client.Meta[Thing]) {
+			mu.Lock()
+			nodeThings = data
+			mu.Unlock()
+			wsWg.Done()
+		},
 	})
 
-	// Subscribe to settings on node server with auth
-	go client.Subscribe(ctx, "ws", nodeServer.Address, "settings", authHeader, func(data []client.Meta[Settings]) {
-		nodeSettings = data
-		wg.Done()
+	// Subscribe to settings on node
+	go client.Subscribe(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "settings", client.SubscribeEvents[Settings]{
+		OnMessage: func(data client.Meta[Settings]) {
+			mu.Lock()
+			nodeSettings = []client.Meta[Settings]{data}
+			mu.Unlock()
+			wsWg.Done()
+		},
 	})
 
-	// Subscribe to settings on pivot server with auth
-	go client.Subscribe(ctx, "ws", pivotServer.Address, "settings", authHeader, func(data []client.Meta[Settings]) {
-		pivotSettings = data
-		wg.Done()
+	// Subscribe to settings on pivot
+	go client.Subscribe(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "settings", client.SubscribeEvents[Settings]{
+		OnMessage: func(data client.Meta[Settings]) {
+			mu.Lock()
+			pivotSettings = []client.Meta[Settings]{data}
+			mu.Unlock()
+			wsWg.Done()
+		},
 	})
 
 	// Wait for initial snapshots
-	wg.Wait()
+	wsWg.Wait()
 
-	// Initial state - things list should be empty
+	// Verify initial state
+	mu.Lock()
 	require.Equal(t, 0, len(pivotThings))
 	require.Equal(t, 0, len(nodeThings))
+	mu.Unlock()
 
-	// Create a thing on pivot server with node's address - expect 1 message on pivotThings
-	// This registers the node so that future storage events will trigger sync to it
-	wg.Add(1)
-	thingID, err := oio.Push(pivotServer, "things/*", Thing{IP: nodeServer.Address, On: false})
+	// Push thing to pivot - expect 1 ws event on pivotThings
+	wsWg.Add(1)
+	thingID, err := ooo.Push(pivotServer, "things/*", Thing{IP: nodeServer.Address, On: false})
 	require.NoError(t, err)
 	require.NotEmpty(t, thingID)
-	wg.Wait()
+	wsWg.Wait()
 
+	mu.Lock()
 	require.Equal(t, 1, len(pivotThings))
 	require.Equal(t, false, pivotThings[0].Data.On)
+	mu.Unlock()
 
-	// Read from node triggers sync - expect 1 message on nodeThings
-	wg.Add(1)
-	_, err = oio.Get[Thing](nodeServer, "things/"+thingID)
+	// Read from node triggers sync - expect 1 ws event on nodeThings
+	wsWg.Add(1)
+	_, err = ooo.Get[Thing](nodeServer, "things/"+thingID)
 	require.NoError(t, err)
-	wg.Wait()
+	wsWg.Wait()
 
+	mu.Lock()
 	require.Equal(t, 1, len(nodeThings))
 	require.Equal(t, false, nodeThings[0].Data.On)
+	mu.Unlock()
 
-	// Now register a second user on pivot - this will trigger sync to node via StorageSync
-	// because getNodes() now returns the node's address from things
-	// Expect 2 authStorage events: 1 on pivot (write) + 1 on node (sync)
-	wg.Add(2)
+	// Register second user on pivot - expect 2 auth writes:
+	// 1. Pivot writes user to its auth storage
+	// 2. SyncCallback triggers node sync, node writes user to its auth storage
+	atomic.StoreInt32(&pendingWrites, 2)
+	authWg.Add(2)
 	token2 := RegisterUser(t, pivotServer, "testuser")
 	require.NotEqual(t, "", token2)
-	wg.Wait()
+	authWg.Wait()
 
-	// Authorize on node server - the user should now be synced
+	// Authorize testuser on node - user already synced, no additional auth write expected
 	token = Authorize(t, nodeServer, "testuser")
 	require.NotEqual(t, "", token)
 	authHeader = http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
 
-	// Modify thing on pivot - expect 2 messages (pivotThings + nodeThings sync)
-	wg.Add(2)
-	pivotThing, err := oio.Get[Thing](pivotServer, "things/"+thingID)
+	// Modify thing on pivot - expect 2 ws events (pivotThings + nodeThings)
+	wsWg.Add(2)
+	pivotThing, err := ooo.Get[Thing](pivotServer, "things/"+thingID)
 	require.NoError(t, err)
 	pivotThing.Data.On = true
-	err = oio.Set(pivotServer, "things/"+thingID, pivotThing.Data)
+	err = ooo.Set(pivotServer, "things/"+thingID, pivotThing.Data)
 	require.NoError(t, err)
-	wg.Wait()
+	wsWg.Wait()
 
-	// Verify via HTTP
-	updatedThing, err := oio.Get[Thing](pivotServer, "things/"+thingID)
+	// Verify via storage
+	updatedThing, err := ooo.Get[Thing](pivotServer, "things/"+thingID)
 	require.NoError(t, err)
 	require.Equal(t, true, updatedThing.Data.On)
 
-	// Verify data consistency via HTTP
-	nodeThing, err := oio.Get[Thing](nodeServer, "things/"+thingID)
+	nodeThing, err := ooo.Get[Thing](nodeServer, "things/"+thingID)
 	require.NoError(t, err)
 	require.Equal(t, updatedThing.Data, nodeThing.Data)
 
-	// Update settings on node - expect 2 messages (nodeSettings + pivotSettings sync)
-	wg.Add(2)
-	err = oio.Set(nodeServer, "settings", Settings{DayEpoch: 1})
+	// Set settings on node - expect 2 ws events (nodeSettings + pivotSettings)
+	wsWg.Add(2)
+	err = ooo.Set(nodeServer, "settings", Settings{DayEpoch: 1})
 	require.NoError(t, err)
-	wg.Wait()
+	wsWg.Wait()
 
+	mu.Lock()
 	require.Equal(t, 1, nodeSettings[0].Data.DayEpoch)
+	require.Equal(t, 1, pivotSettings[0].Data.DayEpoch)
+	mu.Unlock()
 
-	// Update settings on pivot - expect 1 message on pivotSettings
-	wg.Add(1)
-	err = oio.Set(pivotServer, "settings", Settings{DayEpoch: 9})
+	// Set settings on pivot - expect 2 ws events (pivotSettings + nodeSettings)
+	wsWg.Add(2)
+	err = ooo.Set(pivotServer, "settings", Settings{DayEpoch: 9})
 	require.NoError(t, err)
-	wg.Wait()
+	wsWg.Wait()
 
-	require.Equal(t, 9, pivotSettings[0].Data.DayEpoch)
+	// Verify final state via storage
+	pivotSettingsObj, err := pivotServer.Storage.Get("settings")
+	require.NoError(t, err)
+	var pivotSettingsData Settings
+	err = json.Unmarshal(pivotSettingsObj.Data, &pivotSettingsData)
+	require.NoError(t, err)
+	require.Equal(t, 9, pivotSettingsData.DayEpoch)
+
+	nodeSettingsObj, err := nodeServer.Storage.Get("settings")
+	require.NoError(t, err)
+	var nodeSettingsData Settings
+	err = json.Unmarshal(nodeSettingsObj.Data, &nodeSettingsData)
+	require.NoError(t, err)
+	require.Equal(t, 9, nodeSettingsData.DayEpoch)
 }

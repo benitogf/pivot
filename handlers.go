@@ -1,0 +1,104 @@
+package pivot
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"github.com/benitogf/ooo/meta"
+	"github.com/benitogf/ooo/storage"
+	"github.com/gorilla/mux"
+)
+
+func SynchronizeHandler(pivot string, synchronize func() error) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if pivot == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, "this method should not be called on the pivot server")
+			return
+		}
+
+		synchronize()
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func GetList(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		objs, err := db.GetList(path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, err.Error())
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(objs)
+	}
+}
+
+// GetSingle returns a single entry for non-glob keys
+func GetSingle(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		obj, err := db.Get(path)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, err.Error())
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(obj)
+	}
+}
+
+// Set set data on the pivot instance
+func Set(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		decoded, err := meta.DecodeFromReader(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		index := mux.Vars(r)["index"]
+		itemKey := path + "/" + decoded.Index
+		if index == "" {
+			itemKey = path
+		}
+		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// Delete delete data on the pivot instance
+func Delete(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		index := mux.Vars(r)["index"]
+		time := mux.Vars(r)["time"]
+		itemKey := path + "/" + index
+		err := db.Del(itemKey)
+		db.Set(StoragePrefix+path, json.RawMessage(time))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// Activity route to get activity info from the pivot instance
+func Activity(key Key) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if key.Database == nil || !key.Database.Active() {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		activity, _ := checkActivity(key)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(activity)
+	}
+}

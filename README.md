@@ -22,7 +22,10 @@ when connectivity is restored using last-write-wins conflict resolution.
 ```go
 // Create server
 server := &ooo.Server{}
-server.Pivot = pivotAddress // Empty string for pivot server, pivot's address for nodes
+server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+
+// Create external storage (e.g., for auth)
+authStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 
 // Configure pivot synchronization
 config := pivot.Config{
@@ -31,21 +34,14 @@ config := pivot.Config{
         {Path: "settings"},                        // nil Database = server.Storage
     },
     NodesKey: "things/*", // Node discovery path - entries must have "ip" field
+    PivotIP:  pivotIP,    // Empty string = pivot server, otherwise = pivot's address
 }
 
-// Setup pivot - configures routes, sets server.DbOpt, returns callbacks
-result := pivot.Setup(server, config)
+// Setup pivot - modifies server (routes, OnStorageEvent, BeforeRead)
+pivot.Setup(server, config)
 
-server.BeforeRead = result.BeforeRead
-// Start external storages with BeforeRead callback for sync-on-read
-authStorage.Start(ooo.StorageOpt{BeforeRead: result.BeforeRead})
-
-// Watch external storage for write/delete sync
-go func() {
-    for event := range authStorage.Watch() {
-        result.SyncCallback(event)
-    }
-}()
+// Attach external storage for sync (handles Start + BeforeRead + WatchWithCallback)
+pivot.GetInstance(server).Attach(authStorage)
 
 // Start server
 server.Start("localhost:8080")
@@ -55,6 +51,24 @@ server.Start("localhost:8080")
 
 - **Keys**: List of paths to synchronize. Each key can specify a custom `Database` or use `nil` to default to `server.Storage`.
 - **NodesKey**: Path where node entries are stored. Entries must have an `"ip"` field containing the node's address. This key is automatically added to the sync list.
+- **PivotIP**: Empty string for the pivot server, or the pivot's address for node servers.
+
+### External Storage (Attach)
+
+For external storages (not `server.Storage`), use `GetInstance` and `Attach`:
+
+```go
+// GetInstance retrieves the pivot Instance after Setup
+instance := pivot.GetInstance(server)
+
+// Attach handles: Start with BeforeRead + WatchWithCallback for sync
+instance.Attach(authStorage)
+
+// With additional storage options (e.g., for testing)
+instance.Attach(authStorage, storage.Options{AfterWrite: myCallback})
+```
+
+The `Instance` type exposes `BeforeRead` and `SyncCallback` for manual setup if needed.
 
 ### Node Discovery
 
@@ -62,8 +76,112 @@ Nodes register themselves by creating entries at `NodesKey` with their IP addres
 
 ```go
 // On pivot server, create a "thing" that represents a node
-oio.Push(server, "things/*", Thing{IP: nodeServer.Address})
+ooo.Push(server, "things/*", Thing{IP: nodeServer.Address})
 ```
 
 When the pivot server writes data, it reads all entries from `NodesKey`, extracts the `"ip"` field, and triggers sync on each node.
+
+### Route Structure
+
+All pivot routes are prefixed with `/_pivot`:
+
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/_pivot/pivot` | GET | Trigger sync on node |
+| `/_pivot/health/nodes` | GET | Node health status |
+| `/_pivot/activity/{key}` | GET | Activity info for a key |
+| `/_pivot/pivot/{key}` | GET | Get synced data |
+| `/_pivot/pivot/{key}/{index}` | POST | Set synced data |
+| `/_pivot/pivot/{key}/{index}/{time}` | DELETE | Delete synced data |
+
+### Node Health Monitoring
+
+Pivot servers automatically track node health to avoid timeout penalties when syncing to unreachable nodes. The health status is available via a GET endpoint:
+
+```
+GET /_pivot/health/nodes
+```
+
+**Response:**
+```json
+[
+  {"address": "192.168.1.10:8080", "healthy": true, "lastCheck": "2026-01-05T16:43:00+08:00"},
+  {"address": "192.168.1.11:8080", "healthy": false, "lastCheck": "2026-01-05T16:42:30+08:00"}
+]
+```
+
+- **address**: Node's IP address
+- **healthy**: `true` if last sync succeeded, `false` if it failed
+- **lastCheck**: RFC3339 timestamp of last health check
+
+Unhealthy nodes are automatically skipped during sync and re-checked every 30 seconds in the background. When a node comes back online, it will be marked healthy again.
+
+For node servers, this endpoint returns an empty array `[]`.
+
+### HTTP Client Configuration
+
+By default, pivot uses an HTTP client optimized for synchronization:
+- **500ms dial timeout**: Quick detection of unreachable nodes
+- **30s overall timeout**: Handles large data transfers
+- **Connection pooling**: Efficient reuse of connections
+
+You can provide a custom client via `Config.Client`:
+
+```go
+config := pivot.Config{
+    Keys:    []pivot.Key{{Path: "settings"}},
+    PivotIP: pivotIP,
+    Client:  &http.Client{Timeout: 10 * time.Second}, // Custom client
+}
+```
+
+### UI Integration
+
+The ooo storage explorer UI can display pivot synchronization status. The UI shows different states based on the server's role:
+
+- **Pivot Server**: Shows as "Pivot Server" with node health status and synced keys
+- **Node Server**: Shows as "Node Server" with the pivot address it connects to
+- **Not in Cluster**: Shows when pivot is not configured
+
+To enable pivot status in the UI, set `GetPivotInfo` on the UI handler after calling `pivot.Setup`:
+
+```go
+// After pivot.Setup(server, config)
+// The UI handler is typically set up in server.setupRoutes()
+// You can access it via the server's internal setup or create a custom handler
+
+// Example: If you have access to the explorerHandler
+explorerHandler.GetPivotInfo = func() *ui.PivotInfo {
+    instance := pivot.GetInstance(server)
+    if instance == nil {
+        return nil
+    }
+    
+    role := "node"
+    if instance.PivotIP == "" {
+        role = "pivot"
+    }
+    
+    info := &ui.PivotInfo{
+        Role:       role,
+        PivotIP:    instance.PivotIP,
+        SyncedKeys: instance.SyncedKeys,
+    }
+    
+    // Add node health for pivot servers
+    if instance.NodeHealth != nil {
+        for _, status := range instance.NodeHealth.GetStatus() {
+            info.Nodes = append(info.Nodes, ui.PivotNodeStatus{
+                Address:   status.Address,
+                Healthy:   status.Healthy,
+                LastCheck: status.LastCheck,
+            })
+        }
+    }
+    
+    return info
+}
+```
+
+The pivot status button appears in the top navigation bar of the storage explorer, showing the current role (pivot/node/none). Clicking it opens a modal with detailed status information.
 

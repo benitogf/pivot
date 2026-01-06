@@ -4,6 +4,8 @@ go 1.25
 
 replace github.com/benitogf/ooo => ../ooo
 
+replace github.com/benitogf/auth => ../auth
+
 require (
 	github.com/benitogf/auth v0.0.0-20251216152326-c72d27703287
 	github.com/benitogf/ooo v0.0.0-20251124052607-b19fb995a95c
@@ -18,6 +20,7 @@ require (
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec // indirect
 	github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 // indirect
 	github.com/benitogf/jsonpatch v0.0.0-20250219100646-458e71efe70d // indirect
+	github.com/benitogf/network v0.0.0-20251125064936-78e6c87dff2a // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect

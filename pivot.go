@@ -1,28 +1,18 @@
 package pivot
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
+	"net"
 	"net/http"
-	"reflect"
-	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/key"
-	"github.com/benitogf/ooo/meta"
-	"github.com/gorilla/mux"
+	"github.com/benitogf/ooo/storage"
 )
-
-// ActivityEntry keeps the time of the last entry
-type ActivityEntry struct {
-	LastEntry int64 `json:"lastEntry"`
-}
 
 // Node is the expected structure for entries in the NodesKey path.
 // User data stored at NodesKey must include an "ip" field.
@@ -30,584 +20,44 @@ type Node struct {
 	IP string `json:"ip"`
 }
 
-// Key defines a path to synchronize and its associated database.
-type Key struct {
-	Path     string
-	Database ooo.Database // nil means server.Storage
-}
+const (
+	// RoutePrefix is the HTTP route prefix for all pivot endpoints
+	RoutePrefix = "/_pivot"
+	// StoragePrefix is the key prefix for pivot metadata in storage
+	StoragePrefix = "pivot/"
+)
 
 // Config holds the configuration for pivot synchronization.
 type Config struct {
-	Keys        []Key  // Keys to sync (not including NodesKey)
-	NodesKey    string // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
-	RoutePrefix string // Optional prefix for pivot routes (default: ""). Use to avoid conflicts with user routes.
-	PivotIP     string // Address of the pivot server. Empty string means this server IS the pivot.
+	Keys     []Key        // Keys to sync (not including NodesKey)
+	NodesKey string       // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
+	PivotIP  string       // Address of the pivot server. Empty string means this server IS the pivot.
+	Client   *http.Client // Optional HTTP client for sync requests. If nil, DefaultClient() is used.
+}
+
+// DefaultClient returns an HTTP client optimized for pivot synchronization.
+// - Short dial timeout (500ms) to quickly detect unreachable nodes
+// - Longer response timeout (30s) to handle large data transfers
+// - Connection pooling for efficiency
+func DefaultClient() *http.Client {
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   500 * time.Millisecond,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		},
+	}
 }
 
 // getNodes function type used internally for node discovery
 type getNodes func() []string
 
-func FindStorageFor(keys []Key, index string) (ooo.Database, error) {
-	for _, _key := range keys {
-		if key.Match(_key.Path, index) {
-			return _key.Database, nil
-		}
-	}
-	return nil, errors.New("failed to find storage for " + index)
-}
-
-func lastActivity(objs []meta.Object) int64 {
-	var maxTime int64
-	for _, obj := range objs {
-		objTime := max(obj.Created, obj.Updated)
-		if objTime > maxTime {
-			maxTime = objTime
-		}
-	}
-	return maxTime
-}
-
-func checkLastDelete(storage ooo.Database, lastEntry int64, key string) int64 {
-	lastDelete, err := storage.Get("pivot:" + key)
-	if err != nil {
-		// log.Println("failed to get last delete of ", key, err)
-		return lastEntry
-	}
-
-	obj, err := meta.Decode(lastDelete)
-	if err != nil {
-		// log.Println("failed to decode object of last delete for ", key, lastDelete, err)
-		return lastEntry
-	}
-
-	lastDeleteNum, err := strconv.Atoi(string(obj.Data))
-	if err != nil {
-		// log.Println("failed to decode last delete of ", key, lastDelete, err)
-		return lastEntry
-	}
-
-	return max(lastEntry, int64(lastDeleteNum))
-}
-
-func checkActivity(_key Key) (ActivityEntry, error) {
-	var activity ActivityEntry
-	entries, err := _key.Database.Get(_key.Path)
-	if err != nil {
-		return activity, nil
-	}
-	baseKey := _key
-
-	if key.LastIndex(_key.Path) == "*" {
-		_baseKey := strings.Replace(_key.Path, "/*", "", 1)
-		objs, err := meta.DecodeList(entries)
-		if err != nil {
-			// log.Println("failed to decode "+_key+" objects list", err)
-			return activity, err
-		}
-
-		activity.LastEntry = checkLastDelete(_key.Database, lastActivity(objs), _baseKey)
-		return activity, nil
-	}
-
-	obj, err := meta.Decode(entries)
-	if err != nil {
-		// log.Println("failed to decode "+_key+" objects list", err)
-		return activity, err
-	}
-
-	activity.LastEntry = checkLastDelete(_key.Database, max(obj.Created, obj.Updated), baseKey.Path)
-	return activity, nil
-}
-
-func checkPivotActivity(client *http.Client, pivot string, key string) (ActivityEntry, error) {
-	var activity ActivityEntry
-	resp, err := client.Get("http://" + pivot + "/activity/" + key)
-	if err != nil {
-		// log.Println("failed to get activity on "+key+" from pivot at "+pivot, err)
-		return activity, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return activity, errors.New("failed to get activity on " + key + " from pivot at " + pivot)
-	}
-
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&activity)
-
-	return activity, err
-}
-
-func getEntriesFromPivot(client *http.Client, pivot string, key string) ([]meta.Object, error) {
-	var objs []meta.Object
-	resp, err := client.Get("http://" + pivot + "/" + key)
-	if err != nil {
-		return objs, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return objs, errors.New("failed to get " + key + " from pivot " + resp.Status)
-	}
-
-	objs, err = meta.DecodeListFromReader(resp.Body)
-	if err != nil {
-		return objs, err
-	}
-
-	return objs, nil
-}
-
-// TriggerNodeSync will call pivot on a node server
-func TriggerNodeSync(client *http.Client, node, routePrefix string) {
-	resp, err := client.Get("http://" + node + routePrefix + "/pivot")
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		// log.Println("failed to trigger sync from pivot on " + node + " " + resp.Status)
-		return
-	}
-}
-
-func getEntryFromPivot(client *http.Client, pivot string, key string) (meta.Object, error) {
-	var obj meta.Object
-	resp, err := client.Get("http://" + pivot + "/" + key)
-	if err != nil {
-		// log.Println("failed to get "+key+" from pivot", err)
-		return obj, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return obj, errors.New("failed to get " + key + " from pivot " + resp.Status)
-	}
-
-	return meta.DecodeFromReader(resp.Body)
-}
-
-// get from pivot and write to local
-func syncLocalEntries(client *http.Client, pivot string, _key Key, lastEntry int64) error {
-	if key.LastIndex(_key.Path) == "*" {
-		baseKey := strings.Replace(_key.Path, "/*", "", 1)
-		objsPivot, err := getEntriesFromPivot(client, pivot, _key.Path)
-		if err != nil {
-			// log.Println("sync local " + baseKey + " failed to get from pivot")
-			return err
-		}
-
-		localData, err := _key.Database.Get(_key.Path)
-		if err != nil {
-			// log.Println("sync local " + _key.Path + " failed to read local entries")
-			return err
-		}
-
-		objsLocal, err := meta.DecodeList(localData)
-		if err != nil {
-			// log.Println("sync local " + _key + " failed to decode local entries")
-			return err
-		}
-
-		objsToDelete := getEntriesNegativeDiff(objsLocal, objsPivot)
-		for _, index := range objsToDelete {
-			_key.Database.Del(baseKey + "/" + index)
-		}
-
-		objsToSend := getEntriesPositiveDiff(objsLocal, objsPivot)
-		for _, obj := range objsToSend {
-			_key.Database.SetWithMeta(baseKey+"/"+obj.Index, obj.Data, obj.Created, obj.Updated)
-			// if err != nil {
-			// 	log.Println("failed to store entry from pivot", err)
-			// }
-		}
-		_key.Database.Set("pivot:"+baseKey, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
-		return nil
-	}
-
-	obj, err := getEntryFromPivot(client, pivot, _key.Path)
-	if err != nil {
-		// log.Println("sync local " + _key.Path + " failed to get from pivot")
-		return err
-	}
-	_key.Database.SetWithMeta(_key.Path, obj.Data, obj.Created, obj.Updated)
-	// if err != nil {
-	// 	log.Println("failed to store entry from pivot", err)
-	// }
-	_key.Database.Set("pivot:"+_key.Path, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
-
-	return nil
-}
-
-func sendToPivot(client *http.Client, key string, pivot string, obj meta.Object) error {
-	buf := new(bytes.Buffer)
-	json.NewEncoder(buf).Encode(obj)
-	resp, err := client.Post("http://"+pivot+"/pivot/"+key, "application/json", buf)
-	if err != nil {
-		// log.Println("failed to send update to pivot", err)
-		return err
-	}
-
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		// log.Println("http://" + pivot + "/pivot/" + key)
-		// log.Println("failed to send update to pivot " + resp.Status)
-		return errors.New("failed to send update to pivot " + resp.Status)
-	}
-
-	return nil
-}
-
-func sendDelete(client *http.Client, key, pivot string, lastEntry int64) error {
-	req, err := http.NewRequest("DELETE", "http://"+pivot+"/pivot/"+key+"/"+strconv.FormatInt(lastEntry, 10), nil)
-	if err != nil {
-		// log.Println("failed to send delete to pivot", err)
-		return err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		// log.Println("failed to send delete to pivot", err)
-		return err
-	}
-
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		// log.Println("http://" + pivot + "/pivot/" + key)
-		// log.Println("failed to send delete to pivot " + resp.Status)
-		return errors.New("failed to send delete to pivot " + resp.Status)
-	}
-
-	return nil
-}
-
-// getEntriesNegativeDiff returns entries in objsDst that are not in objsSrc (deletions).
-// O(n) using map lookup instead of O(n²) nested loops.
-func getEntriesNegativeDiff(objsDst, objsSrc []meta.Object) []string {
-	// Build map of source indices for O(1) lookup
-	srcIndices := make(map[string]struct{}, len(objsSrc))
-	for _, obj := range objsSrc {
-		srcIndices[obj.Index] = struct{}{}
-	}
-
-	var result []string
-	for _, objDst := range objsDst {
-		if _, found := srcIndices[objDst.Index]; !found {
-			result = append(result, objDst.Index)
-		}
-	}
-	return result
-}
-
-// getEntriesPositiveDiff returns entries in objsSrc that are new or updated compared to objsDst.
-// O(n) using map lookup instead of O(n²) nested loops.
-func getEntriesPositiveDiff(objsDst, objsSrc []meta.Object) []meta.Object {
-	// Build map of destination entries for O(1) lookup
-	dstEntries := make(map[string]meta.Object, len(objsDst))
-	for _, obj := range objsDst {
-		dstEntries[obj.Index] = obj
-	}
-
-	var result []meta.Object
-	for _, objSrc := range objsSrc {
-		if objDst, found := dstEntries[objSrc.Index]; !found {
-			// New entry - not in destination
-			result = append(result, objSrc)
-		} else if objSrc.Updated > objDst.Updated {
-			// Updated entry - source is newer
-			result = append(result, objSrc)
-		}
-	}
-	return result
-}
-
-// get from local and send to pivot (updates only, no new entries or deletes)
-func syncPivotEntries(client *http.Client, pivot string, _key Key, lastEntry int64) error {
-	localData, err := _key.Database.Get(_key.Path)
-	if err != nil {
-		// log.Println("sync pivot " + _key + " failed to read local entries")
-		return err
-	}
-	if key.LastIndex(_key.Path) == "*" {
-		baseKey := strings.Replace(_key.Path, "/*", "", 1)
-		objsLocal, err := meta.DecodeList(localData)
-		if err != nil {
-			// log.Println("sync pivot " + _key + " failed to decode local entries")
-			return err
-		}
-
-		objsPivot, err := getEntriesFromPivot(client, pivot, _key.Path)
-		if err != nil {
-			// log.Println("sync pivot " + baseKey + " failed to get from pivot")
-			return err
-		}
-
-		objsToDelete := getEntriesNegativeDiff(objsPivot, objsLocal)
-		for _, index := range objsToDelete {
-			sendDelete(client, baseKey+"/"+index, pivot, lastEntry)
-		}
-
-		objsToSend := getEntriesPositiveDiff(objsPivot, objsLocal)
-		for _, obj := range objsToSend {
-			sendToPivot(client, baseKey+"/"+obj.Index, pivot, obj)
-		}
-
-		return nil
-	}
-
-	obj, err := meta.Decode(localData)
-	if err != nil {
-		// log.Println("sync pivot " + _key + " failed to decode local entries")
-		return err
-	}
-	sendToPivot(client, obj.Index, pivot, obj)
-
-	return nil
-}
-
-func synchronizeItem(client *http.Client, pivot string, key Key) error {
-	update := false
-	_key := strings.Replace(key.Path, "/*", "", 1)
-	//check
-	activityPivot, err := checkPivotActivity(client, pivot, _key)
-	if err != nil {
-		return errors.New("failed to check activity for " + _key + " on pivot")
-	}
-	activityLocal, err := checkActivity(key)
-	if err != nil {
-		return errors.New("failed to check activity for " + _key + " on local")
-	}
-
-	// sync
-	if activityLocal.LastEntry > activityPivot.LastEntry {
-		err := syncPivotEntries(client, pivot, key, activityLocal.LastEntry)
-		if err != nil {
-			return err
-		}
-		update = true
-	}
-
-	if activityLocal.LastEntry < activityPivot.LastEntry {
-		err := syncLocalEntries(client, pivot, key, activityPivot.LastEntry)
-		if err != nil {
-			return err
-		}
-		update = true
-	}
-
-	if update {
-		return nil
-	}
-
-	return errors.New("nothing to synchronize for " + key.Path)
-}
-
-// synchronizeKeys performs the actual synchronization without mutex handling
-func synchronizeKeys(client *http.Client, pivot string, keys []Key) error {
-	update := false
-	for _, key := range keys {
-		errItem := synchronizeItem(client, pivot, key)
-		if errItem == nil {
-			update = true
-		}
-	}
-	if update {
-		return nil
-	}
-	return errors.New("nothing to synchronize")
-}
-
-// syncFuncs holds the synchronize functions for a server
-type syncFuncs struct {
-	// sync waits for the lock - used by /pivot handler
-	sync func() error
-	// trySync skips if locked - used by BeforeRead and StorageSync
-	trySync func() error
-}
-
-// makeSyncFuncs creates synchronize functions with a shared per-server mutex.
-// Note: Per-key mutexes could allow parallel sync of different keys but adds complexity.
-// The current per-server mutex is sufficient for most use cases.
-func makeSyncFuncs(client *http.Client, pivot string, keys []Key) syncFuncs {
-	var mu sync.Mutex
-	return syncFuncs{
-		sync: func() error {
-			mu.Lock()
-			defer mu.Unlock()
-			return synchronizeKeys(client, pivot, keys)
-		},
-		trySync: func() error {
-			if !mu.TryLock() {
-				return nil
-			}
-			defer mu.Unlock()
-			return synchronizeKeys(client, pivot, keys)
-		},
-	}
-}
-
-// StorageSyncCallback is the callback type for storage sync events
-type StorageSyncCallback func(event ooo.StorageEvent)
-
-// StorageSync creates a StorageSyncCallback that triggers synchronization on storage events.
-// This replaces the need for SyncWriteFilter and SyncDeleteFilter.
-// For pivot servers (pivotIP == ""), it notifies all nodes on any storage change.
-// For node servers, it synchronizes with the pivot on any storage change.
-func StorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes getNodes, synchronize func() error, routePrefix string) StorageSyncCallback {
-	return func(event ooo.StorageEvent) {
-		// Find matching key and its database for this event
-		var matchedKey string
-		var matchedDB ooo.Database
-		for _, k := range keys {
-			if key.Match(k.Path, event.Key) {
-				matchedKey = strings.Replace(k.Path, "/*", "", 1)
-				matchedDB = k.Database
-				break
-			}
-		}
-
-		if matchedKey == "" || matchedDB == nil {
-			return
-		}
-
-		// Track delete timestamps for proper sync
-		if event.Operation == "del" {
-			matchedDB.Set("pivot:"+matchedKey, json.RawMessage(ooo.Time()))
-		}
-
-		if pivotIP == "" {
-			// This is the pivot server - notify all nodes synchronously
-			// so that data is available on nodes before returning
-			for _, node := range _getNodes() {
-				TriggerNodeSync(client, node, routePrefix)
-			}
-		} else {
-			// This is a node - synchronize with pivot
-			go synchronize()
-		}
-	}
-}
-
-func Pivot(pivot string, synchronize func() error) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if pivot == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(w, "this method should not be called on the pivot server")
-			return
-		}
-
-		synchronize()
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-func Get(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var objs []meta.Object
-		raw, err := storage.Get(key)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprint(w, err.Error())
-			return
-		}
-
-		err = json.Unmarshal(raw, &objs)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprint(w, err.Error())
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(objs)
-	}
-}
-
-// Set set data on the pivot instance
-func Set(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		decoded, err := meta.DecodeFromReader(r.Body)
-		if err != nil {
-			// log.Println("failed to decode "+key+" entry on pivot", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		index := mux.Vars(r)["index"]
-		itemKey := key + "/" + decoded.Index
-		if index == "" {
-			itemKey = key
-		}
-		_, err = storage.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
-		if err != nil {
-			// log.Println("failed to store on pivot "+key+" entry", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-// Delete delete data on the pivot instance
-func Delete(storage ooo.Database, key string) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		index := mux.Vars(r)["index"]
-		time := mux.Vars(r)["time"]
-		itemKey := key + "/" + index
-		err := storage.Del(itemKey)
-		storage.Set("pivot:"+key, json.RawMessage(time))
-		if err != nil {
-			// log.Println("failed to delete on pivot "+key+" entry", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}
-}
-
-// Activity route to get activity info from the pivot instance
-func Activity(key Key) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if key.Database == nil || !key.Database.Active() {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		activity, _ := checkActivity(key)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(activity)
-	}
-}
-
-// SetupResult contains the callbacks returned by Setup for use with external storages.
-type SetupResult struct {
-	BeforeRead   func(string)        // Callback for sync-on-read
-	SyncCallback StorageSyncCallback // Callback for storage events (write/delete sync)
-}
-
-// Setup configures pivot synchronization using Config.
-// NodesKey is automatically added to sync keys and uses server.Storage.
-// Keys with nil Database default to server.Storage.
-// The internal getNodes function reads from NodesKey and extracts "ip" field.
-//
-// Usage:
-//
-//	config := pivot.Config{
-//	    Keys: []pivot.Key{
-//	        {Path: "users/*", Database: authStore},
-//	        {Path: "settings"},  // nil Database = server.Storage
-//	    },
-//	    NodesKey: "things/*",  // Automatically synced via server.Storage
-//	}
-//
-//	result := pivot.Setup(server, config)
-//	authStore.Start(ooo.StorageOpt{BeforeRead: result.BeforeRead})
-//	go func() {
-//	    for event := range authStore.Watch() {
-//	        result.SyncCallback(event)
-//	    }
-//	}()
-//	server.Start("localhost:8080")
-//
 // buildKeys constructs the full keys list from config.
 // Keys with nil Database are filled with server.Storage.
 // NodesKey is appended if not already present.
@@ -643,45 +93,47 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
 	return func() []string {
 		var result []string
-		if nodesKey == "" {
+		if nodesKey == "" || server.Storage == nil {
 			return result
 		}
-		raw, err := server.Storage.Get(nodesKey)
+		objs, err := server.Storage.GetList(nodesKey)
 		if err != nil {
 			return result
 		}
-		var nodes []struct {
-			Data Node `json:"data"`
-		}
-		if err := json.Unmarshal(raw, &nodes); err != nil {
-			return result
-		}
-		for _, n := range nodes {
-			if n.Data.IP != "" {
-				result = append(result, n.Data.IP)
+		for _, obj := range objs {
+			var node Node
+			if err := json.Unmarshal(obj.Data, &node); err != nil {
+				continue
+			}
+			if node.IP != "" {
+				result = append(result, node.IP)
 			}
 		}
 		return result
 	}
 }
 
-// storedPivotIPs tracks the pivot IP for each storage instance to detect changes between runs.
-// Key is the storage pointer address, value is the last known pivot IP.
-var storedPivotIPs = make(map[uintptr]string)
-var storedPivotIPsMu sync.Mutex
+// pivotIPKey is the storage key for persisting the pivot IP
+const pivotIPKey = StoragePrefix + "pivotip"
 
 // checkPivotIPChange checks if the pivot IP changed since last run for this storage.
 // If changed, wipes all data for the configured keys to prevent contamination.
+// The pivot IP is persisted in storage so it survives process restarts.
 // Returns true if data was wiped.
 func checkPivotIPChange(server *ooo.Server, config Config, pivotIP string) bool {
-	storedPivotIPsMu.Lock()
-	defer storedPivotIPsMu.Unlock()
+	// Skip if storage is not active (will be checked again when storage starts)
+	if server.Storage == nil || !server.Storage.Active() {
+		return false
+	}
 
-	// Use storage pointer as key to track pivot IP per storage instance
-	storageKey := uintptr(reflect.ValueOf(server.Storage).Pointer())
-	storedIP, exists := storedPivotIPs[storageKey]
+	// Read stored pivot IP from storage
+	obj, err := server.Storage.Get(pivotIPKey)
+	storedIP := ""
+	if err == nil {
+		storedIP = string(obj.Data)
+	}
 
-	if exists && storedIP != pivotIP {
+	if storedIP != "" && storedIP != pivotIP {
 		log.Printf("WARNING: Pivot IP changed from %q to %q - wiping all synced data", storedIP, pivotIP)
 		// Wipe all data for configured keys
 		for _, k := range config.Keys {
@@ -696,28 +148,28 @@ func checkPivotIPChange(server *ooo.Server, config Config, pivotIP string) bool 
 			wipeStorage(server.Storage, config.NodesKey)
 		}
 		// Update stored pivot IP after wipe
-		storedPivotIPs[storageKey] = pivotIP
+		server.Storage.Set(pivotIPKey, []byte(pivotIP))
 		return true
 	}
 
 	// First run or same pivot IP - just store/update
-	storedPivotIPs[storageKey] = pivotIP
+	server.Storage.Set(pivotIPKey, []byte(pivotIP))
 	return false
 }
 
 // wipeStorage deletes all entries matching the given path pattern
-func wipeStorage(db ooo.Database, path string) {
+// and also deletes the associated activity metadata
+func wipeStorage(db storage.Database, path string) {
+	baseKey := strings.Replace(path, "/*", "", 1)
+	// Delete activity metadata
+	db.Del(StoragePrefix + baseKey)
+
 	// For wildcard paths, get all entries and delete individually
 	if key.LastIndex(path) == "*" {
-		data, err := db.Get(path)
+		objs, err := db.GetList(path)
 		if err != nil {
 			return
 		}
-		objs, err := meta.DecodeList(data)
-		if err != nil {
-			return
-		}
-		baseKey := strings.Replace(path, "/*", "", 1)
 		for _, obj := range objs {
 			db.Del(baseKey + "/" + obj.Index)
 		}
@@ -726,9 +178,18 @@ func wipeStorage(db ooo.Database, path string) {
 	}
 }
 
-func Setup(server *ooo.Server, config Config) SetupResult {
+// Setup configures pivot synchronization on the server.
+// It modifies the server by setting routes, OnStorageEvent, and BeforeRead.
+// Returns the server to make side-effects explicit.
+// Use GetInstance(server) to access BeforeRead/SyncCallback for external storages.
+func Setup(server *ooo.Server, config Config) *ooo.Server {
 	pivotIP := config.PivotIP
-	client := server.Client
+
+	// Use config.Client if provided, otherwise use DefaultClient()
+	client := config.Client
+	if client == nil {
+		client = DefaultClient()
+	}
 
 	// Check if pivot IP changed since last run - wipe data if so
 	checkPivotIPChange(server, config, pivotIP)
@@ -737,40 +198,45 @@ func Setup(server *ooo.Server, config Config) SetupResult {
 	getNodes := makeGetNodes(server, config.NodesKey)
 
 	// Create per-server synchronize functions with shared mutex
-	// sync waits for lock (used by /pivot handler)
+	// sync waits for lock (used by /synchronize handler)
 	// trySync skips if locked (used by BeforeRead and StorageSync)
 	sf := makeSyncFuncs(client, pivotIP, keys)
 
-	// Route prefix for pivot routes (default: empty, e.g. "/_pivot" to isolate)
-	prefix := config.RoutePrefix
+	// Create node health tracker for pivot servers to skip unhealthy nodes
+	var nodeHealth *NodeHealth
+	if pivotIP == "" {
+		nodeHealth = NewNodeHealth(client)
+		nodeHealth.StartBackgroundCheck(getNodes, server.Active)
+	}
 
-	syncCallback := StorageSync(client, pivotIP, keys, getNodes, sf.trySync, prefix)
+	syncCallback := StorageSync(client, pivotIP, keys, getNodes, sf.trySync, nodeHealth)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
-	server.OnStorageEvent = ooo.StorageEventCallback(syncCallback)
+	server.OnStorageEvent = storage.EventCallback(syncCallback)
 
 	// Set up HTTP routes for pivot protocol
-	// /pivot handler uses sync (waits for lock) to ensure sync completes
-	server.Router.HandleFunc(prefix+"/pivot", Pivot(pivotIP, sf.sync)).Methods("GET")
+	// /synchronize handler uses sync (waits for lock) to ensure sync completes
+	server.Router.HandleFunc(RoutePrefix+"/synchronize", SynchronizeHandler(pivotIP, sf.sync)).Methods("GET")
+
+	// Node health endpoint (only meaningful on pivot servers)
+	server.Router.HandleFunc(RoutePrefix+"/health/nodes", NodeHealthHandler(nodeHealth)).Methods("GET")
 	for _, k := range keys {
 		baseKey := strings.Replace(k.Path, "/*", "", 1)
-		server.Router.HandleFunc(prefix+"/activity/"+baseKey, Activity(k)).Methods("GET")
+		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k)).Methods("GET")
 		if baseKey != k.Path {
-			server.Router.HandleFunc(prefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey)).Methods("POST")
-			server.Router.HandleFunc(prefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
 		} else {
-			server.Router.HandleFunc(prefix+"/pivot/"+baseKey, Set(k.Database, baseKey)).Methods("POST")
-			server.Router.HandleFunc(prefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
 		}
-		// For keys with external storage (not server.Storage), expose GET route
-		if k.Database != nil && k.Database != server.Storage {
-			if baseKey != k.Path {
-				// List pattern like "users/*" - register as "/users/*" to handle the wildcard
-				server.Router.HandleFunc(prefix+"/"+baseKey+"/{path:.*}", Get(k.Database, k.Path)).Methods("GET")
-				server.Router.HandleFunc(prefix+"/"+baseKey, Get(k.Database, k.Path)).Methods("GET")
-			} else {
-				server.Router.HandleFunc(prefix+"/"+k.Path, Get(k.Database, k.Path)).Methods("GET")
-			}
+		// Expose GET routes for all synced keys
+		if baseKey != k.Path {
+			// List pattern like "users/*" - register as "/users/*" to handle the wildcard
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{path:.*}", GetList(k.Database, k.Path)).Methods("GET")
+		} else {
+			// Single key like "settings" - use GetSingle
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+k.Path, GetSingle(k.Database, k.Path)).Methods("GET")
 		}
 	}
 
@@ -793,8 +259,23 @@ func Setup(server *ooo.Server, config Config) SetupResult {
 		}
 	}
 
-	return SetupResult{
+	// Assign BeforeRead to server
+	server.BeforeRead = beforeRead
+
+	// Store instance for GetInstance lookup
+	// Include pivot info for UI integration
+	var keyPaths []string
+	for _, k := range keys {
+		keyPaths = append(keyPaths, k.Path)
+	}
+	instance := &Instance{
 		BeforeRead:   beforeRead,
 		SyncCallback: syncCallback,
+		PivotIP:      pivotIP,
+		SyncedKeys:   keyPaths,
+		NodeHealth:   nodeHealth,
 	}
+	storeInstance(server, instance)
+
+	return server
 }
