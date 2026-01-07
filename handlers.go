@@ -10,7 +10,9 @@ import (
 	"github.com/gorilla/mux"
 )
 
-func SynchronizeHandler(pivot string, synchronize func() error) func(w http.ResponseWriter, r *http.Request) {
+// SynchronizePivotHandler handles /synchronize/pivot - pull-only sync from pivot.
+// Called by pivot when it has changes (including deletes) that nodes should pull.
+func SynchronizePivotHandler(pivot string, pullOnly func() error) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pivot == "" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -18,7 +20,22 @@ func SynchronizeHandler(pivot string, synchronize func() error) func(w http.Resp
 			return
 		}
 
-		synchronize()
+		pullOnly()
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// SynchronizeNodeHandler handles /synchronize/node - bidirectional sync.
+// Called by node when it has local changes to push to pivot.
+func SynchronizeNodeHandler(pivot string, bidirectional func() error) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if pivot == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, "this method should not be called on the pivot server")
+			return
+		}
+
+		bidirectional()
 		w.WriteHeader(http.StatusOK)
 	}
 }

@@ -99,6 +99,7 @@ func FakeServer(t *testing.T, pivotIP string, afterAuthWrite func(key string)) *
 	)
 
 	// Configure pivot synchronization
+	// NodesKey is automatically added to Keys by buildKeys if not present
 	config := pivot.Config{
 		Keys: []pivot.Key{
 			{Path: "users/*", Database: authStorage},
@@ -332,4 +333,77 @@ func TestBasicPivotSync(t *testing.T) {
 	err = json.Unmarshal(nodeSettingsObj.Data, &nodeSettingsData)
 	require.NoError(t, err)
 	require.Equal(t, 9, nodeSettingsData.DayEpoch)
+
+	// Test delete sync from pivot to node
+	// Push a second thing to pivot
+	wsWg.Add(2) // pivotThings + nodeThings
+	thingID2, err := ooo.Push(pivotServer, "things/*", Thing{IP: "10.0.0.1", On: true})
+	require.NoError(t, err)
+	require.NotEmpty(t, thingID2)
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things")
+	require.Equal(t, 2, len(nodeThings), "node should have 2 things")
+	mu.Unlock()
+
+	// Delete from pivot - expect 2 ws events (pivotThings + nodeThings after sync)
+	// With /synchronize/pivot endpoint, node pulls from pivot and sees the delete
+	// The delete is tracked to prevent StorageSync from re-adding the item
+	wsWg.Add(2)
+	err = pivotServer.Storage.Del("things/" + thingID2)
+	require.NoError(t, err)
+	wsWg.Wait()
+
+	// Verify pivot storage
+	_, err = pivotServer.Storage.Get("things/" + thingID2)
+	require.Error(t, err, "thingID2 should be deleted from pivot storage")
+
+	// Verify node storage - delete should have propagated via pull-only sync
+	_, err = nodeServer.Storage.Get("things/" + thingID2)
+	require.Error(t, err, "thingID2 should be deleted from node storage after sync")
+
+	// Verify subscription state
+	mu.Lock()
+	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after pivot-to-node delete")
+	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after pivot-to-node delete")
+	require.Equal(t, thingID, pivotThings[0].Index)
+	require.Equal(t, thingID, nodeThings[0].Index)
+	mu.Unlock()
+
+	// Test delete sync from node to pivot
+	// Push a third thing to node
+	wsWg.Add(2) // pivotThings + nodeThings
+	thingID3, err := ooo.Push(nodeServer, "things/*", Thing{IP: "172.16.0.1", On: false})
+	require.NoError(t, err)
+	require.NotEmpty(t, thingID3)
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things after node push")
+	require.Equal(t, 2, len(nodeThings), "node should have 2 things after node push")
+	mu.Unlock()
+
+	// Delete from node - expect 2 ws events (nodeThings + pivotThings after sync)
+	// Node's StorageSync triggers bidirectional sync which sends delete to pivot
+	wsWg.Add(2)
+	err = nodeServer.Storage.Del("things/" + thingID3)
+	require.NoError(t, err)
+	wsWg.Wait()
+
+	// Verify node storage
+	_, err = nodeServer.Storage.Get("things/" + thingID3)
+	require.Error(t, err, "thingID3 should be deleted from node storage")
+
+	// Verify pivot storage - delete should have propagated via bidirectional sync
+	_, err = pivotServer.Storage.Get("things/" + thingID3)
+	require.Error(t, err, "thingID3 should be deleted from pivot storage after sync")
+
+	// Verify subscription state
+	mu.Lock()
+	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after node-to-pivot delete")
+	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after node-to-pivot delete")
+	require.Equal(t, thingID, pivotThings[0].Index)
+	require.Equal(t, thingID, nodeThings[0].Index)
+	mu.Unlock()
 }

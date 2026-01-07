@@ -8,10 +8,10 @@ replace github.com/benitogf/auth => ../auth
 
 require (
 	github.com/benitogf/auth v0.0.0-20251216152326-c72d27703287
+	github.com/benitogf/network v0.0.0-20251125064936-78e6c87dff2a
 	github.com/benitogf/ooo v0.0.0-20251124052607-b19fb995a95c
 	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/mux v1.8.1
-	github.com/gorilla/websocket v1.5.3
 	github.com/stretchr/testify v1.11.1
 )
 
@@ -20,11 +20,11 @@ require (
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec // indirect
 	github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 // indirect
 	github.com/benitogf/jsonpatch v0.0.0-20250219100646-458e71efe70d // indirect
-	github.com/benitogf/network v0.0.0-20251125064936-78e6c87dff2a // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect
 	github.com/gorilla/handlers v1.5.2 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/pkg/expect v0.0.0-20191209053905-1fe4c9394a8a // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/rs/cors v1.11.1 // indirect

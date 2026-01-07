@@ -15,9 +15,11 @@ func TriggerNodeSync(client *http.Client, node string) {
 	TriggerNodeSyncWithHealth(client, node)
 }
 
-// TriggerNodeSyncWithHealth will call pivot on a node server and return success status
+// TriggerNodeSyncWithHealth triggers a pull-only sync on a node server.
+// Uses /synchronize/pivot endpoint so node pulls from pivot without sending data back.
+// This prevents re-adding items that pivot just deleted.
 func TriggerNodeSyncWithHealth(client *http.Client, node string) bool {
-	resp, err := client.Get("http://" + node + RoutePrefix + "/synchronize")
+	resp, err := client.Get("http://" + node + RoutePrefix + "/synchronize/pivot")
 	if err != nil {
 		return false
 	}

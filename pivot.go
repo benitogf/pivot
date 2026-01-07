@@ -209,14 +209,16 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		nodeHealth.StartBackgroundCheck(getNodes, server.Active)
 	}
 
-	syncCallback := StorageSync(client, pivotIP, keys, getNodes, sf.trySync, nodeHealth)
+	syncCallback := StorageSync(client, pivotIP, keys, getNodes, sf.trySync, nodeHealth, sf.isRecentPullDelete, sf.isRecentPullSet, sf.isRecentPull)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
 	server.OnStorageEvent = storage.EventCallback(syncCallback)
 
 	// Set up HTTP routes for pivot protocol
-	// /synchronize handler uses sync (waits for lock) to ensure sync completes
-	server.Router.HandleFunc(RoutePrefix+"/synchronize", SynchronizeHandler(pivotIP, sf.sync)).Methods("GET")
+	// /synchronize/pivot - pull-only sync, used when pivot triggers sync on node (e.g., after delete)
+	// /synchronize/node - bidirectional sync, used when node has local changes to push
+	server.Router.HandleFunc(RoutePrefix+"/synchronize/pivot", SynchronizePivotHandler(pivotIP, sf.pullOnly)).Methods("GET")
+	server.Router.HandleFunc(RoutePrefix+"/synchronize/node", SynchronizeNodeHandler(pivotIP, sf.bidirectional)).Methods("GET")
 
 	// Node health endpoint (only meaningful on pivot servers)
 	server.Router.HandleFunc(RoutePrefix+"/health/nodes", NodeHealthHandler(nodeHealth)).Methods("GET")

@@ -1,7 +1,5 @@
 github.com/bclicn/color v0.0.0-20180711051946-108f2023dc84 h1:cutFptzj+ospnc1PETUqcSVTH3VQ44Bi0rpt3nE9gvo=
 github.com/bclicn/color v0.0.0-20180711051946-108f2023dc84/go.mod h1:Va9ap1qxjAWkIVaW1E9rH0aNgE8SDI5A4n8Ds8P0fAA=
-github.com/benitogf/auth v0.0.0-20251216152326-c72d27703287 h1:0EJH36MVc5+7gaYXYjM9DKUvGyMCvpruPz2ruwL3VAo=
-github.com/benitogf/auth v0.0.0-20251216152326-c72d27703287/go.mod h1:3oCvWA8j5XYH/SN8iDsETLEfK4EcGvJ2fuW3Uo+vE04=
 github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec h1:I2p/9YsiAMB+J2DrC+e7OvEWZCmpwolMQ23ejoEMFEE=
 github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec/go.mod h1:hl/Xd8DKuMgC/ClZ2dPZz6mvXaxdkjrt0mr0+jF4UkQ=
 github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 h1:0ERndS9JkEvEq/yXjiZq41lMb3QfmQWUIXycjkRbWOc=

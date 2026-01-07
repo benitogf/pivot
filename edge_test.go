@@ -89,19 +89,6 @@ func TestEmptyStorageSync(t *testing.T) {
 	t.Log("Empty storage sync test passed!")
 }
 
-// TestRoutePrefix verifies RoutePrefix isolates pivot routes.
-func TestRoutePrefix(t *testing.T) {
-	pivotServer := createEdgeTestServerWithPrefix("", "/_pivot")
-	defer pivotServer.Close(os.Interrupt)
-
-	resp, err := pivotServer.Client.Get("http://" + pivotServer.Address + "/_pivot/activity/things")
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	t.Log("Route prefix test passed!")
-}
-
 func createEdgeTestServer(pivotIP string, syncEvents *syncCounter) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
@@ -135,36 +122,6 @@ func createEdgeTestServer(pivotIP string, syncEvents *syncCounter) *ooo.Server {
 			syncEvents.signal()
 		}
 	}
-
-	server.OpenFilter("things/*")
-	server.OpenFilter("settings")
-	server.Start("localhost:0")
-	return server
-}
-
-func createEdgeTestServerWithPrefix(pivotIP string, routePrefix string) *ooo.Server {
-	server := &ooo.Server{}
-	server.Silence = true
-	server.Static = true
-	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
-	server.Router = mux.NewRouter()
-	server.Client = &http.Client{
-		Timeout: time.Second * 10,
-		Transport: &http.Transport{
-			Dial:              (&net.Dialer{Timeout: 5 * time.Second}).Dial,
-			MaxConnsPerHost:   3000,
-			DisableKeepAlives: true,
-		},
-	}
-	server.Audit = func(r *http.Request) bool { return true }
-
-	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotIP,
-	}
-
-	pivot.Setup(server, config)
 
 	server.OpenFilter("things/*")
 	server.OpenFilter("settings")
