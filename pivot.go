@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +58,9 @@ func DefaultClient() *http.Client {
 
 // getNodes function type used internally for node discovery
 type getNodes func() []string
+
+// GetNodes is the exported type for node discovery functions (backward compatibility)
+type GetNodes func() []string
 
 // buildKeys constructs the full keys list from config.
 // Keys with nil Database are filled with server.Storage.
@@ -197,10 +201,11 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	keys := buildKeys(server, config)
 	getNodes := makeGetNodes(server, config.NodesKey)
 
-	// Create per-server synchronize functions with shared mutex
-	// sync waits for lock (used by /synchronize handler)
-	// trySync skips if locked (used by BeforeRead and StorageSync)
-	sf := makeSyncFuncs(client, pivotIP, keys)
+	// Create syncer for node servers (nil for pivot servers)
+	var s *syncer
+	if pivotIP != "" {
+		s = newSyncer(client, pivotIP, keys)
+	}
 
 	// Create node health tracker for pivot servers to skip unhealthy nodes
 	var nodeHealth *NodeHealth
@@ -209,7 +214,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		nodeHealth.StartBackgroundCheck(getNodes, server.Active)
 	}
 
-	syncCallback := StorageSync(client, pivotIP, keys, getNodes, sf.trySync, nodeHealth, sf.isRecentPullDelete, sf.isRecentPullSet, sf.isRecentPull)
+	syncCallback := makeStorageSync(client, pivotIP, keys, getNodes, s, nodeHealth)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
 	server.OnStorageEvent = storage.EventCallback(syncCallback)
@@ -217,8 +222,8 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// Set up HTTP routes for pivot protocol
 	// /synchronize/pivot - pull-only sync, used when pivot triggers sync on node (e.g., after delete)
 	// /synchronize/node - bidirectional sync, used when node has local changes to push
-	server.Router.HandleFunc(RoutePrefix+"/synchronize/pivot", SynchronizePivotHandler(pivotIP, sf.pullOnly)).Methods("GET")
-	server.Router.HandleFunc(RoutePrefix+"/synchronize/node", SynchronizeNodeHandler(pivotIP, sf.bidirectional)).Methods("GET")
+	server.Router.HandleFunc(RoutePrefix+"/synchronize/pivot", SynchronizePivotHandler(pivotIP, s)).Methods("GET")
+	server.Router.HandleFunc(RoutePrefix+"/synchronize/node", SynchronizeNodeHandler(pivotIP, s)).Methods("GET")
 
 	// Node health endpoint (only meaningful on pivot servers)
 	server.Router.HandleFunc(RoutePrefix+"/health/nodes", NodeHealthHandler(nodeHealth)).Methods("GET")
@@ -255,7 +260,9 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		defer atomic.StoreInt32(&syncing, 0)
 		for _, k := range keys {
 			if key.Match(k.Path, readKey) {
-				sf.trySync()
+				if s != nil {
+					s.TrySync()
+				}
 				return
 			}
 		}
@@ -280,4 +287,36 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	storeInstance(server, instance)
 
 	return server
+}
+
+// SyncDeleteFilter returns a delete filter that syncs deletes to pivot and notifies nodes.
+// This is for backward compatibility with code that uses the old pivot API.
+func SyncDeleteFilter(client *http.Client, pivotIP string, db storage.Database, keyPath string, _getNodes GetNodes) func(index string) error {
+	return func(index string) error {
+		// Delete locally first
+		err := db.Del(keyPath + "/" + index)
+		if err != nil {
+			return err
+		}
+
+		// If this is a node, send delete to pivot
+		if pivotIP != "" {
+			sendDelete(client, keyPath+"/"+index, pivotIP, time.Now().UnixNano())
+		} else {
+			// If this is pivot, notify all nodes
+			nodes := _getNodes()
+			if len(nodes) > 0 {
+				var wg sync.WaitGroup
+				for _, node := range nodes {
+					wg.Add(1)
+					go func(n string) {
+						defer wg.Done()
+						TriggerNodeSyncWithHealth(client, n)
+					}(node)
+				}
+				wg.Wait()
+			}
+		}
+		return nil
+	}
 }

@@ -70,14 +70,6 @@ func syncLocalEntriesWithTracking(client *http.Client, pivot string, _key Key, l
 	return nil
 }
 
-// get from local and send to pivot
-// Sends new items and updates, but NOT items that were deleted on pivot.
-// An item is considered "deleted on pivot" if it doesn't exist on pivot AND
-// the local item was created BEFORE the pivot's last activity (which includes delete timestamps).
-func syncPivotEntries(client *http.Client, pivot string, _key Key, pivotActivity int64) error {
-	return syncPivotEntriesWithDeleteCheck(client, pivot, _key, pivotActivity, nil)
-}
-
 // syncPivotEntriesWithDeleteCheck syncs local entries to pivot with an optional delete check.
 // If isRecentDelete is provided, items that were recently deleted by a pull-only sync
 // will not be re-added to pivot.
@@ -270,149 +262,148 @@ func pullFromPivotWithTracking(client *http.Client, pivot string, keys []Key, on
 	return errors.New("nothing to synchronize")
 }
 
-// syncFuncs holds the synchronize functions for a server
-type syncFuncs struct {
-	// pullOnly syncs FROM pivot only - used by /synchronize/pivot handler
-	pullOnly func() error
-	// bidirectional syncs both ways - used by /synchronize/node handler
-	bidirectional func() error
-	// trySync skips if locked - used by BeforeRead
-	trySync func() error
-	// isRecentPullDelete checks if a key was recently deleted by a pull-only sync
-	isRecentPullDelete func(key string) bool
-	// isRecentPullSet checks if a key was recently set by a pull-only sync
-	isRecentPullSet func(key string) bool
-	// isRecentPull checks if a pull-only sync was recently completed
-	isRecentPull func() bool
+// pullTracker tracks keys that were modified during a pull operation.
+// Uses generation counters for deterministic behavior without timing assumptions.
+type pullTracker struct {
+	mu         sync.RWMutex
+	generation uint64            // Current generation counter
+	lastPull   uint64            // Generation of last pull operation
+	deleted    map[string]uint64 // key -> generation when deleted
+	set        map[string]uint64 // key -> generation when set
 }
 
-// makeSyncFuncs creates synchronize functions with a shared per-server mutex.
-// Note: Per-key mutexes could allow parallel sync of different keys but adds complexity.
-// The current per-server mutex is sufficient for most use cases.
-func makeSyncFuncs(client *http.Client, pivot string, keys []Key) syncFuncs {
-	var mu sync.Mutex
-	// Track keys that were recently deleted by pull-only sync
-	recentPullDeletes := make(map[string]int64)
-	var deletesMu sync.RWMutex
+func newPullTracker() *pullTracker {
+	return &pullTracker{
+		deleted: make(map[string]uint64),
+		set:     make(map[string]uint64),
+	}
+}
 
-	// Track keys that were recently set by pull-only sync
-	recentPullSets := make(map[string]int64)
-	var setsMu sync.RWMutex
-
-	// Track when the last pull-only sync completed
-	var lastPullTime int64
-	var pullTimeMu sync.RWMutex
-
-	// Helper to check if a key was recently deleted by pull-only sync
-	isRecentDelete := func(key string) bool {
-		deletesMu.RLock()
-		defer deletesMu.RUnlock()
-		t, exists := recentPullDeletes[key]
-		if !exists {
-			return false
+// startPull begins a new pull operation and returns its generation
+func (p *pullTracker) startPull() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.generation++
+	p.lastPull = p.generation
+	// Clear old entries (keep only last 2 generations)
+	for k, g := range p.deleted {
+		if g < p.lastPull-1 {
+			delete(p.deleted, k)
 		}
-		// Consider delete recent if within 5 seconds
-		return time.Now().UnixNano()-t < 5*1e9
 	}
-
-	// Helper to check if a key was recently set by pull-only sync
-	isRecentSet := func(key string) bool {
-		setsMu.RLock()
-		defer setsMu.RUnlock()
-		t, exists := recentPullSets[key]
-		if !exists {
-			return false
+	for k, g := range p.set {
+		if g < p.lastPull-1 {
+			delete(p.set, k)
 		}
-		// Consider set recent if within 5 seconds
-		return time.Now().UnixNano()-t < 5*1e9
 	}
+	return p.generation
+}
 
-	// Helper to check if a pull-only sync was recently completed
-	// This is used to skip StorageSync callbacks for events that were caused by the pull
-	isRecentPull := func() bool {
-		pullTimeMu.RLock()
-		defer pullTimeMu.RUnlock()
-		// Consider pull recent if within 100ms (enough time for async events to be processed)
-		return time.Now().UnixNano()-lastPullTime < 100*1e6
-	}
+// trackDelete records a key deleted during pull
+func (p *pullTracker) trackDelete(key string, gen uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.deleted[key] = gen
+}
 
-	return syncFuncs{
-		pullOnly: func() error {
-			mu.Lock()
-			defer mu.Unlock()
-			// Clear old entries before pull (entries older than 5 seconds)
-			now := time.Now().UnixNano()
-			deletesMu.Lock()
-			for k, t := range recentPullDeletes {
-				if now-t > 5*1e9 {
-					delete(recentPullDeletes, k)
-				}
-			}
-			deletesMu.Unlock()
-			setsMu.Lock()
-			for k, t := range recentPullSets {
-				if now-t > 5*1e9 {
-					delete(recentPullSets, k)
-				}
-			}
-			setsMu.Unlock()
-			err := pullFromPivotWithTracking(client, pivot, keys,
-				func(key string) {
-					deletesMu.Lock()
-					recentPullDeletes[key] = time.Now().UnixNano()
-					deletesMu.Unlock()
-				},
-				func(key string) {
-					setsMu.Lock()
-					recentPullSets[key] = time.Now().UnixNano()
-					setsMu.Unlock()
-				})
-			// Record when pull completed
-			pullTimeMu.Lock()
-			lastPullTime = time.Now().UnixNano()
-			pullTimeMu.Unlock()
-			return err
-		},
-		bidirectional: func() error {
-			mu.Lock()
-			defer mu.Unlock()
-			// Use synchronizeKeysWithDeleteCheck to skip recently deleted items
-			return synchronizeKeysWithDeleteCheck(client, pivot, keys, isRecentDelete)
-		},
-		trySync: func() error {
-			if !mu.TryLock() {
-				return nil
-			}
-			defer mu.Unlock()
-			// Use synchronizeKeysWithDeleteCheck to skip recently deleted items
-			return synchronizeKeysWithDeleteCheck(client, pivot, keys, isRecentDelete)
-		},
-		isRecentPullDelete: isRecentDelete,
-		isRecentPullSet:    isRecentSet,
-		isRecentPull:       isRecentPull,
+// trackSet records a key set during pull
+func (p *pullTracker) trackSet(key string, gen uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.set[key] = gen
+}
+
+// pulledDelete returns true if key was deleted in the last pull
+func (p *pullTracker) pulledDelete(key string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.lastPull == 0 {
+		return false
 	}
+	gen, exists := p.deleted[key]
+	return exists && gen == p.lastPull
+}
+
+// pulledSet returns true if key was set in the last pull
+func (p *pullTracker) pulledSet(key string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.lastPull == 0 {
+		return false
+	}
+	gen, exists := p.set[key]
+	return exists && gen == p.lastPull
+}
+
+// syncer coordinates synchronization operations for a server.
+// It ensures only one sync runs at a time and tracks pulled keys.
+type syncer struct {
+	mu      sync.Mutex
+	tracker *pullTracker
+	client  *http.Client
+	pivot   string
+	keys    []Key
+}
+
+func newSyncer(client *http.Client, pivot string, keys []Key) *syncer {
+	return &syncer{
+		tracker: newPullTracker(),
+		client:  client,
+		pivot:   pivot,
+		keys:    keys,
+	}
+}
+
+// Pull syncs FROM pivot only (used when pivot notifies node of changes)
+func (s *syncer) Pull() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gen := s.tracker.startPull()
+	return pullFromPivotWithTracking(s.client, s.pivot, s.keys,
+		func(key string) { s.tracker.trackDelete(key, gen) },
+		func(key string) { s.tracker.trackSet(key, gen) })
+}
+
+// Sync performs bidirectional synchronization
+func (s *syncer) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return synchronizeKeysWithDeleteCheck(s.client, s.pivot, s.keys, s.tracker.pulledDelete)
+}
+
+// TrySync attempts sync but skips if already in progress
+func (s *syncer) TrySync() error {
+	if !s.mu.TryLock() {
+		return nil
+	}
+	defer s.mu.Unlock()
+	return synchronizeKeysWithDeleteCheck(s.client, s.pivot, s.keys, s.tracker.pulledDelete)
+}
+
+// PulledDelete returns true if key was deleted in the last pull
+func (s *syncer) PulledDelete(key string) bool {
+	return s.tracker.pulledDelete(key)
+}
+
+// PulledSet returns true if key was set in the last pull
+func (s *syncer) PulledSet(key string) bool {
+	return s.tracker.pulledSet(key)
 }
 
 // StorageSyncCallback is the callback type for storage sync events
 type StorageSyncCallback func(event storage.Event)
 
-// StorageSync creates a StorageSyncCallback that triggers synchronization on storage events.
-// This replaces the need for SyncWriteFilter and SyncDeleteFilter.
+// makeStorageSync creates a callback that triggers synchronization on storage events.
 // For pivot servers (pivotIP == ""), it notifies all nodes on any storage change.
-// For node servers, it synchronizes with the pivot synchronously on any storage change.
-// If nodeHealth is provided, unhealthy nodes are skipped to avoid timeout penalties.
-// isRecentPullDelete checks if a key was recently deleted by a pull-only sync.
-// isRecentPull checks if a pull-only sync was recently completed.
-func StorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes getNodes, synchronize func() error, nodeHealth *NodeHealth, isRecentPullDelete func(key string) bool, isRecentPullSet func(key string) bool, isRecentPull func() bool) StorageSyncCallback {
+// For node servers, it synchronizes with the pivot on any storage change.
+func makeStorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes getNodes, s *syncer, nodeHealth *NodeHealth) StorageSyncCallback {
 	return func(event storage.Event) {
-		// For node servers, skip sync for events that were caused by a pull-only sync
-		// - Skip SET events from pull to prevent triggering unnecessary bidirectional sync
-		// - Skip DEL events from pull to prevent triggering sync that would re-add the item
-		if pivotIP != "" {
-			if event.Operation == "set" && isRecentPullSet != nil && isRecentPullSet(event.Key) {
+		// For node servers, skip events caused by a pull operation
+		if pivotIP != "" && s != nil {
+			if event.Operation == "set" && s.PulledSet(event.Key) {
 				return
 			}
-			if event.Operation == "del" && isRecentPullDelete != nil && isRecentPullDelete(event.Key) {
+			if event.Operation == "del" && s.PulledDelete(event.Key) {
 				return
 			}
 		}
@@ -473,7 +464,9 @@ func StorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes getN
 				// For set events, synchronize with pivot synchronously
 				// Synchronous sync ensures the operation completes before the next one starts,
 				// preventing race conditions where stale data overwrites newer data
-				synchronize()
+				if s != nil {
+					s.TrySync()
+				}
 			}
 		}
 	}

@@ -12,30 +12,30 @@ import (
 
 // SynchronizePivotHandler handles /synchronize/pivot - pull-only sync from pivot.
 // Called by pivot when it has changes (including deletes) that nodes should pull.
-func SynchronizePivotHandler(pivot string, pullOnly func() error) func(w http.ResponseWriter, r *http.Request) {
+func SynchronizePivotHandler(pivot string, s *syncer) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if pivot == "" {
+		if pivot == "" || s == nil {
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, "this method should not be called on the pivot server")
 			return
 		}
 
-		pullOnly()
+		s.Pull()
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
 // SynchronizeNodeHandler handles /synchronize/node - bidirectional sync.
 // Called by node when it has local changes to push to pivot.
-func SynchronizeNodeHandler(pivot string, bidirectional func() error) func(w http.ResponseWriter, r *http.Request) {
+func SynchronizeNodeHandler(pivot string, s *syncer) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if pivot == "" {
+		if pivot == "" || s == nil {
 			w.WriteHeader(http.StatusBadRequest)
 			fmt.Fprint(w, "this method should not be called on the pivot server")
 			return
 		}
 
-		bidirectional()
+		s.Sync()
 		w.WriteHeader(http.StatusOK)
 	}
 }
