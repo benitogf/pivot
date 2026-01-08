@@ -216,6 +216,15 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	if pivotIP == "" {
 		nodeHealth = NewNodeHealth(client)
 		nodeHealth.StartBackgroundCheck(getNodes, server.Active)
+
+		// Compose OnClose to stop NodeHealth goroutine when server closes
+		existingOnClose := server.OnClose
+		server.OnClose = func() {
+			nodeHealth.Stop()
+			if existingOnClose != nil {
+				existingOnClose()
+			}
+		}
 	}
 
 	syncCallback := makeStorageSync(client, pivotIP, keys, getNodes, s, nodeHealth)

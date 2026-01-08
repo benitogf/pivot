@@ -28,7 +28,9 @@ type NodeHealth struct {
 	unhealthySince   map[string]time.Time // node address -> when it first became unhealthy
 	client           *http.Client
 	running          bool
-	baseTickInterval time.Duration // base tick interval for the background goroutine
+	baseTickInterval time.Duration  // base tick interval for the background goroutine
+	stopCh           chan struct{}  // channel to signal shutdown
+	wg               sync.WaitGroup // wait group to ensure goroutine exits
 }
 
 // NewNodeHealth creates a new NodeHealth tracker.
@@ -153,7 +155,7 @@ func NodeHealthHandler(nh *NodeHealth) http.HandlerFunc {
 // StartBackgroundCheck starts a background goroutine that periodically
 // re-checks unhealthy nodes to detect when they come back online.
 // Uses per-node backoff: 1s initially, 5s after 10min unhealthy, 10s after 30min.
-// The goroutine will automatically stop when isActive returns false.
+// Call Stop() to shut down the goroutine immediately.
 func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, isActive func() bool) {
 	nh.mu.Lock()
 	if nh.running {
@@ -161,25 +163,43 @@ func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, isActive fu
 		return
 	}
 	nh.running = true
+	nh.stopCh = make(chan struct{})
 	nh.mu.Unlock()
 
+	nh.wg.Add(1)
 	go func() {
+		defer nh.wg.Done()
 		// Tick at the fastest interval (1s) - per-node backoff is checked in recheckUnhealthyNodes
 		ticker := time.NewTicker(nh.baseTickInterval)
 		defer ticker.Stop()
 		for {
-			if !isActive() {
+			select {
+			case <-nh.stopCh:
 				nh.mu.Lock()
 				nh.running = false
 				nh.mu.Unlock()
 				return
-			}
-			<-ticker.C
-			if isActive() {
-				nh.recheckUnhealthyNodes(getNodes())
+			case <-ticker.C:
+				if isActive() {
+					nh.recheckUnhealthyNodes(getNodes())
+				}
 			}
 		}
 	}()
+}
+
+// Stop shuts down the background health check goroutine and waits for it to exit.
+// Safe to call multiple times.
+func (nh *NodeHealth) Stop() {
+	nh.mu.Lock()
+	if !nh.running {
+		nh.mu.Unlock()
+		return
+	}
+	nh.mu.Unlock()
+
+	close(nh.stopCh)
+	nh.wg.Wait()
 }
 
 // recheckUnhealthyNodes checks unhealthy nodes based on their individual backoff intervals.

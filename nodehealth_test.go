@@ -296,6 +296,46 @@ func TestNodeHealth_BackoffResetOnHealthy(t *testing.T) {
 	require.False(t, nh.IsHealthy(node))
 }
 
+func TestNodeHealth_Stop_ImmediateShutdown(t *testing.T) {
+	nh := pivot.NewNodeHealth(http.DefaultClient)
+
+	var active int32 = 1
+	isActive := func() bool { return atomic.LoadInt32(&active) == 1 }
+	getNodes := func() []string { return []string{"192.168.1.1:8080"} }
+
+	nh.StartBackgroundCheck(getNodes, isActive)
+
+	// Stop should return immediately without waiting for ticker
+	start := time.Now()
+	nh.Stop()
+	elapsed := time.Since(start)
+
+	// Should complete in well under 1 second (the ticker interval)
+	require.Less(t, elapsed, 100*time.Millisecond, "Stop() should return immediately")
+}
+
+func TestNodeHealth_Stop_SafeToCallMultipleTimes(t *testing.T) {
+	nh := pivot.NewNodeHealth(http.DefaultClient)
+
+	var active int32 = 1
+	isActive := func() bool { return atomic.LoadInt32(&active) == 1 }
+	getNodes := func() []string { return []string{} }
+
+	nh.StartBackgroundCheck(getNodes, isActive)
+
+	// Multiple Stop calls should be safe
+	nh.Stop()
+	nh.Stop()
+	nh.Stop()
+}
+
+func TestNodeHealth_Stop_SafeWithoutStart(t *testing.T) {
+	nh := pivot.NewNodeHealth(http.DefaultClient)
+
+	// Stop without Start should be safe (no-op)
+	nh.Stop()
+}
+
 // =============================================================================
 // End-to-End Node Health Tests
 // =============================================================================
