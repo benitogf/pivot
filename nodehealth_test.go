@@ -1,12 +1,17 @@
 package pivot_test
 
 import (
+	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/benitogf/ooo"
 	"github.com/benitogf/pivot"
 	"github.com/stretchr/testify/require"
 )
@@ -289,4 +294,266 @@ func TestNodeHealth_BackoffResetOnHealthy(t *testing.T) {
 	// Mark as unhealthy again - should start fresh backoff
 	nh.MarkUnhealthy(node)
 	require.False(t, nh.IsHealthy(node))
+}
+
+// =============================================================================
+// End-to-End Node Health Tests
+// =============================================================================
+
+func TestE2E_NodeHealth_PivotTracksNodeHealth(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Create node server
+	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	defer nodeServer.Close(os.Interrupt)
+
+	// Register the node on the pivot
+	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
+	nodePortInt, _ := strconv.Atoi(nodePort)
+	ooo.Push(pivotServer, "things/*", Thing{IP: nodeIP, Port: nodePortInt, On: true})
+
+	// Get pivot instance to access NodeHealth
+	instance := pivot.GetInstance(pivotServer)
+	require.NotNil(t, instance)
+	require.NotNil(t, instance.NodeHealth)
+
+	// Trigger a sync by writing to pivot - this should mark node as healthy
+	ooo.Set(pivotServer, "settings", Settings{DayEpoch: 1})
+
+	// Wait for sync to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Node should be marked healthy after successful sync
+	require.True(t, instance.NodeHealth.IsHealthy(nodeServer.Address))
+
+	// Verify node health status endpoint returns data
+	resp, err := pivotServer.Client.Get("http://" + pivotServer.Address + "/_pivot/health/nodes")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var status []pivot.NodeStatus
+	err = json.NewDecoder(resp.Body).Decode(&status)
+	require.NoError(t, err)
+	require.Len(t, status, 1)
+	require.Equal(t, nodeServer.Address, status[0].Address)
+	require.True(t, status[0].Healthy)
+}
+
+func TestE2E_NodeHealth_UnreachableNodeMarkedUnhealthy(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Register a fake unreachable node
+	ooo.Push(pivotServer, "things/*", Thing{IP: "192.168.99.99", Port: 9999, On: true})
+
+	// Get pivot instance
+	instance := pivot.GetInstance(pivotServer)
+	require.NotNil(t, instance)
+	require.NotNil(t, instance.NodeHealth)
+
+	// Trigger a sync - this should fail and mark node as unhealthy
+	// The sync uses a 5 second timeout, so we need to wait longer
+	ooo.Set(pivotServer, "settings", Settings{DayEpoch: 1})
+
+	// Wait for sync attempt to complete (timeout is 5s, but connection refused is fast)
+	// Poll for the node to appear in health status
+	var status []pivot.NodeStatus
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		status = instance.NodeHealth.GetStatus()
+		if len(status) > 0 {
+			break
+		}
+	}
+
+	// Node should be marked unhealthy after failed sync
+	require.Len(t, status, 1, "expected node to be tracked in health status")
+	require.Equal(t, "192.168.99.99:9999", status[0].Address)
+	require.False(t, status[0].Healthy)
+	require.False(t, instance.NodeHealth.IsHealthy("192.168.99.99:9999"))
+}
+
+func TestE2E_NodeHealth_MixedHealthyUnhealthyNodes(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Create one real node
+	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	defer nodeServer.Close(os.Interrupt)
+
+	// Register both real and fake nodes
+	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
+	nodePortInt, _ := strconv.Atoi(nodePort)
+	ooo.Push(pivotServer, "things/*", Thing{IP: nodeIP, Port: nodePortInt, On: true})
+	ooo.Push(pivotServer, "things/*", Thing{IP: "192.168.99.99", Port: 9999, On: true})
+
+	// Get pivot instance
+	instance := pivot.GetInstance(pivotServer)
+	require.NotNil(t, instance.NodeHealth)
+
+	// Trigger sync
+	ooo.Set(pivotServer, "settings", Settings{DayEpoch: 1})
+
+	// Poll for both nodes to appear in health status
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		status := instance.NodeHealth.GetStatus()
+		if len(status) >= 2 {
+			break
+		}
+	}
+
+	// Real node should be healthy, fake node should be unhealthy
+	require.True(t, instance.NodeHealth.IsHealthy(nodeServer.Address))
+	require.False(t, instance.NodeHealth.IsHealthy("192.168.99.99:9999"))
+
+	// GetHealthyNodes should filter correctly
+	allNodes := []string{nodeServer.Address, "192.168.99.99:9999"}
+	healthyNodes := instance.NodeHealth.GetHealthyNodes(allNodes)
+	require.Len(t, healthyNodes, 1)
+	require.Contains(t, healthyNodes, nodeServer.Address)
+}
+
+func TestE2E_NodeHealth_NodeRecovery(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Get pivot instance
+	instance := pivot.GetInstance(pivotServer)
+	require.NotNil(t, instance.NodeHealth)
+
+	// Register a fake unreachable node first
+	ooo.Push(pivotServer, "things/*", Thing{IP: "192.168.99.99", Port: 9999, On: true})
+
+	// Trigger sync - node becomes unhealthy
+	ooo.Set(pivotServer, "settings", Settings{DayEpoch: 1})
+
+	// Poll for node to appear in health status
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		status := instance.NodeHealth.GetStatus()
+		if len(status) > 0 {
+			break
+		}
+	}
+	require.False(t, instance.NodeHealth.IsHealthy("192.168.99.99:9999"))
+
+	// Now create a real node at a different address
+	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	defer nodeServer.Close(os.Interrupt)
+
+	// Register the real node
+	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
+	nodePortInt, _ := strconv.Atoi(nodePort)
+	ooo.Push(pivotServer, "things/*", Thing{IP: nodeIP, Port: nodePortInt, On: true})
+
+	// Trigger another sync
+	ooo.Set(pivotServer, "settings", Settings{DayEpoch: 2})
+
+	// Poll for new node to appear in health status
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		status := instance.NodeHealth.GetStatus()
+		if len(status) >= 2 {
+			break
+		}
+	}
+
+	// New node should be healthy
+	require.True(t, instance.NodeHealth.IsHealthy(nodeServer.Address))
+	// Old fake node still unhealthy
+	require.False(t, instance.NodeHealth.IsHealthy("192.168.99.99:9999"))
+}
+
+func TestE2E_NodeHealth_NodeServerNoHealthTracking(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Create node server
+	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	defer nodeServer.Close(os.Interrupt)
+
+	// Node servers should NOT have NodeHealth (only pivot servers do)
+	nodeInstance := pivot.GetInstance(nodeServer)
+	require.NotNil(t, nodeInstance)
+	require.Nil(t, nodeInstance.NodeHealth)
+
+	// Pivot server SHOULD have NodeHealth
+	pivotInstance := pivot.GetInstance(pivotServer)
+	require.NotNil(t, pivotInstance)
+	require.NotNil(t, pivotInstance.NodeHealth)
+}
+
+func TestE2E_NodeHealth_HealthEndpointOnNode(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Create node server
+	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	defer nodeServer.Close(os.Interrupt)
+
+	// Node server health endpoint should return empty array (no health tracking)
+	resp, err := nodeServer.Client.Get("http://" + nodeServer.Address + "/_pivot/health/nodes")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var status []pivot.NodeStatus
+	err = json.NewDecoder(resp.Body).Decode(&status)
+	require.NoError(t, err)
+	require.Len(t, status, 0)
+}
+
+func TestE2E_NodeHealth_MultipleNodesAllHealthy(t *testing.T) {
+	// Create pivot server
+	pivotServer := FakeServer(t, "", nil)
+	defer pivotServer.Close(os.Interrupt)
+
+	// Create multiple node servers
+	node1 := FakeServer(t, pivotServer.Address, nil)
+	defer node1.Close(os.Interrupt)
+	node2 := FakeServer(t, pivotServer.Address, nil)
+	defer node2.Close(os.Interrupt)
+	node3 := FakeServer(t, pivotServer.Address, nil)
+	defer node3.Close(os.Interrupt)
+
+	// Register all nodes
+	node1IP, node1Port, _ := net.SplitHostPort(node1.Address)
+	node1PortInt, _ := strconv.Atoi(node1Port)
+	node2IP, node2Port, _ := net.SplitHostPort(node2.Address)
+	node2PortInt, _ := strconv.Atoi(node2Port)
+	node3IP, node3Port, _ := net.SplitHostPort(node3.Address)
+	node3PortInt, _ := strconv.Atoi(node3Port)
+
+	ooo.Push(pivotServer, "things/*", Thing{IP: node1IP, Port: node1PortInt, On: true})
+	ooo.Push(pivotServer, "things/*", Thing{IP: node2IP, Port: node2PortInt, On: true})
+	ooo.Push(pivotServer, "things/*", Thing{IP: node3IP, Port: node3PortInt, On: true})
+
+	// Get pivot instance
+	instance := pivot.GetInstance(pivotServer)
+	require.NotNil(t, instance.NodeHealth)
+
+	// Trigger sync
+	ooo.Set(pivotServer, "settings", Settings{DayEpoch: 1})
+	time.Sleep(200 * time.Millisecond)
+
+	// All nodes should be healthy
+	require.True(t, instance.NodeHealth.IsHealthy(node1.Address))
+	require.True(t, instance.NodeHealth.IsHealthy(node2.Address))
+	require.True(t, instance.NodeHealth.IsHealthy(node3.Address))
+
+	// Status endpoint should show all 3 healthy
+	status := instance.NodeHealth.GetStatus()
+	require.Len(t, status, 3)
+	for _, s := range status {
+		require.True(t, s.Healthy)
+	}
 }

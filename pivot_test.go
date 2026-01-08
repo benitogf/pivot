@@ -29,22 +29,6 @@ type Thing struct {
 	On   bool   `json:"on"`
 }
 
-// parseAddress splits "host:port" into IP and Port components
-func parseAddress(addr string) (string, int) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr, 0
-	}
-	port, _ := strconv.Atoi(portStr)
-	return host, port
-}
-
-// newThing creates a Thing from an address string (e.g., "127.0.0.1:8080")
-func newThing(addr string, on bool) Thing {
-	ip, port := parseAddress(addr)
-	return Thing{IP: ip, Port: port, On: on}
-}
-
 type Settings struct {
 	DayEpoch int `json:"startOfDay"`
 }
@@ -145,352 +129,188 @@ func FakeServer(t *testing.T, pivotIP string, afterAuthWrite func(key string)) *
 	return server
 }
 
-func TestBasicPivotSyncLocal(t *testing.T) {
-	// WaitGroup for websocket events
-	var wsWg sync.WaitGroup
-	// WaitGroup for auth storage writes
-	var authWg sync.WaitGroup
-
-	// State variables for subscriptions (protected by mutex for concurrent writes)
-	var pivotThings []client.Meta[Thing]
-	var nodeThings []client.Meta[Thing]
-	var pivotSettings []client.Meta[Settings]
-	var nodeSettings []client.Meta[Settings]
-	var mu sync.Mutex
-
-	// Callback for auth storage writes - signals WaitGroup when expected
-	// Use atomic counter to safely handle writes from sync
-	var pendingWrites int32
-	afterAuthWrite := func(key string) {
-		if atomic.AddInt32(&pendingWrites, -1) >= 0 {
-			authWg.Done()
-		}
-	}
-
-	pivotServer := FakeServer(t, "", afterAuthWrite)
-	defer pivotServer.Close(os.Interrupt)
-
-	nodeServer := FakeServer(t, pivotServer.Address, afterAuthWrite)
-	defer nodeServer.Close(os.Interrupt)
-
-	// Register first user on pivot - expect 1 auth write
-	atomic.StoreInt32(&pendingWrites, 1)
-	authWg.Add(1)
-	token := RegisterUser(t, pivotServer, "root")
-	require.NotEqual(t, "", token)
-	authWg.Wait()
-	authHeader := http.Header{}
-	authHeader.Set("Authorization", "Bearer "+token)
-
-	// Authorize on node (triggers sync-on-read for user data) - expect 1 auth write from sync
-	atomic.StoreInt32(&pendingWrites, 1)
-	authWg.Add(1)
-	token = Authorize(t, nodeServer, "root")
-	require.NotEqual(t, "", token)
-	authWg.Wait()
-	authHeader = http.Header{}
-	authHeader.Set("Authorization", "Bearer "+token)
-
-	ctx := t.Context()
-
-	// Expect 4 initial snapshots from subscriptions
-	wsWg.Add(4)
-
-	// Subscribe to things on pivot
-	go client.SubscribeList(client.SubscribeConfig{
-		Ctx:     ctx,
-		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
-		Header:  authHeader,
-		Silence: true,
-	}, "things/*", client.SubscribeListEvents[Thing]{
-		OnMessage: func(data []client.Meta[Thing]) {
-			mu.Lock()
-			pivotThings = data
-			mu.Unlock()
-			wsWg.Done()
-		},
-	})
-
-	// Subscribe to things on node
-	go client.SubscribeList(client.SubscribeConfig{
-		Ctx:     ctx,
-		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
-		Header:  authHeader,
-		Silence: true,
-	}, "things/*", client.SubscribeListEvents[Thing]{
-		OnMessage: func(data []client.Meta[Thing]) {
-			mu.Lock()
-			nodeThings = data
-			mu.Unlock()
-			wsWg.Done()
-		},
-	})
-
-	// Subscribe to settings on node
-	go client.Subscribe(client.SubscribeConfig{
-		Ctx:     ctx,
-		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
-		Header:  authHeader,
-		Silence: true,
-	}, "settings", client.SubscribeEvents[Settings]{
-		OnMessage: func(data client.Meta[Settings]) {
-			mu.Lock()
-			nodeSettings = []client.Meta[Settings]{data}
-			mu.Unlock()
-			wsWg.Done()
-		},
-	})
-
-	// Subscribe to settings on pivot
-	go client.Subscribe(client.SubscribeConfig{
-		Ctx:     ctx,
-		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
-		Header:  authHeader,
-		Silence: true,
-	}, "settings", client.SubscribeEvents[Settings]{
-		OnMessage: func(data client.Meta[Settings]) {
-			mu.Lock()
-			pivotSettings = []client.Meta[Settings]{data}
-			mu.Unlock()
-			wsWg.Done()
-		},
-	})
-
-	// Wait for initial snapshots
-	wsWg.Wait()
-
-	// Verify initial state
-	mu.Lock()
-	require.Equal(t, 0, len(pivotThings))
-	require.Equal(t, 0, len(nodeThings))
-	mu.Unlock()
-
-	// Push thing to pivot - expect 1 ws event on pivotThings
-	wsWg.Add(1)
-	thingID, err := ooo.Push(pivotServer, "things/*", newThing(nodeServer.Address, false))
-	require.NoError(t, err)
-	require.NotEmpty(t, thingID)
-	wsWg.Wait()
-
-	mu.Lock()
-	require.Equal(t, 1, len(pivotThings))
-	require.Equal(t, false, pivotThings[0].Data.On)
-	mu.Unlock()
-
-	// Read from node triggers sync - expect 1 ws event on nodeThings
-	wsWg.Add(1)
-	_, err = ooo.Get[Thing](nodeServer, "things/"+thingID)
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	mu.Lock()
-	require.Equal(t, 1, len(nodeThings))
-	require.Equal(t, false, nodeThings[0].Data.On)
-	mu.Unlock()
-
-	// Register second user on pivot - expect 2 auth writes:
-	// 1. Pivot writes user to its auth storage
-	// 2. SyncCallback triggers node sync, node writes user to its auth storage
-	atomic.StoreInt32(&pendingWrites, 2)
-	authWg.Add(2)
-	token2 := RegisterUser(t, pivotServer, "testuser")
-	require.NotEqual(t, "", token2)
-	authWg.Wait()
-
-	// Authorize testuser on node - user already synced, no additional auth write expected
-	token = Authorize(t, nodeServer, "testuser")
-	require.NotEqual(t, "", token)
-	authHeader = http.Header{}
-	authHeader.Set("Authorization", "Bearer "+token)
-
-	// Modify thing on pivot - expect 2 ws events (pivotThings + nodeThings)
-	wsWg.Add(2)
-	pivotThing, err := ooo.Get[Thing](pivotServer, "things/"+thingID)
-	require.NoError(t, err)
-	pivotThing.Data.On = true
-	err = ooo.Set(pivotServer, "things/"+thingID, pivotThing.Data)
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify via storage
-	updatedThing, err := ooo.Get[Thing](pivotServer, "things/"+thingID)
-	require.NoError(t, err)
-	require.Equal(t, true, updatedThing.Data.On)
-
-	nodeThing, err := ooo.Get[Thing](nodeServer, "things/"+thingID)
-	require.NoError(t, err)
-	require.Equal(t, updatedThing.Data, nodeThing.Data)
-
-	// Set settings on node - expect 2 ws events (nodeSettings + pivotSettings)
-	wsWg.Add(2)
-	err = ooo.Set(nodeServer, "settings", Settings{DayEpoch: 1})
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	mu.Lock()
-	require.Equal(t, 1, nodeSettings[0].Data.DayEpoch)
-	require.Equal(t, 1, pivotSettings[0].Data.DayEpoch)
-	mu.Unlock()
-
-	// Set settings on pivot - expect 2 ws events (pivotSettings + nodeSettings)
-	wsWg.Add(2)
-	err = ooo.Set(pivotServer, "settings", Settings{DayEpoch: 9})
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify final state via ooo.Get
-	pivotSettingsObj, err := ooo.Get[Settings](pivotServer, "settings")
-	require.NoError(t, err)
-	require.Equal(t, 9, pivotSettingsObj.Data.DayEpoch)
-
-	nodeSettingsObj, err := ooo.Get[Settings](nodeServer, "settings")
-	require.NoError(t, err)
-	require.Equal(t, 9, nodeSettingsObj.Data.DayEpoch)
-
-	// Test delete sync from pivot to node
-	// Push a second thing to pivot
-	wsWg.Add(2) // pivotThings + nodeThings
-	thingID2, err := ooo.Push(pivotServer, "things/*", Thing{IP: "10.0.0.1", Port: 0, On: true})
-	require.NoError(t, err)
-	require.NotEmpty(t, thingID2)
-	wsWg.Wait()
-
-	mu.Lock()
-	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things")
-	require.Equal(t, 2, len(nodeThings), "node should have 2 things")
-	mu.Unlock()
-
-	// Delete from pivot - expect 2 ws events (pivotThings + nodeThings after sync)
-	// With /synchronize/pivot endpoint, node pulls from pivot and sees the delete
-	// The delete is tracked to prevent StorageSync from re-adding the item
-	wsWg.Add(2)
-	err = ooo.Delete(pivotServer, "things/"+thingID2)
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify pivot - item should be deleted
-	_, err = ooo.Get[Thing](pivotServer, "things/"+thingID2)
-	require.Error(t, err, "thingID2 should be deleted from pivot")
-
-	// Verify node - delete should have propagated via pull-only sync
-	_, err = ooo.Get[Thing](nodeServer, "things/"+thingID2)
-	require.Error(t, err, "thingID2 should be deleted from node after sync")
-
-	// Verify subscription state
-	mu.Lock()
-	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after pivot-to-node delete")
-	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after pivot-to-node delete")
-	require.Equal(t, thingID, pivotThings[0].Index)
-	require.Equal(t, thingID, nodeThings[0].Index)
-	mu.Unlock()
-
-	// Test delete sync from node to pivot
-	// Push a third thing to node
-	wsWg.Add(2) // pivotThings + nodeThings
-	thingID3, err := ooo.Push(nodeServer, "things/*", Thing{IP: "172.16.0.1", Port: 0, On: false})
-	require.NoError(t, err)
-	require.NotEmpty(t, thingID3)
-	wsWg.Wait()
-
-	mu.Lock()
-	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things after node push")
-	require.Equal(t, 2, len(nodeThings), "node should have 2 things after node push")
-	mu.Unlock()
-
-	// Delete from node - expect 2 ws events (nodeThings + pivotThings after sync)
-	// Node's StorageSync triggers bidirectional sync which sends delete to pivot
-	wsWg.Add(2)
-	err = ooo.Delete(nodeServer, "things/"+thingID3)
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify node - item should be deleted
-	_, err = ooo.Get[Thing](nodeServer, "things/"+thingID3)
-	require.Error(t, err, "thingID3 should be deleted from node")
-
-	// Verify pivot - delete should have propagated via bidirectional sync
-	_, err = ooo.Get[Thing](pivotServer, "things/"+thingID3)
-	require.Error(t, err, "thingID3 should be deleted from pivot after sync")
-
-	// Verify subscription state
-	mu.Lock()
-	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after node-to-pivot delete")
-	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after node-to-pivot delete")
-	require.Equal(t, thingID, pivotThings[0].Index)
-	require.Equal(t, thingID, nodeThings[0].Index)
-	mu.Unlock()
-
-	// Test update sync from node to pivot (modify existing thing on node)
-	// Keep the node server address so pivot can still find the node for sync
-	wsWg.Add(2) // nodeThings + pivotThings
-	nodeThing, err = ooo.Get[Thing](nodeServer, "things/"+thingID)
-	require.NoError(t, err)
-	nodeThing.Data.On = false // Only change the On field, keep IP as node server address
-	err = ooo.Set(nodeServer, "things/"+thingID, nodeThing.Data)
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify update synced to pivot
-	nodeIP, nodePort := parseAddress(nodeServer.Address)
-	pivotThing, err = ooo.Get[Thing](pivotServer, "things/"+thingID)
-	require.NoError(t, err)
-	require.Equal(t, nodeIP, pivotThing.Data.IP)
-	require.Equal(t, nodePort, pivotThing.Data.Port)
-	require.Equal(t, false, pivotThing.Data.On)
-
-	mu.Lock()
-	require.Equal(t, nodeIP, nodeThings[0].Data.IP)
-	require.Equal(t, nodeIP, pivotThings[0].Data.IP)
-	mu.Unlock()
-
-	// Test delete settings from node to pivot (single key delete)
-	// Expect 2 ws events: nodeSettings (empty) + pivotSettings (empty after sync)
-	wsWg.Add(2)
-	err = ooo.Delete(nodeServer, "settings")
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify settings deleted on both sides
-	_, err = ooo.Get[Settings](nodeServer, "settings")
-	require.Error(t, err, "settings should be deleted from node")
-	_, err = ooo.Get[Settings](pivotServer, "settings")
-	require.Error(t, err, "settings should be deleted from pivot after sync")
-
-	// Test set settings on pivot after delete - expect 2 ws events
-	wsWg.Add(2)
-	err = ooo.Set(pivotServer, "settings", Settings{DayEpoch: 42})
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify settings synced to node
-	nodeSettingsObj, err = ooo.Get[Settings](nodeServer, "settings")
-	require.NoError(t, err)
-	require.Equal(t, 42, nodeSettingsObj.Data.DayEpoch)
-
-	// Test delete settings from pivot to node (single key delete)
-	// Expect 2 ws events: pivotSettings (empty) + nodeSettings (empty after sync)
-	wsWg.Add(2)
-	err = ooo.Delete(pivotServer, "settings")
-	require.NoError(t, err)
-	wsWg.Wait()
-
-	// Verify settings deleted on both sides
-	_, err = ooo.Get[Settings](pivotServer, "settings")
-	require.Error(t, err, "settings should be deleted from pivot")
-	_, err = ooo.Get[Settings](nodeServer, "settings")
-	require.Error(t, err, "settings should be deleted from node after sync")
+// syncTestOps provides operations that can be local or remote based on the useRemote flag
+type syncTestOps struct {
+	useRemote   bool
+	pivotServer *ooo.Server
+	nodeServer  *ooo.Server
+	pivotCfg    ooio.RemoteConfig
+	nodeCfg     ooio.RemoteConfig
 }
 
-func TestBasicPivotSyncRemote(t *testing.T) {
+func (ops *syncTestOps) pushThing(t *testing.T, toPivot bool, thing Thing) string {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if toPivot {
+			cfg = ops.pivotCfg
+		}
+		resp, err := ooio.RemotePushWithResponse(cfg, "things/*", thing)
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.Index)
+		return resp.Index
+	}
+	server := ops.nodeServer
+	if toPivot {
+		server = ops.pivotServer
+	}
+	id, err := ooo.Push(server, "things/*", thing)
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+	return id
+}
+
+func (ops *syncTestOps) getThing(t *testing.T, fromPivot bool, id string) Thing {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		result, err := ooio.RemoteGet[Thing](cfg, "things/"+id)
+		require.NoError(t, err)
+		return result.Data
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	result, err := ooo.Get[Thing](server, "things/"+id)
+	require.NoError(t, err)
+	return result.Data
+}
+
+func (ops *syncTestOps) getThingExpectError(t *testing.T, fromPivot bool, id string, msg string) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		_, err := ooio.RemoteGet[Thing](cfg, "things/"+id)
+		require.Error(t, err, msg)
+		return
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	_, err := ooo.Get[Thing](server, "things/"+id)
+	require.Error(t, err, msg)
+}
+
+func (ops *syncTestOps) setThing(t *testing.T, toPivot bool, id string, thing Thing) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if toPivot {
+			cfg = ops.pivotCfg
+		}
+		err := ooio.RemoteSet(cfg, "things/"+id, thing)
+		require.NoError(t, err)
+		return
+	}
+	server := ops.nodeServer
+	if toPivot {
+		server = ops.pivotServer
+	}
+	err := ooo.Set(server, "things/"+id, thing)
+	require.NoError(t, err)
+}
+
+func (ops *syncTestOps) deleteThing(t *testing.T, fromPivot bool, id string) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		err := ooio.RemoteDelete(cfg, "things/"+id)
+		require.NoError(t, err)
+		return
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	err := ooo.Delete(server, "things/"+id)
+	require.NoError(t, err)
+}
+
+func (ops *syncTestOps) setSettings(t *testing.T, toPivot bool, settings Settings) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if toPivot {
+			cfg = ops.pivotCfg
+		}
+		err := ooio.RemoteSet(cfg, "settings", settings)
+		require.NoError(t, err)
+		return
+	}
+	server := ops.nodeServer
+	if toPivot {
+		server = ops.pivotServer
+	}
+	err := ooo.Set(server, "settings", settings)
+	require.NoError(t, err)
+}
+
+func (ops *syncTestOps) getSettings(t *testing.T, fromPivot bool) Settings {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		result, err := ooio.RemoteGet[Settings](cfg, "settings")
+		require.NoError(t, err)
+		return result.Data
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	result, err := ooo.Get[Settings](server, "settings")
+	require.NoError(t, err)
+	return result.Data
+}
+
+func (ops *syncTestOps) getSettingsExpectError(t *testing.T, fromPivot bool, msg string) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		_, err := ooio.RemoteGet[Settings](cfg, "settings")
+		require.Error(t, err, msg)
+		return
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	_, err := ooo.Get[Settings](server, "settings")
+	require.Error(t, err, msg)
+}
+
+func (ops *syncTestOps) deleteSettings(t *testing.T, fromPivot bool) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		err := ooio.RemoteDelete(cfg, "settings")
+		require.NoError(t, err)
+		return
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	err := ooo.Delete(server, "settings")
+	require.NoError(t, err)
+}
+
+func testBasicPivotSync(t *testing.T, useRemote bool) {
 	var wsWg sync.WaitGroup
 	var authWg sync.WaitGroup
 	var pivotThings, nodeThings []client.Meta[Thing]
 	var pivotSettings, nodeSettings []client.Meta[Settings]
 	var mu sync.Mutex
-	_ = pivotThings
-	_ = nodeThings
-	_ = pivotSettings
-	_ = nodeSettings
 	var pendingWrites int32
 
 	afterAuthWrite := func(key string) {
@@ -504,9 +324,17 @@ func TestBasicPivotSyncRemote(t *testing.T) {
 	nodeServer := FakeServer(t, pivotServer.Address, afterAuthWrite)
 	defer nodeServer.Close(os.Interrupt)
 
-	pivotCfg := ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: pivotServer.Address}
-	nodeCfg := ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: nodeServer.Address}
+	ops := &syncTestOps{
+		useRemote:   useRemote,
+		pivotServer: pivotServer,
+		nodeServer:  nodeServer,
+	}
+	if useRemote {
+		ops.pivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: pivotServer.Address}
+		ops.nodeCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: nodeServer.Address}
+	}
 
+	// Register and authorize users
 	atomic.StoreInt32(&pendingWrites, 1)
 	authWg.Add(1)
 	token := RegisterUser(t, pivotServer, "root")
@@ -521,12 +349,15 @@ func TestBasicPivotSyncRemote(t *testing.T) {
 
 	authHeader := http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
-	pivotCfg.Header = authHeader
-	nodeCfg.Header = authHeader
+	if useRemote {
+		ops.pivotCfg.Header = authHeader
+		ops.nodeCfg.Header = authHeader
+	}
 
 	ctx := t.Context()
 	wsWg.Add(4)
 
+	// Subscribe to things and settings on both servers
 	go client.SubscribeList(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: pivotServer.Address}, Header: authHeader, Silence: true}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) { mu.Lock(); pivotThings = data; mu.Unlock(); wsWg.Done() }})
 	go client.SubscribeList(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: nodeServer.Address}, Header: authHeader, Silence: true}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) { mu.Lock(); nodeThings = data; mu.Unlock(); wsWg.Done() }})
 	go client.Subscribe(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: nodeServer.Address}, Header: authHeader, Silence: true}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
@@ -544,68 +375,157 @@ func TestBasicPivotSyncRemote(t *testing.T) {
 
 	wsWg.Wait()
 
-	nodeIP, nodePort := parseAddress(nodeServer.Address)
+	// Verify initial state
+	mu.Lock()
+	require.Equal(t, 0, len(pivotThings))
+	require.Equal(t, 0, len(nodeThings))
+	mu.Unlock()
 
-	// Push thing to pivot via remote - expect 2 ws events (pivot write + node sync via TriggerNodeSync)
+	// Get node address for Thing creation
+	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
+	nodePortInt, _ := strconv.Atoi(nodePort)
+
+	// Push thing to pivot - expect 2 ws events (pivot + node via TriggerNodeSync)
 	wsWg.Add(2)
-	thingIDResp, err := ooio.RemotePushWithResponse(pivotCfg, "things/*", Thing{IP: nodeIP, Port: nodePort, On: false})
-	require.NoError(t, err)
-	thingID := thingIDResp.Index
-	require.NotEmpty(t, thingID, "RemotePushWithResponse should return a non-empty index")
+	thingID := ops.pushThing(t, true, Thing{IP: nodeIP, Port: nodePortInt, On: false})
 	wsWg.Wait()
 
 	mu.Lock()
-	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after push")
-	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after sync")
+	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing")
+	require.Equal(t, false, pivotThings[0].Data.On)
+	require.Equal(t, 1, len(nodeThings), "node should have 1 thing")
+	require.Equal(t, false, nodeThings[0].Data.On)
 	mu.Unlock()
 
-	// Read from node via remote - should have the thing after sync
-	nodeThing, err := ooio.RemoteGet[Thing](nodeCfg, "things/"+thingID)
-	require.NoError(t, err)
-	require.Equal(t, false, nodeThing.Data.On)
+	// Read from node - should have the thing after sync
+	nodeThing := ops.getThing(t, false, thingID)
+	require.Equal(t, false, nodeThing.On)
 
-	// Modify thing on pivot
+	// Modify thing on pivot - expect 2 ws events
 	wsWg.Add(2)
-	err = ooio.RemoteSet(pivotCfg, "things/"+thingID, Thing{IP: nodeIP, Port: nodePort, On: true})
-	require.NoError(t, err)
+	ops.setThing(t, true, thingID, Thing{IP: nodeIP, Port: nodePortInt, On: true})
 	wsWg.Wait()
 
-	// Set settings on node
+	// Verify update
+	updatedThing := ops.getThing(t, true, thingID)
+	require.Equal(t, true, updatedThing.On)
+	nodeThing = ops.getThing(t, false, thingID)
+	require.Equal(t, true, nodeThing.On)
+
+	// Set settings on node - expect 2 ws events
 	wsWg.Add(2)
-	err = ooio.RemoteSet(nodeCfg, "settings", Settings{DayEpoch: 1})
-	require.NoError(t, err)
+	ops.setSettings(t, false, Settings{DayEpoch: 1})
 	wsWg.Wait()
 
-	// Set settings on pivot
+	mu.Lock()
+	require.Equal(t, 1, nodeSettings[0].Data.DayEpoch)
+	require.Equal(t, 1, pivotSettings[0].Data.DayEpoch)
+	mu.Unlock()
+
+	// Set settings on pivot - expect 2 ws events
 	wsWg.Add(2)
-	err = ooio.RemoteSet(pivotCfg, "settings", Settings{DayEpoch: 9})
-	require.NoError(t, err)
+	ops.setSettings(t, true, Settings{DayEpoch: 9})
 	wsWg.Wait()
 
-	pivotSettingsObj, err := ooio.RemoteGet[Settings](pivotCfg, "settings")
-	require.NoError(t, err)
-	require.Equal(t, 9, pivotSettingsObj.Data.DayEpoch)
+	// Verify settings
+	pivotSettingsObj := ops.getSettings(t, true)
+	require.Equal(t, 9, pivotSettingsObj.DayEpoch)
+	nodeSettingsObj := ops.getSettings(t, false)
+	require.Equal(t, 9, nodeSettingsObj.DayEpoch)
 
-	// Delete thing from pivot
+	// Push a second thing to pivot
 	wsWg.Add(2)
-	thingID2Resp, _ := ooio.RemotePushWithResponse(pivotCfg, "things/*", Thing{IP: "10.0.0.1", Port: 0, On: true})
-	thingID2 := thingID2Resp.Index
+	thingID2 := ops.pushThing(t, true, Thing{IP: "10.0.0.1", Port: 0, On: true})
 	wsWg.Wait()
 
+	mu.Lock()
+	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things")
+	require.Equal(t, 2, len(nodeThings), "node should have 2 things")
+	mu.Unlock()
+
+	// Delete from pivot - expect 2 ws events
 	wsWg.Add(2)
-	err = ooio.RemoteDelete(pivotCfg, "things/"+thingID2)
-	require.NoError(t, err)
+	ops.deleteThing(t, true, thingID2)
 	wsWg.Wait()
 
-	_, err = ooio.RemoteGet[Thing](pivotCfg, "things/"+thingID2)
-	require.Error(t, err)
+	// Verify deletion
+	ops.getThingExpectError(t, true, thingID2, "thingID2 should be deleted from pivot")
+	ops.getThingExpectError(t, false, thingID2, "thingID2 should be deleted from node after sync")
 
-	// Delete settings
+	mu.Lock()
+	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after delete")
+	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after delete")
+	require.Equal(t, thingID, pivotThings[0].Index)
+	require.Equal(t, thingID, nodeThings[0].Index)
+	mu.Unlock()
+
+	// Push a third thing to node
 	wsWg.Add(2)
-	err = ooio.RemoteDelete(nodeCfg, "settings")
-	require.NoError(t, err)
+	thingID3 := ops.pushThing(t, false, Thing{IP: "172.16.0.1", Port: 0, On: false})
 	wsWg.Wait()
 
-	_, err = ooio.RemoteGet[Settings](nodeCfg, "settings")
-	require.Error(t, err)
+	mu.Lock()
+	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things after node push")
+	require.Equal(t, 2, len(nodeThings), "node should have 2 things after node push")
+	mu.Unlock()
+
+	// Delete from node - expect 2 ws events
+	wsWg.Add(2)
+	ops.deleteThing(t, false, thingID3)
+	wsWg.Wait()
+
+	// Verify deletion
+	ops.getThingExpectError(t, false, thingID3, "thingID3 should be deleted from node")
+	ops.getThingExpectError(t, true, thingID3, "thingID3 should be deleted from pivot after sync")
+
+	mu.Lock()
+	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after node delete")
+	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after node delete")
+	mu.Unlock()
+
+	// Update thing on node - expect 2 ws events
+	wsWg.Add(2)
+	ops.setThing(t, false, thingID, Thing{IP: nodeIP, Port: nodePortInt, On: false})
+	wsWg.Wait()
+
+	// Verify update synced to pivot
+	pivotThing := ops.getThing(t, true, thingID)
+	require.Equal(t, nodeIP, pivotThing.IP)
+	require.Equal(t, nodePortInt, pivotThing.Port)
+	require.Equal(t, false, pivotThing.On)
+
+	// Delete settings from node - expect 2 ws events
+	wsWg.Add(2)
+	ops.deleteSettings(t, false)
+	wsWg.Wait()
+
+	// Verify settings deleted
+	ops.getSettingsExpectError(t, false, "settings should be deleted from node")
+	ops.getSettingsExpectError(t, true, "settings should be deleted from pivot after sync")
+
+	// Set settings on pivot after delete - expect 2 ws events
+	wsWg.Add(2)
+	ops.setSettings(t, true, Settings{DayEpoch: 42})
+	wsWg.Wait()
+
+	// Verify settings synced
+	nodeSettingsObj = ops.getSettings(t, false)
+	require.Equal(t, 42, nodeSettingsObj.DayEpoch)
+
+	// Delete settings from pivot - expect 2 ws events
+	wsWg.Add(2)
+	ops.deleteSettings(t, true)
+	wsWg.Wait()
+
+	// Verify settings deleted
+	ops.getSettingsExpectError(t, true, "settings should be deleted from pivot")
+	ops.getSettingsExpectError(t, false, "settings should be deleted from node after sync")
+}
+
+func TestBasicPivotSyncLocal(t *testing.T) {
+	testBasicPivotSync(t, false)
+}
+
+func TestBasicPivotSyncRemote(t *testing.T) {
+	testBasicPivotSync(t, true)
 }

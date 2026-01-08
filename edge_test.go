@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -25,20 +26,22 @@ func TestNodeToPivotSync(t *testing.T) {
 	defer nodeServer.Close(os.Interrupt)
 
 	// Use node server address so pivot can find the node for sync notifications
+	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
+	nodePortInt, _ := strconv.Atoi(nodePort)
+
 	syncEvents.expect(1)
-	thingID, err := ooo.Push(nodeServer, "things/*", newThing(nodeServer.Address, true))
+	thingID, err := ooo.Push(nodeServer, "things/*", Thing{IP: nodeIP, Port: nodePortInt, On: true})
 	require.NoError(t, err)
 	syncEvents.wait()
 
-	nodeIP, nodePort := parseAddress(nodeServer.Address)
 	pivotThing, err := ooo.Get[Thing](pivotServer, "things/"+thingID)
 	require.NoError(t, err)
 	require.Equal(t, true, pivotThing.Data.On)
 	require.Equal(t, nodeIP, pivotThing.Data.IP)
-	require.Equal(t, nodePort, pivotThing.Data.Port)
+	require.Equal(t, nodePortInt, pivotThing.Data.Port)
 
 	syncEvents.expect(2) // Node storage event + pivot storage event after sync
-	_, err = ooo.Push(nodeServer, "things/*", newThing(nodeServer.Address, false))
+	_, err = ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: false})
 	require.NoError(t, err)
 	syncEvents.wait()
 
