@@ -69,7 +69,7 @@ func TestHermitCrab(t *testing.T) {
 
 	// Write data to node - expect 2 sync events (node write + pivot receive)
 	syncEvents.expect(2)
-	thingID, err := ooo.Push(node, "things/*", Thing{IP: "192.168.1.1", On: true})
+	thingID, err := ooo.Push(node, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 	require.NoError(t, err)
 	require.NotEmpty(t, thingID)
 	t.Logf("Wrote thing %s to node", thingID)
@@ -101,7 +101,7 @@ func TestHermitCrab(t *testing.T) {
 
 	// Write new data to node - expect 2 sync events (node write + pivot receive)
 	syncEvents.expect(2)
-	thingID2, err := ooo.Push(node, "things/*", Thing{IP: "192.168.2.2", On: false})
+	thingID2, err := ooo.Push(node, "things/*", Thing{IP: "192.168.2.2", Port: 0, On: false})
 	require.NoError(t, err)
 	require.NotEmpty(t, thingID2)
 	t.Logf("Wrote thing %s to node (for Shell B)", thingID2)

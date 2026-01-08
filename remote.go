@@ -2,10 +2,12 @@ package pivot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/benitogf/ooo/meta"
 )
@@ -18,8 +20,17 @@ func TriggerNodeSync(client *http.Client, node string) {
 // TriggerNodeSyncWithHealth triggers a pull-only sync on a node server.
 // Uses /synchronize/pivot endpoint so node pulls from pivot without sending data back.
 // This prevents re-adding items that pivot just deleted.
+// Uses a 5 second timeout to allow sync to complete on slow networks.
 func TriggerNodeSyncWithHealth(client *http.Client, node string) bool {
-	resp, err := client.Get("http://" + node + RoutePrefix + "/synchronize/pivot")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+node+RoutePrefix+"/synchronize/pivot", nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return false
 	}
@@ -84,7 +95,8 @@ func sendToPivot(client *http.Client, key string, pivot string, obj meta.Object)
 }
 
 func sendDelete(client *http.Client, key, pivot string, lastEntry int64) error {
-	req, err := http.NewRequest("DELETE", "http://"+pivot+RoutePrefix+"/pivot/"+key+"/"+strconv.FormatInt(lastEntry, 10), nil)
+	url := "http://" + pivot + RoutePrefix + "/pivot/" + key + "/" + strconv.FormatInt(lastEntry, 10)
+	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
 		return err
 	}

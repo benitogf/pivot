@@ -15,11 +15,6 @@ import (
 	"github.com/benitogf/ooo/storage"
 )
 
-// get from pivot and write to local
-func syncLocalEntries(client *http.Client, pivot string, _key Key, lastEntry int64) error {
-	return syncLocalEntriesWithTracking(client, pivot, _key, lastEntry, nil, nil)
-}
-
 // syncLocalEntriesWithTracking syncs from pivot and tracks synced keys via callbacks.
 // onDelete is called for each key deleted locally (item exists locally but not on pivot)
 // onSet is called for each key set locally (item exists on pivot but not locally, or pivot is newer)
@@ -39,33 +34,51 @@ func syncLocalEntriesWithTracking(client *http.Client, pivot string, _key Key, l
 		objsToDelete := GetEntriesNegativeDiff(objsLocal, objsPivot)
 		for _, index := range objsToDelete {
 			fullKey := baseKey + "/" + index
-			_key.Database.Del(fullKey)
+			// Track BEFORE delete so storage callback can skip this event
 			if onDelete != nil {
 				onDelete(fullKey)
 			}
+			_key.Database.Del(fullKey)
 		}
 
 		objsToSend := GetEntriesPositiveDiff(objsLocal, objsPivot)
 		for _, obj := range objsToSend {
 			fullKey := baseKey + "/" + obj.Index
-			_key.Database.SetWithMeta(fullKey, obj.Data, obj.Created, obj.Updated)
+			// Track BEFORE set so storage callback can skip this event
 			if onSet != nil {
 				onSet(fullKey)
 			}
+			_key.Database.SetWithMeta(fullKey, obj.Data, obj.Created, obj.Updated)
 		}
-		_key.Database.Set(StoragePrefix+baseKey, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
+		// Only update activity timestamp if items were actually synced
+		if len(objsToDelete) > 0 || len(objsToSend) > 0 {
+			_key.Database.Set(StoragePrefix+baseKey, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
+		}
 		return nil
 	}
 
 	obj, err := getEntryFromPivot(client, pivot, _key.Path)
 	if err != nil {
-		return err
+		// Key doesn't exist on pivot - check if it exists locally and delete it
+		_, localErr := _key.Database.Get(_key.Path)
+		if localErr == nil {
+			// Key exists locally but not on pivot - delete it
+			if onDelete != nil {
+				onDelete(_key.Path)
+			}
+			_key.Database.Del(_key.Path)
+		}
+		// Clear delete timestamp so activity becomes 0 (matching pivot's 0)
+		_key.Database.Del(StoragePrefix + _key.Path)
+		return nil
 	}
-	_key.Database.SetWithMeta(_key.Path, obj.Data, obj.Created, obj.Updated)
+	// Track BEFORE set so storage callback can skip this event
 	if onSet != nil {
 		onSet(_key.Path)
 	}
-	_key.Database.Set(StoragePrefix+_key.Path, json.RawMessage(strconv.FormatInt(lastEntry, 10)))
+	_key.Database.SetWithMeta(_key.Path, obj.Data, obj.Created, obj.Updated)
+	// Clear delete timestamp so activity is based on object timestamp
+	_key.Database.Del(StoragePrefix + _key.Path)
 
 	return nil
 }
@@ -156,18 +169,20 @@ func syncPivotEntriesWithDeleteCheck(client *http.Client, pivot string, _key Key
 
 	obj, err := _key.Database.Get(_key.Path)
 	if err != nil {
-		return err
+		// Key doesn't exist locally - check if it exists on pivot and delete it
+		pivotObj, pivotErr := getEntryFromPivot(client, pivot, _key.Path)
+		if pivotErr == nil {
+			// Key exists on pivot but not locally - send delete
+			sendDelete(client, _key.Path, pivot, pivotObj.Updated)
+		}
+		return nil
 	}
 	sendToPivot(client, obj.Index, pivot, obj)
 
 	return nil
 }
 
-func synchronizeItem(client *http.Client, pivot string, key Key) error {
-	return synchronizeItemWithDeleteCheck(client, pivot, key, nil)
-}
-
-func synchronizeItemWithDeleteCheck(client *http.Client, pivot string, key Key, isRecentDelete func(key string) bool) error {
+func synchronizeItemWithTracking(client *http.Client, pivot string, key Key, isRecentDelete func(key string) bool, onDelete func(key string), onSet func(key string)) error {
 	update := false
 	_key := strings.Replace(key.Path, "/*", "", 1)
 	//check
@@ -192,7 +207,7 @@ func synchronizeItemWithDeleteCheck(client *http.Client, pivot string, key Key, 
 
 	// sync pivot to local
 	if activityLocal.LastEntry < activityPivot.LastEntry {
-		err := syncLocalEntries(client, pivot, key, activityPivot.LastEntry)
+		err := syncLocalEntriesWithTracking(client, pivot, key, activityPivot.LastEntry, onDelete, onSet)
 		if err != nil {
 			return err
 		}
@@ -207,17 +222,12 @@ func synchronizeItemWithDeleteCheck(client *http.Client, pivot string, key Key, 
 }
 
 // synchronizeKeys performs the actual synchronization without mutex handling
-func synchronizeKeys(client *http.Client, pivot string, keys []Key) error {
-	return synchronizeKeysWithDeleteCheck(client, pivot, keys, nil)
-}
-
-// synchronizeKeysWithDeleteCheck performs synchronization with an optional delete check.
-// If isRecentDelete is provided, items that were recently deleted by a pull-only sync
-// will not be re-added to pivot.
-func synchronizeKeysWithDeleteCheck(client *http.Client, pivot string, keys []Key, isRecentDelete func(key string) bool) error {
+// synchronizeKeysWithTracking performs synchronization with tracking callbacks.
+// onDelete/onSet are called for each key deleted/set locally during sync.
+func synchronizeKeysWithTracking(client *http.Client, pivot string, keys []Key, isRecentDelete func(key string) bool, onDelete func(key string), onSet func(key string)) error {
 	update := false
 	for _, key := range keys {
-		errItem := synchronizeItemWithDeleteCheck(client, pivot, key, isRecentDelete)
+		errItem := synchronizeItemWithTracking(client, pivot, key, isRecentDelete, onDelete, onSet)
 		if errItem == nil {
 			update = true
 		}
@@ -226,13 +236,6 @@ func synchronizeKeysWithDeleteCheck(client *http.Client, pivot string, keys []Ke
 		return nil
 	}
 	return errors.New("nothing to synchronize")
-}
-
-// pullFromPivot syncs FROM pivot only, without sending local data back.
-// Used by /synchronize/pivot endpoint when pivot triggers a sync on a node.
-// This prevents re-adding items that pivot just deleted.
-func pullFromPivot(client *http.Client, pivot string, keys []Key) error {
-	return pullFromPivotWithTracking(client, pivot, keys, nil, nil)
 }
 
 // pullFromPivotWithTracking syncs FROM pivot and tracks synced keys.
@@ -262,87 +265,77 @@ func pullFromPivotWithTracking(client *http.Client, pivot string, keys []Key, on
 	return errors.New("nothing to synchronize")
 }
 
-// pullTracker tracks keys that were modified during a pull operation.
-// Uses generation counters for deterministic behavior without timing assumptions.
+// pullTracker tracks keys that are being modified during sync operations.
+// Keys are tracked before storage operations and consumed (removed) when checked.
+// This ensures each storage event is only skipped once.
 type pullTracker struct {
-	mu         sync.RWMutex
-	generation uint64            // Current generation counter
-	lastPull   uint64            // Generation of last pull operation
-	deleted    map[string]uint64 // key -> generation when deleted
-	set        map[string]uint64 // key -> generation when set
+	mu      sync.Mutex
+	deleted map[string]bool // keys being deleted during current sync
+	set     map[string]bool // keys being set during current sync
 }
 
 func newPullTracker() *pullTracker {
 	return &pullTracker{
-		deleted: make(map[string]uint64),
-		set:     make(map[string]uint64),
+		deleted: make(map[string]bool),
+		set:     make(map[string]bool),
 	}
 }
 
-// startPull begins a new pull operation and returns its generation
-func (p *pullTracker) startPull() uint64 {
+// trackDelete records a key being deleted during sync
+func (p *pullTracker) trackDelete(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.generation++
-	p.lastPull = p.generation
-	// Clear old entries (keep only last 2 generations)
-	for k, g := range p.deleted {
-		if g < p.lastPull-1 {
-			delete(p.deleted, k)
-		}
-	}
-	for k, g := range p.set {
-		if g < p.lastPull-1 {
-			delete(p.set, k)
-		}
-	}
-	return p.generation
+	p.deleted[key] = true
 }
 
-// trackDelete records a key deleted during pull
-func (p *pullTracker) trackDelete(key string, gen uint64) {
+// trackSet records a key being set during sync
+func (p *pullTracker) trackSet(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.deleted[key] = gen
+	p.set[key] = true
 }
 
-// trackSet records a key set during pull
-func (p *pullTracker) trackSet(key string, gen uint64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.set[key] = gen
-}
-
-// pulledDelete returns true if key was deleted in the last pull
+// pulledDelete returns true if key was deleted during sync, and consumes the flag
 func (p *pullTracker) pulledDelete(key string) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.lastPull == 0 {
-		return false
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.deleted[key] {
+		delete(p.deleted, key)
+		return true
 	}
-	gen, exists := p.deleted[key]
-	return exists && gen == p.lastPull
+	return false
 }
 
-// pulledSet returns true if key was set in the last pull
+// pulledSet returns true if key was set during sync, and consumes the flag
 func (p *pullTracker) pulledSet(key string) bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.lastPull == 0 {
-		return false
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.set[key] {
+		delete(p.set, key)
+		return true
 	}
-	gen, exists := p.set[key]
-	return exists && gen == p.lastPull
+	return false
+}
+
+// pendingOp represents a queued per-key operation
+type pendingOp struct {
+	opType string      // "set" or "del"
+	key    string      // full key path
+	obj    meta.Object // for set operations
+	ts     int64       // timestamp for delete operations
 }
 
 // syncer coordinates synchronization operations for a server.
 // It ensures only one sync runs at a time and tracks pulled keys.
+// Uses a per-key queue to ensure operations aren't lost during contention.
 type syncer struct {
 	mu      sync.Mutex
 	tracker *pullTracker
 	client  *http.Client
 	pivot   string
 	keys    []Key
+	queueMu sync.Mutex
+	queue   []pendingOp // Per-key operations queued during Pull
 }
 
 func newSyncer(client *http.Client, pivot string, keys []Key) *syncer {
@@ -351,33 +344,137 @@ func newSyncer(client *http.Client, pivot string, keys []Key) *syncer {
 		client:  client,
 		pivot:   pivot,
 		keys:    keys,
+		queue:   make([]pendingOp, 0),
 	}
 }
 
 // Pull syncs FROM pivot only (used when pivot notifies node of changes)
 func (s *syncer) Pull() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	gen := s.tracker.startPull()
-	return pullFromPivotWithTracking(s.client, s.pivot, s.keys,
-		func(key string) { s.tracker.trackDelete(key, gen) },
-		func(key string) { s.tracker.trackSet(key, gen) })
+	err := pullFromPivotWithTracking(s.client, s.pivot, s.keys,
+		s.tracker.trackDelete,
+		s.tracker.trackSet)
+	s.mu.Unlock()
+
+	// Process any queued per-key operations
+	s.processQueue()
+	return err
 }
 
-// Sync performs bidirectional synchronization
+// TryPull attempts to sync FROM pivot, skipping if already in progress
+func (s *syncer) TryPull() error {
+	if !s.mu.TryLock() {
+		return nil
+	}
+	err := pullFromPivotWithTracking(s.client, s.pivot, s.keys,
+		s.tracker.trackDelete,
+		s.tracker.trackSet)
+	s.mu.Unlock()
+
+	// Process any queued per-key operations
+	s.processQueue()
+	return err
+}
+
+// processQueue sends all queued per-key operations to pivot
+func (s *syncer) processQueue() {
+	s.queueMu.Lock()
+	if len(s.queue) == 0 {
+		s.queueMu.Unlock()
+		return
+	}
+	// Take ownership of the queue
+	pending := s.queue
+	s.queue = make([]pendingOp, 0)
+	s.queueMu.Unlock()
+
+	// Process each operation
+	for _, op := range pending {
+		switch op.opType {
+		case "set":
+			sendToPivot(s.client, op.key, s.pivot, op.obj)
+		case "del":
+			sendDelete(s.client, op.key, s.pivot, op.ts)
+		}
+	}
+}
+
+// processQueueLocked sends all queued per-key operations to pivot (caller must hold s.mu)
+func (s *syncer) processQueueLocked() {
+	s.queueMu.Lock()
+	if len(s.queue) == 0 {
+		s.queueMu.Unlock()
+		return
+	}
+	pending := s.queue
+	s.queue = make([]pendingOp, 0)
+	s.queueMu.Unlock()
+
+	for _, op := range pending {
+		switch op.opType {
+		case "set":
+			sendToPivot(s.client, op.key, s.pivot, op.obj)
+		case "del":
+			sendDelete(s.client, op.key, s.pivot, op.ts)
+		}
+	}
+}
+
+// QueueOrSendSet sends a set operation to pivot, or queues it if Pull is in progress
+func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
+	if s.mu.TryLock() {
+		sendToPivot(s.client, key, s.pivot, obj)
+		s.mu.Unlock()
+	} else {
+		// Pull in progress - queue for later and wait for Pull to complete then process
+		s.queueMu.Lock()
+		s.queue = append(s.queue, pendingOp{opType: "set", key: key, obj: obj})
+		s.queueMu.Unlock()
+		// Wait for Pull to release the lock, then process queue under lock
+		s.mu.Lock()
+		s.processQueueLocked()
+		s.mu.Unlock()
+	}
+}
+
+// QueueOrSendDelete sends a delete operation to pivot, or queues it if Pull is in progress
+func (s *syncer) QueueOrSendDelete(key string, ts int64) {
+	if s.mu.TryLock() {
+		sendDelete(s.client, key, s.pivot, ts)
+		s.mu.Unlock()
+	} else {
+		// Pull in progress - queue for later and wait for Pull to complete then process
+		s.queueMu.Lock()
+		s.queue = append(s.queue, pendingOp{opType: "del", key: key, ts: ts})
+		s.queueMu.Unlock()
+		// Wait for Pull to release the lock, then process queue under lock
+		s.mu.Lock()
+		s.processQueueLocked()
+		s.mu.Unlock()
+	}
+}
+
+// Sync performs bidirectional synchronization with tracking
 func (s *syncer) Sync() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return synchronizeKeysWithDeleteCheck(s.client, s.pivot, s.keys, s.tracker.pulledDelete)
+	err := synchronizeKeysWithTracking(s.client, s.pivot, s.keys, s.tracker.pulledDelete,
+		s.tracker.trackDelete,
+		s.tracker.trackSet)
+	s.mu.Unlock()
+	return err
 }
 
 // TrySync attempts sync but skips if already in progress
+// Uses tracking to prevent storage events from triggering redundant syncs
 func (s *syncer) TrySync() error {
 	if !s.mu.TryLock() {
 		return nil
 	}
-	defer s.mu.Unlock()
-	return synchronizeKeysWithDeleteCheck(s.client, s.pivot, s.keys, s.tracker.pulledDelete)
+	err := synchronizeKeysWithTracking(s.client, s.pivot, s.keys, s.tracker.pulledDelete,
+		s.tracker.trackDelete,
+		s.tracker.trackSet)
+	s.mu.Unlock()
+	return err
 }
 
 // PulledDelete returns true if key was deleted in the last pull
@@ -424,48 +521,48 @@ func makeStorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes 
 		}
 
 		// Track delete timestamps for proper sync
-		if event.Operation == "del" {
+		switch event.Operation {
+		case "del":
 			matchedDB.Set(StoragePrefix+matchedKey, json.RawMessage(ooo.Time()))
+		case "set":
+			// Clear delete timestamp when key is set, so activity is based on object timestamp
+			matchedDB.Del(StoragePrefix + matchedKey)
 		}
 
 		if pivotIP == "" {
-			// This is the pivot server - notify all nodes in parallel
-			// Wait for all notifications to complete before returning
+			// This is the pivot server - notify all nodes asynchronously
+			// Fire and forget - don't block the storage callback
 			nodes := _getNodes()
 			// Filter to healthy nodes if health tracking is enabled
 			if nodeHealth != nil {
 				nodes = nodeHealth.GetHealthyNodes(nodes)
 			}
-			if len(nodes) > 0 {
-				var wg sync.WaitGroup
-				for _, node := range nodes {
-					wg.Add(1)
-					go func(n string) {
-						defer wg.Done()
-						ok := TriggerNodeSyncWithHealth(client, n)
-						if nodeHealth != nil {
-							if ok {
-								nodeHealth.MarkHealthy(n)
-							} else {
-								nodeHealth.MarkUnhealthy(n)
-							}
+			for _, node := range nodes {
+				go func(n string) {
+					ok := TriggerNodeSyncWithHealth(client, n)
+					if nodeHealth != nil {
+						if ok {
+							nodeHealth.MarkHealthy(n)
+						} else {
+							nodeHealth.MarkUnhealthy(n)
 						}
-					}(node)
-				}
-				wg.Wait()
+					}
+				}(node)
 			}
 		} else {
-			// This is a node - handle sync with pivot
-			if event.Operation == "del" {
-				// For delete events, send delete command directly to pivot
-				// This is more reliable than relying on bidirectional sync to detect the delete
-				sendDelete(client, event.Key, pivotIP, time.Now().UnixNano())
-			} else {
-				// For set events, synchronize with pivot synchronously
-				// Synchronous sync ensures the operation completes before the next one starts,
-				// preventing race conditions where stale data overwrites newer data
-				if s != nil {
-					s.TrySync()
+			// This is a node - use per-key operations to sync with pivot
+			// This ensures deterministic event generation: each local change
+			// sends exactly that key to pivot, no list-level comparisons
+			if s != nil {
+				if event.Operation == "del" {
+					// Send delete for this specific key
+					s.QueueOrSendDelete(event.Key, time.Now().UnixNano())
+				} else {
+					// Send set for this specific key
+					obj, err := matchedDB.Get(event.Key)
+					if err == nil {
+						s.QueueOrSendSet(event.Key, obj)
+					}
 				}
 			}
 		}

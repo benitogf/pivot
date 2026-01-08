@@ -72,14 +72,15 @@ The `Instance` type exposes `BeforeRead` and `SyncCallback` for manual setup if 
 
 ### Node Discovery
 
-Nodes register themselves by creating entries at `NodesKey` with their IP address:
+Nodes register themselves by creating entries at `NodesKey` with their IP and port:
 
 ```go
 // On pivot server, create a "thing" that represents a node
-ooo.Push(server, "things/*", Thing{IP: nodeServer.Address})
+// The IP and Port fields are used to construct the node address
+ooo.Push(server, "things/*", Thing{IP: "127.0.0.1", Port: 8080})
 ```
 
-When the pivot server writes data, it reads all entries from `NodesKey`, extracts the `"ip"` field, and triggers sync on each node.
+When the pivot server writes data, it reads all entries from `NodesKey`, extracts the `"ip"` and `"port"` fields, constructs the address (e.g., `127.0.0.1:8080`), and triggers sync on each node. Entries without a port (Port: 0) are treated as data, not node servers.
 
 ### Route Structure
 

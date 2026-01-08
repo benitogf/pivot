@@ -59,6 +59,8 @@ func checkActivity(_key Key) (ActivityEntry, error) {
 
 	obj, err := _key.Database.Get(_key.Path)
 	if err != nil {
+		// Key doesn't exist - check for delete timestamp
+		activity.LastEntry = checkLastDelete(_key.Database, 0, baseKey.Path)
 		return activity, nil
 	}
 

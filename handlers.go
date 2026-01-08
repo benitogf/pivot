@@ -96,7 +96,14 @@ func Delete(db storage.Database, path string) func(w http.ResponseWriter, r *htt
 	return func(w http.ResponseWriter, r *http.Request) {
 		index := mux.Vars(r)["index"]
 		time := mux.Vars(r)["time"]
-		itemKey := path + "/" + index
+		var itemKey string
+		if index == "" {
+			// Single key delete (e.g., "settings")
+			itemKey = path
+		} else {
+			// Glob pattern delete (e.g., "things/123")
+			itemKey = path + "/" + index
+		}
 		err := db.Del(itemKey)
 		db.Set(StoragePrefix+path, json.RawMessage(time))
 		if err != nil {
@@ -108,13 +115,13 @@ func Delete(db storage.Database, path string) func(w http.ResponseWriter, r *htt
 }
 
 // Activity route to get activity info from the pivot instance
-func Activity(key Key) func(w http.ResponseWriter, r *http.Request) {
+func Activity(_key Key) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if key.Database == nil || !key.Database.Active() {
+		if _key.Database == nil || !_key.Database.Active() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		activity, _ := checkActivity(key)
+		activity, _ := checkActivity(_key)
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(activity)
 	}

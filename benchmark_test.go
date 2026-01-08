@@ -103,7 +103,7 @@ func BenchmarkBaseline_Write(b *testing.B) {
 	defer server.Close(os.Interrupt)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ooo.Push(server, "things/*", Thing{IP: "192.168.1.1", On: true})
+		ooo.Push(server, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 	}
 }
 
@@ -119,7 +119,7 @@ func BenchmarkBaseline_Set(b *testing.B) {
 func BenchmarkBaseline_Read(b *testing.B) {
 	server := createBenchServer()
 	defer server.Close(os.Interrupt)
-	thingID, _ := ooo.Push(server, "things/*", Thing{IP: "192.168.1.1", On: true})
+	thingID, _ := ooo.Push(server, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ooo.Get[Thing](server, "things/"+thingID)
@@ -148,7 +148,7 @@ func BenchmarkPivotServer_UnreachableNode_Set(b *testing.B) {
 	defer server.Close(os.Interrupt)
 
 	// Register a fake unreachable node
-	ooo.Push(server, "things/*", Thing{IP: "192.168.99.99:9999", On: true})
+	ooo.Push(server, "things/*", Thing{IP: "192.168.99.99", Port: 9999, On: true})
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -168,7 +168,7 @@ func BenchmarkPivotServer_ReachableNode_Set(b *testing.B) {
 	defer nodeServer.Close(os.Interrupt)
 
 	// Register the node on the pivot
-	ooo.Push(pivotServer, "things/*", Thing{IP: nodeServer.Address, On: true})
+	ooo.Push(pivotServer, "things/*", newThing(nodeServer.Address, true))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -202,7 +202,7 @@ func BenchmarkNodeServer_Write(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", On: true})
+		ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 	}
 }
 
@@ -214,7 +214,7 @@ func BenchmarkNodeServer_Read(b *testing.B) {
 	defer nodeServer.Close(os.Interrupt)
 
 	// Pre-populate data on node
-	thingID, _ := ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", On: true})
+	thingID, _ := ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -336,7 +336,7 @@ func BenchmarkE2E_PivotToNode_Set(b *testing.B) {
 	defer nodeServer.Close(os.Interrupt)
 
 	// Register the node on the pivot
-	ooo.Push(pivotServer, "things/*", Thing{IP: nodeServer.Address, On: true})
+	ooo.Push(pivotServer, "things/*", newThing(nodeServer.Address, true))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -379,12 +379,12 @@ func BenchmarkE2E_PivotToNode_Write(b *testing.B) {
 	defer nodeServer.Close(os.Interrupt)
 
 	// Register the node on the pivot
-	ooo.Push(pivotServer, "things/*", Thing{IP: nodeServer.Address, On: true})
+	ooo.Push(pivotServer, "things/*", newThing(nodeServer.Address, true))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Write on pivot
-		ooo.Push(pivotServer, "things/*", Thing{IP: "192.168.1.1", On: true})
+		ooo.Push(pivotServer, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 		// Wait for event on node (sync completed)
 		nodeWaiter.wait("things/*", time.Second)
 	}
@@ -404,7 +404,7 @@ func BenchmarkE2E_NodeToPivot_Write(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Write on node
-		ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", On: true})
+		ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 		// Wait for event on pivot (sync completed)
 		pivotWaiter.wait("things/*", time.Second)
 	}
@@ -429,9 +429,9 @@ func BenchmarkE2E_MultiNode_Set(b *testing.B) {
 	defer node3.Close(os.Interrupt)
 
 	// Register all nodes on the pivot
-	ooo.Push(pivotServer, "things/*", Thing{IP: node1.Address, On: true})
-	ooo.Push(pivotServer, "things/*", Thing{IP: node2.Address, On: true})
-	ooo.Push(pivotServer, "things/*", Thing{IP: node3.Address, On: true})
+	ooo.Push(pivotServer, "things/*", newThing(node1.Address, true))
+	ooo.Push(pivotServer, "things/*", newThing(node2.Address, true))
+	ooo.Push(pivotServer, "things/*", newThing(node3.Address, true))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

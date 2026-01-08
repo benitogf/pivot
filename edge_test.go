@@ -24,18 +24,21 @@ func TestNodeToPivotSync(t *testing.T) {
 	nodeServer := createEdgeTestServer(pivotServer.Address, syncEvents)
 	defer nodeServer.Close(os.Interrupt)
 
+	// Use node server address so pivot can find the node for sync notifications
 	syncEvents.expect(1)
-	thingID, err := ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.1", On: true})
+	thingID, err := ooo.Push(nodeServer, "things/*", newThing(nodeServer.Address, true))
 	require.NoError(t, err)
 	syncEvents.wait()
 
+	nodeIP, nodePort := parseAddress(nodeServer.Address)
 	pivotThing, err := ooo.Get[Thing](pivotServer, "things/"+thingID)
 	require.NoError(t, err)
 	require.Equal(t, true, pivotThing.Data.On)
-	require.Equal(t, "192.168.1.1", pivotThing.Data.IP)
+	require.Equal(t, nodeIP, pivotThing.Data.IP)
+	require.Equal(t, nodePort, pivotThing.Data.Port)
 
-	syncEvents.expect(1)
-	_, err = ooo.Push(nodeServer, "things/*", Thing{IP: "192.168.1.2", On: false})
+	syncEvents.expect(2) // Node storage event + pivot storage event after sync
+	_, err = ooo.Push(nodeServer, "things/*", newThing(nodeServer.Address, false))
 	require.NoError(t, err)
 	syncEvents.wait()
 

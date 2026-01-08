@@ -2,6 +2,7 @@ package pivot
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -16,9 +17,10 @@ import (
 )
 
 // Node is the expected structure for entries in the NodesKey path.
-// User data stored at NodesKey must include an "ip" field.
+// User data stored at NodesKey must include "ip" and "port" fields.
 type Node struct {
-	IP string `json:"ip"`
+	IP   string `json:"ip"`
+	Port int    `json:"port"`
 }
 
 const (
@@ -93,7 +95,8 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 	return keys
 }
 
-// makeGetNodes creates a function that returns node IPs from the NodesKey path.
+// makeGetNodes creates a function that returns node addresses from the NodesKey path.
+// Only returns entries with a non-zero port - these are actual node servers.
 func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
 	return func() []string {
 		var result []string
@@ -109,8 +112,9 @@ func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
 			if err := json.Unmarshal(obj.Data, &node); err != nil {
 				continue
 			}
-			if node.IP != "" {
-				result = append(result, node.IP)
+			// Only include entries with a port - these are actual node servers
+			if node.IP != "" && node.Port > 0 {
+				result = append(result, fmt.Sprintf("%s:%d", node.IP, node.Port))
 			}
 		}
 		return result
@@ -248,7 +252,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	}
 
 	// Create BeforeRead callback for sync-on-read
-	// Uses trySync to avoid blocking if sync is already in progress
+	// Uses Pull() to sync FROM pivot only, avoiding conflicts with per-key sends
 	var syncing int32
 	beforeRead := func(readKey string) {
 		if pivotIP == "" {
@@ -261,7 +265,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		for _, k := range keys {
 			if key.Match(k.Path, readKey) {
 				if s != nil {
-					s.TrySync()
+					s.TryPull()
 				}
 				return
 			}
