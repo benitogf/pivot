@@ -11,16 +11,40 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/benitogf/coat"
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/key"
+	"github.com/benitogf/ooo/meta"
 	"github.com/benitogf/ooo/storage"
+	"github.com/benitogf/ooo/stream"
+	"github.com/gorilla/mux"
 )
 
 // Node is the expected structure for entries in the NodesKey path.
 // User data stored at NodesKey must include "ip" and "port" fields.
+// Accepts both lowercase and uppercase field names for flexibility.
 type Node struct {
 	IP   string `json:"ip"`
 	Port int    `json:"port"`
+	// Alternative field names (uppercase)
+	IPAlt   string `json:"IP"`
+	PortAlt int    `json:"Port"`
+}
+
+// GetIP returns the IP from either field
+func (n Node) GetIP() string {
+	if n.IP != "" {
+		return n.IP
+	}
+	return n.IPAlt
+}
+
+// GetPort returns the port from either field
+func (n Node) GetPort() int {
+	if n.Port > 0 {
+		return n.Port
+	}
+	return n.PortAlt
 }
 
 const (
@@ -32,10 +56,11 @@ const (
 
 // Config holds the configuration for pivot synchronization.
 type Config struct {
-	Keys     []Key        // Keys to sync (not including NodesKey)
-	NodesKey string       // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
-	PivotIP  string       // Address of the pivot server. Empty string means this server IS the pivot.
-	Client   *http.Client // Optional HTTP client for sync requests. If nil, DefaultClient() is used.
+	Keys            []Key        // Keys to sync (not including NodesKey)
+	NodesKey        string       // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
+	PivotIP         string       // Address of the pivot server. Empty string means this server IS the pivot.
+	Client          *http.Client // Optional HTTP client for sync requests. If nil, DefaultClient() is used.
+	AutoSyncOnStart bool         // If true, perform full bidirectional sync with pivot when node server starts. Default false.
 }
 
 // DefaultClient returns an HTTP client optimized for pivot synchronization.
@@ -100,7 +125,13 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
 	return func() []string {
 		var result []string
-		if nodesKey == "" || server.Storage == nil {
+		if nodesKey == "" {
+			return result
+		}
+		if server.Storage == nil {
+			return result
+		}
+		if !server.Storage.Active() {
 			return result
 		}
 		objs, err := server.Storage.GetList(nodesKey)
@@ -108,13 +139,35 @@ func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
 			return result
 		}
 		for _, obj := range objs {
-			var node Node
-			if err := json.Unmarshal(obj.Data, &node); err != nil {
+			// Try to parse as a map first to be more flexible with field names
+			var rawData map[string]interface{}
+			if err := json.Unmarshal(obj.Data, &rawData); err != nil {
 				continue
 			}
-			// Only include entries with a port - these are actual node servers
-			if node.IP != "" && node.Port > 0 {
-				result = append(result, fmt.Sprintf("%s:%d", node.IP, node.Port))
+
+			// Look for ip/IP field
+			var ip string
+			if v, ok := rawData["ip"].(string); ok {
+				ip = v
+			} else if v, ok := rawData["IP"].(string); ok {
+				ip = v
+			}
+
+			// Look for port/Port field - handle both int and float64 (JSON numbers)
+			var port int
+			if v, ok := rawData["port"].(float64); ok {
+				port = int(v)
+			} else if v, ok := rawData["Port"].(float64); ok {
+				port = int(v)
+			} else if v, ok := rawData["port"].(int); ok {
+				port = v
+			} else if v, ok := rawData["Port"].(int); ok {
+				port = v
+			}
+
+			// Only include entries with both ip and port
+			if ip != "" && port > 0 {
+				result = append(result, fmt.Sprintf("%s:%d", ip, port))
 			}
 		}
 		return result
@@ -191,6 +244,18 @@ func wipeStorage(db storage.Database, path string) {
 // Returns the server to make side-effects explicit.
 // Use GetInstance(server) to access BeforeRead/SyncCallback for external storages.
 func Setup(server *ooo.Server, config Config) *ooo.Server {
+	// Initialize router if not set
+	if server.Router == nil {
+		server.Router = mux.NewRouter()
+	}
+
+	// Initialize storage if not set
+	if server.Storage == nil {
+		server.Storage = storage.New(storage.LayeredConfig{
+			Memory: storage.NewMemoryLayer(),
+		})
+	}
+
 	pivotIP := config.PivotIP
 
 	// Use config.Client if provided, otherwise use DefaultClient()
@@ -211,23 +276,55 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		s = newSyncer(client, pivotIP, keys)
 	}
 
-	// Create node health tracker for pivot servers to skip unhealthy nodes
+	// Create node health tracker for pivot servers
+	// Health is tracked via periodic pings and sync success/failure
 	var nodeHealth *NodeHealth
 	if pivotIP == "" {
 		nodeHealth = NewNodeHealth(client)
-		nodeHealth.StartBackgroundCheck(getNodes, server.Active)
-
-		// Compose OnClose to stop NodeHealth goroutine when server closes
-		existingOnClose := server.OnClose
-		server.OnClose = func() {
-			nodeHealth.Stop()
-			if existingOnClose != nil {
-				existingOnClose()
+		// Set callback to broadcast to pivot/status subscribers when health changes
+		nodeHealth.SetOnHealthChange(func() {
+			info := GetPivotInfo(server)()
+			data, _ := json.Marshal(info)
+			now := time.Now().UTC().UnixNano()
+			obj := meta.Object{
+				Created: now,
+				Updated: now,
+				Index:   "pivot-status",
+				Data:    data,
 			}
-		}
+			server.Stream.Broadcast("pivot/status", stream.BroadcastOpt{
+				Key:       "pivot/status",
+				Operation: "set",
+				Object:    &obj,
+				FilterObject: func(key string, o meta.Object) (meta.Object, error) {
+					return o, nil
+				},
+			})
+		})
+		// Start background health check every 3 seconds
+		nodeHealth.StartBackgroundCheck(getNodes, 3*time.Second)
 	}
 
-	syncCallback := makeStorageSync(client, pivotIP, keys, getNodes, s, nodeHealth)
+	// Create read filter for pivot/status WebSocket subscription (works for both pivot and node)
+	server.ReadObjectFilter("pivot/status", func(key string, obj meta.Object) (meta.Object, error) {
+		info := GetPivotInfo(server)()
+		data, _ := json.Marshal(info)
+		now := time.Now().UTC().UnixNano()
+		return meta.Object{
+			Created: now,
+			Updated: now,
+			Index:   "pivot-status",
+			Data:    data,
+		}, nil
+	})
+
+	// Create originator tracker for pivot servers to skip TriggerNodeSync back to originating node
+	var originatorTracker *OriginatorTracker
+	if pivotIP == "" {
+		originatorTracker = NewOriginatorTracker()
+	}
+
+	syncCallback := makeStorageSync(client, pivotIP, keys, getNodes, s, nodeHealth, originatorTracker)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
 	server.OnStorageEvent = storage.EventCallback(syncCallback)
@@ -244,11 +341,11 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		baseKey := strings.Replace(k.Path, "/*", "", 1)
 		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k)).Methods("GET")
 		if baseKey != k.Path {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, originatorTracker)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker)).Methods("DELETE")
 		} else {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, originatorTracker)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker)).Methods("DELETE")
 		}
 		// Expose GET routes for all synced keys
 		if baseKey != k.Path {
@@ -296,15 +393,180 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		PivotIP:      pivotIP,
 		SyncedKeys:   keyPaths,
 		NodeHealth:   nodeHealth,
+		GetNodes:     getNodes,
+		syncer:       s,
 	}
 	storeInstance(server, instance)
+
+	// For node servers, start background pivot health check and initial sync
+	if pivotIP != "" {
+		stopHealthCheck := make(chan struct{})
+		var healthCheckWg sync.WaitGroup
+
+		// Stop health check when server closes and wait for it to finish
+		// before Server.Close() modifies server.Stream
+		existingOnClose := server.OnClose
+		server.OnClose = func() {
+			close(stopHealthCheck)
+			healthCheckWg.Wait() // Wait for goroutine to exit before stream is modified
+			if existingOnClose != nil {
+				existingOnClose()
+			}
+		}
+
+		// Start health check and set nodeAddr when server starts
+		// (must wait for server.Start() to initialize Stream)
+		existingOnStart := server.OnStart
+		server.OnStart = func() {
+			if existingOnStart != nil {
+				existingOnStart()
+			}
+			// Set node address for originator tracking
+			if s != nil {
+				s.SetNodeAddr(server.Address)
+			}
+			// Start health check goroutine (after Stream is initialized)
+			healthCheckWg.Add(1)
+			go func() {
+				defer healthCheckWg.Done()
+				startPivotHealthCheck(client, pivotIP, instance, server, stopHealthCheck)
+			}()
+			// Perform initial sync with pivot on startup (if enabled)
+			if config.AutoSyncOnStart && s != nil {
+				server.Console.Log("pivot: performing initial sync with pivot on startup")
+				if err := s.Sync(); err != nil {
+					server.Console.Err("pivot: initial sync failed, starting background retry", err)
+					go retryInitialSync(s, server.Console, stopHealthCheck)
+				} else {
+					server.Console.Log("pivot: initial sync completed successfully")
+				}
+			}
+		}
+	}
+
+	// Set GetPivotInfo on server for UI integration
+	server.GetPivotInfo = GetPivotInfo(server)
 
 	return server
 }
 
+// retryInitialSync retries the initial sync with exponential backoff until successful or stopped.
+// Backoff starts at 1s and doubles each attempt up to 60s max.
+func retryInitialSync(s *syncer, console *coat.Console, stop <-chan struct{}) {
+	const (
+		initialBackoff = 1 * time.Second
+		maxBackoff     = 60 * time.Second
+		multiplier     = 2.0
+	)
+
+	backoff := initialBackoff
+	attempt := 0
+
+	for {
+		attempt++
+		select {
+		case <-stop:
+			console.Log("pivot: stopping initial sync retry (server closing)")
+			return
+		default:
+		}
+
+		// Wait for backoff duration, but check stop channel
+		timer := time.NewTimer(backoff)
+		select {
+		case <-stop:
+			timer.Stop()
+			console.Log("pivot: stopping initial sync retry (server closing)")
+			return
+		case <-timer.C:
+		}
+
+		console.Log(fmt.Sprintf("pivot: retrying initial sync (attempt %d, backoff %v)", attempt, backoff))
+		if err := s.Sync(); err != nil {
+			console.Err(fmt.Sprintf("pivot: initial sync retry %d failed", attempt), err)
+			// Increase backoff with exponential growth, capped at max
+			backoff = time.Duration(float64(backoff) * multiplier)
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		} else {
+			console.Log("pivot: initial sync completed successfully after retry")
+			return
+		}
+	}
+}
+
+// startPivotHealthCheck periodically pings the pivot server and updates the instance health status
+func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instance, server *ooo.Server, stop <-chan struct{}) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	// isStopped checks if the stop channel is closed
+	isStopped := func() bool {
+		select {
+		case <-stop:
+			return true
+		default:
+			return false
+		}
+	}
+
+	checkHealth := func() {
+		// Check if stopped before doing any work
+		if isStopped() {
+			return
+		}
+		url := "http://" + pivotIP + "/"
+		resp, err := client.Get(url)
+		now := time.Now().Format(time.RFC3339)
+		wasHealthy := instance.PivotHealthy
+		if err != nil {
+			instance.PivotHealthy = false
+			instance.PivotLastCheck = now
+		} else {
+			resp.Body.Close()
+			instance.PivotHealthy = resp.StatusCode == http.StatusOK
+			instance.PivotLastCheck = now
+		}
+		// Broadcast if status changed - check stop again before accessing server.Stream
+		if wasHealthy != instance.PivotHealthy && !isStopped() {
+			info := GetPivotInfo(server)()
+			data, _ := json.Marshal(info)
+			now := time.Now().UTC().UnixNano()
+			obj := meta.Object{
+				Created: now,
+				Updated: now,
+				Index:   "pivot-status",
+				Data:    data,
+			}
+			server.Stream.Broadcast("pivot/status", stream.BroadcastOpt{
+				Key:       "pivot/status",
+				Operation: "set",
+				Object:    &obj,
+				FilterObject: func(key string, o meta.Object) (meta.Object, error) {
+					return o, nil
+				},
+			})
+		}
+	}
+
+	// Initial check
+	checkHealth()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			checkHealth()
+		}
+	}
+}
+
 // SyncDeleteFilter returns a delete filter that syncs deletes to pivot and notifies nodes.
 // This is for backward compatibility with code that uses the old pivot API.
-func SyncDeleteFilter(client *http.Client, pivotIP string, db storage.Database, keyPath string, _getNodes GetNodes) func(index string) error {
+// nodeAddr is the address of this node (empty for pivot servers).
+func SyncDeleteFilter(client *http.Client, pivotIP string, db storage.Database, keyPath string, _getNodes GetNodes, nodeAddr string) func(index string) error {
 	return func(index string) error {
 		// Delete locally first
 		err := db.Del(keyPath + "/" + index)
@@ -314,7 +576,7 @@ func SyncDeleteFilter(client *http.Client, pivotIP string, db storage.Database, 
 
 		// If this is a node, send delete to pivot
 		if pivotIP != "" {
-			sendDelete(client, keyPath+"/"+index, pivotIP, time.Now().UnixNano())
+			sendDelete(client, keyPath+"/"+index, pivotIP, time.Now().UnixNano(), nodeAddr)
 		} else {
 			// If this is pivot, notify all nodes
 			nodes := _getNodes()

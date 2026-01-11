@@ -4,109 +4,90 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/benitogf/network"
 )
 
-// Backoff thresholds for health check intervals (per-node)
-const (
-	backoffInitialInterval = 1 * time.Second  // Check every 1s initially
-	backoffMediumInterval  = 5 * time.Second  // Check every 5s after 10min unhealthy
-	backoffMaxInterval     = 10 * time.Second // Check every 10s after 30min unhealthy
-	backoffMediumThreshold = 10 * time.Minute // Time unhealthy before medium backoff
-	backoffMaxThreshold    = 30 * time.Minute // Time unhealthy before max backoff
-)
+// HealthPath is the WebSocket subscription path for node health tracking.
+// Nodes subscribe to this path to indicate they are online.
+const HealthPath = StoragePrefix + "health"
 
-// NodeHealth tracks the availability of nodes to avoid timeout penalties
-// for long-term offline nodes during synchronization.
+// NodeHealth tracks the availability of nodes via periodic health checks.
 type NodeHealth struct {
-	mu               sync.RWMutex
-	healthy          map[string]bool      // node address -> is healthy
-	lastCheck        map[string]time.Time // node address -> last check time
-	unhealthySince   map[string]time.Time // node address -> when it first became unhealthy
-	client           *http.Client
-	running          bool
-	baseTickInterval time.Duration  // base tick interval for the background goroutine
-	stopCh           chan struct{}  // channel to signal shutdown
-	wg               sync.WaitGroup // wait group to ensure goroutine exits
+	mu             sync.RWMutex
+	connected      map[string]bool      // node address -> is connected
+	lastConnect    map[string]time.Time // node address -> last connection time
+	lastDisconnect map[string]time.Time // node address -> last disconnection time
+	stopChan       chan struct{}
+	client         *http.Client
+	onHealthChange func() // callback when health status changes
 }
 
 // NewNodeHealth creates a new NodeHealth tracker.
-// The health checker uses per-node backoff: 1s initially, 5s after 10min unhealthy, 10s after 30min.
 func NewNodeHealth(client *http.Client) *NodeHealth {
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
 	return &NodeHealth{
-		healthy:          make(map[string]bool),
-		lastCheck:        make(map[string]time.Time),
-		unhealthySince:   make(map[string]time.Time),
-		client:           client,
-		baseTickInterval: backoffInitialInterval,
+		connected:      make(map[string]bool),
+		lastConnect:    make(map[string]time.Time),
+		lastDisconnect: make(map[string]time.Time),
+		stopChan:       make(chan struct{}),
+		client:         client,
 	}
 }
 
-// IsHealthy returns true if the node is known to be healthy or hasn't been checked yet.
-// Unknown nodes are assumed healthy to allow first contact.
+// IsHealthy returns true if the node is connected via WebSocket.
 func (nh *NodeHealth) IsHealthy(node string) bool {
 	nh.mu.RLock()
 	defer nh.mu.RUnlock()
-	healthy, exists := nh.healthy[node]
-	if !exists {
-		return true // Unknown nodes assumed healthy
-	}
-	return healthy
+	return nh.connected[node]
 }
 
-// MarkHealthy marks a node as healthy after successful communication.
-// Resets the unhealthySince timestamp.
-func (nh *NodeHealth) MarkHealthy(node string) {
+// OnConnect marks a node as healthy when it connects via WebSocket.
+// The key format is expected to be HealthPath + "/" + nodeAddress.
+func (nh *NodeHealth) OnConnect(key string) {
+	node := extractNodeFromKey(key)
+	if node == "" {
+		return
+	}
 	nh.mu.Lock()
 	defer nh.mu.Unlock()
-	nh.healthy[node] = true
-	nh.lastCheck[node] = time.Now()
-	delete(nh.unhealthySince, node) // Reset backoff when healthy
+	nh.connected[node] = true
+	nh.lastConnect[node] = time.Now()
 }
 
-// MarkUnhealthy marks a node as unhealthy after failed communication.
-// Tracks when the node first became unhealthy for backoff calculation.
-func (nh *NodeHealth) MarkUnhealthy(node string) {
+// OnDisconnect marks a node as unhealthy when it disconnects.
+func (nh *NodeHealth) OnDisconnect(key string) {
+	node := extractNodeFromKey(key)
+	if node == "" {
+		return
+	}
 	nh.mu.Lock()
 	defer nh.mu.Unlock()
-	wasHealthy := nh.healthy[node]
-	nh.healthy[node] = false
-	nh.lastCheck[node] = time.Now()
-	// Only set unhealthySince if transitioning from healthy to unhealthy
-	if wasHealthy || nh.unhealthySince[node].IsZero() {
-		if _, exists := nh.unhealthySince[node]; !exists {
-			nh.unhealthySince[node] = time.Now()
-		}
-	}
+	nh.connected[node] = false
+	nh.lastDisconnect[node] = time.Now()
 }
 
-// getCheckInterval returns the appropriate check interval for a node based on how long it's been unhealthy.
-func (nh *NodeHealth) getCheckInterval(node string) time.Duration {
-	unhealthyTime, exists := nh.unhealthySince[node]
-	if !exists {
-		return backoffInitialInterval
+// extractNodeFromKey extracts the node address from a subscription key.
+// Key format: pivot/health/{safeNodeAddress} where safeNodeAddress has _ instead of :
+func extractNodeFromKey(key string) string {
+	if !strings.HasPrefix(key, HealthPath+"/") {
+		return ""
 	}
-	duration := time.Since(unhealthyTime)
-	if duration >= backoffMaxThreshold {
-		return backoffMaxInterval
-	}
-	if duration >= backoffMediumThreshold {
-		return backoffMediumInterval
-	}
-	return backoffInitialInterval
+	safeAddr := strings.TrimPrefix(key, HealthPath+"/")
+	// Convert underscore back to colon to get the actual address
+	return strings.ReplaceAll(safeAddr, "_", ":")
 }
 
-// GetHealthyNodes filters a list of nodes to only include healthy ones.
+// GetHealthyNodes filters a list of nodes to only include healthy (connected) ones.
 func (nh *NodeHealth) GetHealthyNodes(nodes []string) []string {
 	nh.mu.RLock()
 	defer nh.mu.RUnlock()
 	result := make([]string, 0, len(nodes))
 	for _, node := range nodes {
-		healthy, exists := nh.healthy[node]
-		if !exists || healthy {
+		if nh.connected[node] {
 			result = append(result, node)
 		}
 	}
@@ -124,14 +105,20 @@ type NodeStatus struct {
 func (nh *NodeHealth) GetStatus() []NodeStatus {
 	nh.mu.RLock()
 	defer nh.mu.RUnlock()
-	result := make([]NodeStatus, 0, len(nh.healthy))
-	for addr, healthy := range nh.healthy {
+	result := make([]NodeStatus, 0, len(nh.connected))
+	for addr, connected := range nh.connected {
 		status := NodeStatus{
 			Address: addr,
-			Healthy: healthy,
+			Healthy: connected,
 		}
-		if lastCheck, ok := nh.lastCheck[addr]; ok {
-			status.LastCheck = lastCheck.Format(time.RFC3339)
+		if connected {
+			if t, ok := nh.lastConnect[addr]; ok {
+				status.LastCheck = t.Format(time.RFC3339)
+			}
+		} else {
+			if t, ok := nh.lastDisconnect[addr]; ok {
+				status.LastCheck = t.Format(time.RFC3339)
+			}
 		}
 		result = append(result, status)
 	}
@@ -152,90 +139,91 @@ func NodeHealthHandler(nh *NodeHealth) http.HandlerFunc {
 	}
 }
 
-// StartBackgroundCheck starts a background goroutine that periodically
-// re-checks unhealthy nodes to detect when they come back online.
-// Uses per-node backoff: 1s initially, 5s after 10min unhealthy, 10s after 30min.
-// Call Stop() to shut down the goroutine immediately.
-func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, isActive func() bool) {
-	nh.mu.Lock()
-	if nh.running {
-		nh.mu.Unlock()
-		return
+// Stop stops the background health checker
+func (nh *NodeHealth) Stop() {
+	if nh.stopChan != nil {
+		close(nh.stopChan)
 	}
-	nh.running = true
-	nh.stopCh = make(chan struct{})
-	nh.mu.Unlock()
+}
 
-	nh.wg.Add(1)
+// StartBackgroundCheck starts a goroutine that periodically checks node health
+func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, interval time.Duration) {
 	go func() {
-		defer nh.wg.Done()
-		// Tick at the fastest interval (1s) - per-node backoff is checked in recheckUnhealthyNodes
-		ticker := time.NewTicker(nh.baseTickInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		// Do an initial check immediately
+		nh.checkAllNodes(getNodes())
+
 		for {
 			select {
-			case <-nh.stopCh:
-				nh.mu.Lock()
-				nh.running = false
-				nh.mu.Unlock()
+			case <-nh.stopChan:
 				return
 			case <-ticker.C:
-				if isActive() {
-					nh.recheckUnhealthyNodes(getNodes())
-				}
+				nh.checkAllNodes(getNodes())
 			}
 		}
 	}()
 }
 
-// Stop shuts down the background health check goroutine and waits for it to exit.
-// Safe to call multiple times.
-func (nh *NodeHealth) Stop() {
-	nh.mu.Lock()
-	if !nh.running {
-		nh.mu.Unlock()
-		return
-	}
-	nh.mu.Unlock()
-
-	close(nh.stopCh)
-	nh.wg.Wait()
-}
-
-// recheckUnhealthyNodes checks unhealthy nodes based on their individual backoff intervals.
-func (nh *NodeHealth) recheckUnhealthyNodes(allNodes []string) {
-	nh.mu.RLock()
-	nodesToCheck := make([]string, 0)
-	now := time.Now()
-	for _, node := range allNodes {
-		healthy, exists := nh.healthy[node]
-		if exists && !healthy {
-			lastCheck := nh.lastCheck[node]
-			checkInterval := nh.getCheckInterval(node)
-			if now.Sub(lastCheck) >= checkInterval {
-				nodesToCheck = append(nodesToCheck, node)
-			}
-		}
-	}
-	nh.mu.RUnlock()
-
-	// Check nodes in parallel
-	var wg sync.WaitGroup
-	for _, node := range nodesToCheck {
-		wg.Add(1)
+// checkAllNodes pings all nodes and updates their health status
+func (nh *NodeHealth) checkAllNodes(nodes []string) {
+	for _, node := range nodes {
 		go func(n string) {
-			defer wg.Done()
-			if nh.pingNode(n) {
+			healthy := nh.pingNode(n)
+			if healthy {
 				nh.MarkHealthy(n)
 			} else {
 				nh.MarkUnhealthy(n)
 			}
 		}(node)
 	}
-	wg.Wait()
 }
 
-// pingNode attempts a quick health check on a node using network.IsHostReachable.
+// pingNode checks if a node is reachable
 func (nh *NodeHealth) pingNode(node string) bool {
-	return network.IsHostReachable(nh.client, node+RoutePrefix+"/pivot")
+	url := "http://" + node + "/"
+	resp, err := nh.client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// SetOnHealthChange sets a callback that's called when health status changes
+func (nh *NodeHealth) SetOnHealthChange(callback func()) {
+	nh.mu.Lock()
+	defer nh.mu.Unlock()
+	nh.onHealthChange = callback
+}
+
+// MarkHealthy marks a node as healthy (called when sync succeeds)
+func (nh *NodeHealth) MarkHealthy(node string) {
+	nh.mu.Lock()
+	wasHealthy := nh.connected[node]
+	nh.connected[node] = true
+	nh.lastConnect[node] = time.Now()
+	callback := nh.onHealthChange
+	nh.mu.Unlock()
+
+	// Notify if status changed
+	if !wasHealthy && callback != nil {
+		callback()
+	}
+}
+
+// MarkUnhealthy marks a node as unhealthy (called when sync fails)
+func (nh *NodeHealth) MarkUnhealthy(node string) {
+	nh.mu.Lock()
+	wasHealthy := nh.connected[node]
+	nh.connected[node] = false
+	nh.lastDisconnect[node] = time.Now()
+	callback := nh.onHealthChange
+	nh.mu.Unlock()
+
+	// Notify if status changed
+	if wasHealthy && callback != nil {
+		callback()
+	}
 }

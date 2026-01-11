@@ -70,7 +70,8 @@ func GetSingle(db storage.Database, path string) func(w http.ResponseWriter, r *
 }
 
 // Set set data on the pivot instance
-func Set(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+// originatorTracker is used to track which node originated the change (for pivot servers)
+func Set(db storage.Database, path string, originatorTracker *OriginatorTracker) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		decoded, err := meta.DecodeFromReader(r.Body)
 		if err != nil {
@@ -82,6 +83,10 @@ func Set(db storage.Database, path string) func(w http.ResponseWriter, r *http.R
 		if index == "" {
 			itemKey = path
 		}
+		// Track originator before storage write so callback can exclude it from TriggerNodeSync
+		if originatorTracker != nil {
+			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
+		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -92,7 +97,8 @@ func Set(db storage.Database, path string) func(w http.ResponseWriter, r *http.R
 }
 
 // Delete delete data on the pivot instance
-func Delete(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+// originatorTracker is used to track which node originated the change (for pivot servers)
+func Delete(db storage.Database, path string, originatorTracker *OriginatorTracker) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		index := mux.Vars(r)["index"]
 		time := mux.Vars(r)["time"]
@@ -103,6 +109,10 @@ func Delete(db storage.Database, path string) func(w http.ResponseWriter, r *htt
 		} else {
 			// Glob pattern delete (e.g., "things/123")
 			itemKey = path + "/" + index
+		}
+		// Track originator before storage write so callback can exclude it from TriggerNodeSync
+		if originatorTracker != nil {
+			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
 		}
 		err := db.Del(itemKey)
 		db.Set(StoragePrefix+path, json.RawMessage(time))

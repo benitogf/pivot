@@ -77,10 +77,21 @@ func getEntryFromPivot(client *http.Client, pivot string, key string) (meta.Obje
 	return meta.DecodeFromReader(resp.Body)
 }
 
-func sendToPivot(client *http.Client, key string, pivot string, obj meta.Object) error {
+// OriginatorHeader is the HTTP header used to identify the node that originated a change
+const OriginatorHeader = "X-Pivot-Originator"
+
+func sendToPivot(client *http.Client, key string, pivot string, obj meta.Object, originator string) error {
 	buf := new(bytes.Buffer)
 	json.NewEncoder(buf).Encode(obj)
-	resp, err := client.Post("http://"+pivot+RoutePrefix+"/pivot/"+key, "application/json", buf)
+	req, err := http.NewRequest("POST", "http://"+pivot+RoutePrefix+"/pivot/"+key, buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if originator != "" {
+		req.Header.Set(OriginatorHeader, originator)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -94,11 +105,14 @@ func sendToPivot(client *http.Client, key string, pivot string, obj meta.Object)
 	return nil
 }
 
-func sendDelete(client *http.Client, key, pivot string, lastEntry int64) error {
+func sendDelete(client *http.Client, key, pivot string, lastEntry int64, originator string) error {
 	url := "http://" + pivot + RoutePrefix + "/pivot/" + key + "/" + strconv.FormatInt(lastEntry, 10)
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
 		return err
+	}
+	if originator != "" {
+		req.Header.Set(OriginatorHeader, originator)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
