@@ -5,7 +5,7 @@ go 1.25
 require (
 	github.com/benitogf/auth v0.0.0-20260109062751-db0dd7187682
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec
-	github.com/benitogf/ooo v0.0.0-20260111130618-1a21c5b9bf8f
+	github.com/benitogf/ooo v0.0.0-20260112150242-b3bfdc40a382
 	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/mux v1.8.1
 	github.com/stretchr/testify v1.11.1
