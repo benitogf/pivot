@@ -54,13 +54,14 @@ const (
 	StoragePrefix = "pivot/"
 )
 
-// Config holds the configuration for pivot synchronization.
+// Config holds the configuration for cluster synchronization.
 type Config struct {
 	Keys            []Key        // Keys to sync (not including NodesKey)
 	NodesKey        string       // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
-	PivotIP         string       // Address of the pivot server. Empty string means this server IS the pivot.
+	ExtraNodeURLs   []string     // Additional node URLs to sync with (not stored in NodesKey, e.g. auth servers)
+	ClusterURL      string       // Address of the cluster leader. Empty string means this server IS the leader.
 	Client          *http.Client // Optional HTTP client for sync requests. If nil, DefaultClient() is used.
-	AutoSyncOnStart bool         // If true, perform full bidirectional sync with pivot when node server starts. Default false.
+	AutoSyncOnStart bool         // If true, perform full bidirectional sync with cluster leader when node starts. Default false.
 }
 
 // DefaultClient returns an HTTP client optimized for pivot synchronization.
@@ -120,11 +121,16 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 	return keys
 }
 
-// makeGetNodes creates a function that returns node addresses from the NodesKey path.
+// makeGetNodes creates a function that returns node addresses from the NodesKey path
+// plus any extra node URLs from the Instance (can be added dynamically after Setup).
 // Only returns entries with a non-zero port - these are actual node servers.
-func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
+func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNodes {
 	return func() []string {
-		var result []string
+		// Start with extra node URLs (e.g., auth servers not in nodesKey)
+		extraURLs := instance.GetExtraNodeURLs()
+		result := make([]string, 0, len(extraURLs))
+		result = append(result, extraURLs...)
+
 		if nodesKey == "" {
 			return result
 		}
@@ -174,48 +180,70 @@ func makeGetNodes(server *ooo.Server, nodesKey string) getNodes {
 	}
 }
 
-// pivotIPKey is the storage key for persisting the pivot IP
-const pivotIPKey = StoragePrefix + "pivotip"
+// pivotURLKeyPrefix is the storage key prefix for persisting per-key pivot URLs
+const pivotURLKeyPrefix = StoragePrefix + "keyurl/"
 
-// checkPivotIPChange checks if the pivot IP changed since last run for this storage.
-// If changed, wipes all data for the configured keys to prevent contamination.
-// The pivot IP is persisted in storage so it survives process restarts.
-// Returns true if data was wiped.
-func checkPivotIPChange(server *ooo.Server, config Config, pivotIP string) bool {
+// checkClusterURLChange checks if any key's effective pivot URL changed since last run.
+// If changed, wipes data for that specific key to prevent contamination.
+// Per-key pivot URLs are persisted in storage so they survive process restarts.
+// Returns true if any data was wiped.
+func checkClusterURLChange(server *ooo.Server, config Config, configClusterURL string) bool {
 	// Skip if storage is not active (will be checked again when storage starts)
 	if server.Storage == nil || !server.Storage.Active() {
 		return false
 	}
 
-	// Read stored pivot IP from storage
-	obj, err := server.Storage.Get(pivotIPKey)
-	storedIP := ""
-	if err == nil {
-		storedIP = string(obj.Data)
-	}
+	wiped := false
 
-	if storedIP != "" && storedIP != pivotIP {
-		log.Printf("WARNING: Pivot IP changed from %q to %q - wiping all synced data", storedIP, pivotIP)
-		// Wipe all data for configured keys
-		for _, k := range config.Keys {
+	// Check each key's effective ClusterURL
+	for _, k := range config.Keys {
+		effectiveURL := k.EffectiveClusterURL(configClusterURL)
+		// Use base key (without wildcard) for storage key to avoid issues with * in key names
+		baseKey := strings.Replace(k.Path, "/*", "", 1)
+		storageKey := pivotURLKeyPrefix + baseKey
+
+		// Read stored pivot URL for this key
+		obj, err := server.Storage.Get(storageKey)
+		storedURL := ""
+		if err == nil {
+			storedURL = string(obj.Data)
+		}
+
+		if storedURL != "" && storedURL != effectiveURL {
+			log.Printf("WARNING: Pivot URL for key %q changed from %q to %q - wiping data", k.Path, storedURL, effectiveURL)
 			db := k.Database
 			if db == nil {
 				db = server.Storage
 			}
 			wipeStorage(db, k.Path)
+			wiped = true
 		}
-		// Wipe nodes key data
-		if config.NodesKey != "" {
-			wipeStorage(server.Storage, config.NodesKey)
-		}
-		// Update stored pivot IP after wipe
-		server.Storage.Set(pivotIPKey, []byte(pivotIP))
-		return true
+
+		// Store/update the effective pivot URL for this key
+		server.Storage.Set(storageKey, []byte(effectiveURL))
 	}
 
-	// First run or same pivot IP - just store/update
-	server.Storage.Set(pivotIPKey, []byte(pivotIP))
-	return false
+	// Also check NodesKey (always uses configClusterURL)
+	if config.NodesKey != "" {
+		// Use base key (without wildcard) for storage key
+		baseKey := strings.Replace(config.NodesKey, "/*", "", 1)
+		storageKey := pivotURLKeyPrefix + baseKey
+		obj, err := server.Storage.Get(storageKey)
+		storedURL := ""
+		if err == nil {
+			storedURL = string(obj.Data)
+		}
+
+		if storedURL != "" && storedURL != configClusterURL {
+			log.Printf("WARNING: Pivot URL for NodesKey %q changed from %q to %q - wiping data", config.NodesKey, storedURL, configClusterURL)
+			wipeStorage(server.Storage, config.NodesKey)
+			wiped = true
+		}
+
+		server.Storage.Set(storageKey, []byte(configClusterURL))
+	}
+
+	return wiped
 }
 
 // wipeStorage deletes all entries matching the given path pattern
@@ -256,7 +284,21 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		})
 	}
 
-	pivotIP := config.PivotIP
+	pivotURL := config.ClusterURL
+
+	// Validate key configurations
+	for _, k := range config.Keys {
+		// Panic if both Local and ClusterURL are set - conflicting configuration
+		if k.Local && k.ClusterURL != "" {
+			panic("pivot: Key " + k.Path + " has both Local=true and ClusterURL set - these are mutually exclusive")
+		}
+		// Panic if Config.ClusterURL is empty but Key.ClusterURL is set without Local
+		// This would mean the server is a pivot but trying to sync some keys from another pivot
+		// which requires the server to also be a node (have Config.ClusterURL set)
+		if pivotURL == "" && k.ClusterURL != "" {
+			panic("pivot: Key " + k.Path + " has ClusterURL set but Config.ClusterURL is empty - set Config.ClusterURL or use Local=true for local keys")
+		}
+	}
 
 	// Use config.Client if provided, otherwise use DefaultClient()
 	client := config.Client
@@ -265,21 +307,31 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	}
 
 	// Check if pivot IP changed since last run - wipe data if so
-	checkPivotIPChange(server, config, pivotIP)
+	checkClusterURLChange(server, config, pivotURL)
 
 	keys := buildKeys(server, config)
-	getNodes := makeGetNodes(server, config.NodesKey)
 
-	// Create syncer for node servers (nil for pivot servers)
-	var s *syncer
-	if pivotIP != "" {
-		s = newSyncer(client, pivotIP, keys)
+	// Create instance early so makeGetNodes can reference it for dynamic ExtraNodeURLs
+	var keyPaths []string
+	for _, k := range keys {
+		keyPaths = append(keyPaths, k.Path)
 	}
+	instance := &Instance{
+		ClusterURL:    pivotURL,
+		SyncedKeys:    keyPaths,
+		ExtraNodeURLs: config.ExtraNodeURLs,
+	}
+
+	getNodes := makeGetNodes(server, config.NodesKey, instance)
+
+	// Create syncer pool for keys that need outbound sync
+	// Keys with Local=true or where server IS pivot won't have syncers
+	pool := newSyncerPool(client, keys, pivotURL)
 
 	// Create node health tracker for pivot servers
 	// Health is tracked via periodic pings and sync success/failure
 	var nodeHealth *NodeHealth
-	if pivotIP == "" {
+	if pivotURL == "" {
 		nodeHealth = NewNodeHealth(client)
 		// Set callback to broadcast to pivot/status subscribers when health changes
 		nodeHealth.SetOnHealthChange(func() {
@@ -301,6 +353,10 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 				},
 			})
 		})
+		// Stop NodeHealth before stream is closed
+		server.RegisterPreClose(func() {
+			nodeHealth.Stop()
+		})
 		// Start background health check every 3 seconds
 		nodeHealth.StartBackgroundCheck(getNodes, 3*time.Second)
 	}
@@ -320,11 +376,11 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 
 	// Create originator tracker for pivot servers to skip TriggerNodeSync back to originating node
 	var originatorTracker *OriginatorTracker
-	if pivotIP == "" {
+	if pivotURL == "" {
 		originatorTracker = NewOriginatorTracker()
 	}
 
-	syncCallback := makeStorageSync(client, pivotIP, keys, getNodes, s, nodeHealth, originatorTracker)
+	syncCallback := makeStorageSync(client, pivotURL, keys, getNodes, pool, nodeHealth, originatorTracker)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
 	server.OnStorageEvent = storage.EventCallback(syncCallback)
@@ -332,8 +388,8 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// Set up HTTP routes for pivot protocol
 	// /synchronize/pivot - pull-only sync, used when pivot triggers sync on node (e.g., after delete)
 	// /synchronize/node - bidirectional sync, used when node has local changes to push
-	server.Router.HandleFunc(RoutePrefix+"/synchronize/pivot", SynchronizePivotHandler(pivotIP, s)).Methods("GET")
-	server.Router.HandleFunc(RoutePrefix+"/synchronize/node", SynchronizeNodeHandler(pivotIP, s)).Methods("GET")
+	server.Router.HandleFunc(RoutePrefix+"/synchronize/pivot", SynchronizePivotHandler(pivotURL, pool)).Methods("GET")
+	server.Router.HandleFunc(RoutePrefix+"/synchronize/node", SynchronizeNodeHandler(pivotURL, pool)).Methods("GET")
 
 	// Node health endpoint (only meaningful on pivot servers)
 	server.Router.HandleFunc(RoutePrefix+"/health/nodes", NodeHealthHandler(nodeHealth)).Methods("GET")
@@ -358,20 +414,21 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	}
 
 	// Create BeforeRead callback for sync-on-read
-	// Uses Pull() to sync FROM pivot only, avoiding conflicts with per-key sends
+	// Uses TryPull() on the appropriate syncer based on key's effective ClusterURL
 	var syncing int32
 	beforeRead := func(readKey string) {
-		if pivotIP == "" {
-			return
-		}
 		if !atomic.CompareAndSwapInt32(&syncing, 0, 1) {
 			return
 		}
 		defer atomic.StoreInt32(&syncing, 0)
 		for _, k := range keys {
 			if key.Match(k.Path, readKey) {
-				if s != nil {
-					s.TryPull()
+				// Find the syncer for this key's effective ClusterURL
+				effectiveURL := k.EffectiveClusterURL(pivotURL)
+				if effectiveURL != "" && pool != nil {
+					if s := pool.syncers[effectiveURL]; s != nil {
+						s.TryPull()
+					}
 				}
 				return
 			}
@@ -381,38 +438,24 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// Assign BeforeRead to server
 	server.BeforeRead = beforeRead
 
-	// Store instance for GetInstance lookup
-	// Include pivot info for UI integration
-	var keyPaths []string
-	for _, k := range keys {
-		keyPaths = append(keyPaths, k.Path)
-	}
-	instance := &Instance{
-		BeforeRead:   beforeRead,
-		SyncCallback: syncCallback,
-		PivotIP:      pivotIP,
-		SyncedKeys:   keyPaths,
-		NodeHealth:   nodeHealth,
-		GetNodes:     getNodes,
-		syncer:       s,
-	}
+	// Complete instance setup and store for GetInstance lookup
+	instance.BeforeRead = beforeRead
+	instance.SyncCallback = syncCallback
+	instance.NodeHealth = nodeHealth
+	instance.GetNodes = getNodes
+	instance.syncerPool = pool
 	storeInstance(server, instance)
 
 	// For node servers, start background pivot health check and initial sync
-	if pivotIP != "" {
+	if pivotURL != "" {
 		stopHealthCheck := make(chan struct{})
 		var healthCheckWg sync.WaitGroup
 
-		// Stop health check when server closes and wait for it to finish
-		// before Server.Close() modifies server.Stream
-		existingOnClose := server.OnClose
-		server.OnClose = func() {
+		// Stop health check before stream is closed
+		server.RegisterPreClose(func() {
 			close(stopHealthCheck)
 			healthCheckWg.Wait() // Wait for goroutine to exit before stream is modified
-			if existingOnClose != nil {
-				existingOnClose()
-			}
-		}
+		})
 
 		// Start health check and set nodeAddr when server starts
 		// (must wait for server.Start() to initialize Stream)
@@ -422,21 +465,21 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 				existingOnStart()
 			}
 			// Set node address for originator tracking
-			if s != nil {
-				s.SetNodeAddr(server.Address)
+			if pool != nil {
+				pool.SetNodeAddr(server.Address)
 			}
 			// Start health check goroutine (after Stream is initialized)
 			healthCheckWg.Add(1)
 			go func() {
 				defer healthCheckWg.Done()
-				startPivotHealthCheck(client, pivotIP, instance, server, stopHealthCheck)
+				startPivotHealthCheck(client, pivotURL, instance, server, stopHealthCheck)
 			}()
 			// Perform initial sync with pivot on startup (if enabled)
-			if config.AutoSyncOnStart && s != nil {
+			if config.AutoSyncOnStart && pool != nil && len(pool.syncers) > 0 {
 				server.Console.Log("pivot: performing initial sync with pivot on startup")
-				if err := s.Sync(); err != nil {
+				if err := pool.SyncAll(); err != nil {
 					server.Console.Err("pivot: initial sync failed, starting background retry", err)
-					go retryInitialSync(s, server.Console, stopHealthCheck)
+					go retryInitialSyncPool(pool, server.Console, stopHealthCheck)
 				} else {
 					server.Console.Log("pivot: initial sync completed successfully")
 				}
@@ -450,9 +493,9 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	return server
 }
 
-// retryInitialSync retries the initial sync with exponential backoff until successful or stopped.
+// retryInitialSyncPool retries the initial sync for all syncers with exponential backoff until successful or stopped.
 // Backoff starts at 1s and doubles each attempt up to 60s max.
-func retryInitialSync(s *syncer, console *coat.Console, stop <-chan struct{}) {
+func retryInitialSyncPool(pool *syncerPool, console *coat.Console, stop <-chan struct{}) {
 	const (
 		initialBackoff = 1 * time.Second
 		maxBackoff     = 60 * time.Second
@@ -482,7 +525,7 @@ func retryInitialSync(s *syncer, console *coat.Console, stop <-chan struct{}) {
 		}
 
 		console.Log(fmt.Sprintf("pivot: retrying initial sync (attempt %d, backoff %v)", attempt, backoff))
-		if err := s.Sync(); err != nil {
+		if err := pool.SyncAll(); err != nil {
 			console.Err(fmt.Sprintf("pivot: initial sync retry %d failed", attempt), err)
 			// Increase backoff with exponential growth, capped at max
 			backoff = time.Duration(float64(backoff) * multiplier)
@@ -519,17 +562,29 @@ func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instan
 		url := "http://" + pivotIP + "/"
 		resp, err := client.Get(url)
 		now := time.Now().Format(time.RFC3339)
-		wasHealthy := instance.PivotHealthy
+
+		instance.healthMu.Lock()
+		if instance.PivotHealth == nil {
+			instance.PivotHealth = make(map[string]*PivotHealthStatus)
+		}
+		status := instance.PivotHealth[pivotIP]
+		if status == nil {
+			status = &PivotHealthStatus{}
+			instance.PivotHealth[pivotIP] = status
+		}
+		wasHealthy := status.Healthy
 		if err != nil {
-			instance.PivotHealthy = false
-			instance.PivotLastCheck = now
+			status.Healthy = false
+			status.LastCheck = now
 		} else {
 			resp.Body.Close()
-			instance.PivotHealthy = resp.StatusCode == http.StatusOK
-			instance.PivotLastCheck = now
+			status.Healthy = resp.StatusCode == http.StatusOK
+			status.LastCheck = now
 		}
+		instance.healthMu.Unlock()
+
 		// Broadcast if status changed - check stop again before accessing server.Stream
-		if wasHealthy != instance.PivotHealthy && !isStopped() {
+		if wasHealthy != status.Healthy && !isStopped() {
 			info := GetPivotInfo(server)()
 			data, _ := json.Marshal(info)
 			now := time.Now().UTC().UnixNano()
@@ -566,7 +621,7 @@ func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instan
 // SyncDeleteFilter returns a delete filter that syncs deletes to pivot and notifies nodes.
 // This is for backward compatibility with code that uses the old pivot API.
 // nodeAddr is the address of this node (empty for pivot servers).
-func SyncDeleteFilter(client *http.Client, pivotIP string, db storage.Database, keyPath string, _getNodes GetNodes, nodeAddr string) func(index string) error {
+func SyncDeleteFilter(client *http.Client, pivotURL string, db storage.Database, keyPath string, _getNodes GetNodes, nodeAddr string) func(index string) error {
 	return func(index string) error {
 		// Delete locally first
 		err := db.Del(keyPath + "/" + index)
@@ -575,8 +630,8 @@ func SyncDeleteFilter(client *http.Client, pivotIP string, db storage.Database, 
 		}
 
 		// If this is a node, send delete to pivot
-		if pivotIP != "" {
-			sendDelete(client, keyPath+"/"+index, pivotIP, time.Now().UnixNano(), nodeAddr)
+		if pivotURL != "" {
+			sendDelete(client, keyPath+"/"+index, pivotURL, time.Now().UnixNano(), nodeAddr)
 		} else {
 			// If this is pivot, notify all nodes
 			nodes := _getNodes()

@@ -12,25 +12,51 @@ import (
 var instances = make(map[*ooo.Server]*Instance)
 var instancesMu sync.RWMutex
 
+// PivotHealthStatus tracks health status for a single pivot connection
+type PivotHealthStatus struct {
+	Healthy   bool
+	LastCheck string
+}
+
 // Instance contains pivot callbacks for use with external storages.
 // Use GetInstance(server) to retrieve after Setup.
 type Instance struct {
-	BeforeRead     func(string)        // Callback for sync-on-read
-	SyncCallback   StorageSyncCallback // Callback for storage events (write/delete sync)
-	PivotIP        string              // Empty for pivot server, pivot address for nodes
-	SyncedKeys     []string            // Keys being synchronized
-	NodeHealth     *NodeHealth         // Node health tracker (only for pivot servers)
-	GetNodes       func() []string     // Function to get registered nodes (only for pivot servers)
-	PivotHealthy   bool                // Connection status to pivot (only for node servers)
-	PivotLastCheck string              // Last check time for pivot connection (only for node servers)
-	syncer         *syncer             // Internal syncer for node servers (for testing hooks)
+	BeforeRead     func(string)                  // Callback for sync-on-read
+	SyncCallback   StorageSyncCallback           // Callback for storage events (write/delete sync)
+	ClusterURL     string                        // Config.ClusterURL - empty for pure pivot server
+	SyncedKeys     []string                      // Keys being synchronized
+	NodeHealth     *NodeHealth                   // Node health tracker (only for pivot servers)
+	GetNodes       func() []string               // Function to get registered nodes (only for pivot servers)
+	PivotHealth    map[string]*PivotHealthStatus // Health status per pivot URL (for node servers)
+	ExtraNodeURLs  []string                      // Additional node URLs (can be modified after Setup)
+	syncerPool     *syncerPool                   // Internal syncer pool for node servers (for testing hooks)
+	healthMu       sync.RWMutex                  // Protects PivotHealth map
+	extraNodeURLMu sync.RWMutex                  // Protects ExtraNodeURLs
+}
+
+// AddExtraNodeURL adds a node URL to receive sync notifications (for cluster leader servers).
+func (i *Instance) AddExtraNodeURL(url string) {
+	i.extraNodeURLMu.Lock()
+	i.ExtraNodeURLs = append(i.ExtraNodeURLs, url)
+	i.extraNodeURLMu.Unlock()
+}
+
+// GetExtraNodeURLs returns a copy of the extra node URLs.
+func (i *Instance) GetExtraNodeURLs() []string {
+	i.extraNodeURLMu.RLock()
+	defer i.extraNodeURLMu.RUnlock()
+	result := make([]string, len(i.ExtraNodeURLs))
+	copy(result, i.ExtraNodeURLs)
+	return result
 }
 
 // SetAfterPull sets a callback that fires after each Pull operation completes.
 // This is useful for test synchronization to wait for async TriggerNodeSync operations.
 func (i *Instance) SetAfterPull(callback func()) {
-	if i.syncer != nil {
-		i.syncer.AfterPull = callback
+	if i.syncerPool != nil {
+		for _, s := range i.syncerPool.syncers {
+			s.AfterPull = callback
+		}
 	}
 }
 
@@ -52,10 +78,26 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 			return nil
 		}
 
-		// Determine role
-		role := "node"
-		if instance.PivotIP == "" {
+		// Determine role - mixed if server has both pivot and node keys
+		hasPivotKeys := false
+		hasNodeKeys := false
+		if instance.syncerPool != nil && len(instance.syncerPool.syncers) > 0 {
+			hasNodeKeys = true
+		}
+		// Check if any keys are in pivot mode (Local=true or no ClusterURL)
+		for _, keyPath := range instance.SyncedKeys {
+			if instance.syncerPool == nil || instance.syncerPool.keyMap[keyPath] == "" {
+				hasPivotKeys = true
+				break
+			}
+		}
+		var role string
+		if hasPivotKeys && hasNodeKeys {
+			role = "mixed"
+		} else if hasPivotKeys {
 			role = "pivot"
+		} else {
+			role = "node"
 		}
 
 		// Build node status list - only for pivot servers
@@ -108,13 +150,27 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 			nodes = []ui.PivotNodeStatus{}
 		}
 
+		// Get overall pivot health (all pivots healthy = healthy)
+		pivotHealthy := true
+		pivotLastCheck := ""
+		instance.healthMu.RLock()
+		for _, status := range instance.PivotHealth {
+			if !status.Healthy {
+				pivotHealthy = false
+			}
+			if status.LastCheck > pivotLastCheck {
+				pivotLastCheck = status.LastCheck
+			}
+		}
+		instance.healthMu.RUnlock()
+
 		return &ui.PivotInfo{
 			Role:           role,
-			PivotIP:        instance.PivotIP,
+			PivotIP:        instance.ClusterURL,
 			SyncedKeys:     instance.SyncedKeys,
 			Nodes:          nodes,
-			PivotHealthy:   instance.PivotHealthy,
-			PivotLastCheck: instance.PivotLastCheck,
+			PivotHealthy:   pivotHealthy,
+			PivotLastCheck: pivotLastCheck,
 		}
 	}
 }

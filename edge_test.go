@@ -18,8 +18,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNodeToPivotSync verifies that node writes sync to pivot correctly.
-func TestNodeToPivotSync(t *testing.T) {
+// TestNodeToLeaderSync verifies that node writes sync to leader correctly.
+func TestNodeToLeaderSync(t *testing.T) {
 	pivotServer, wgPivot := createEdgeTestServer("", nil)
 	defer pivotServer.Close(os.Interrupt)
 
@@ -170,9 +170,9 @@ func createEdgeTestServer(pivotIP string, nodeStorage storage.Database) (*ooo.Se
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotIP,
+		Keys:       []pivot.Key{{Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: pivotIP,
 	}
 
 	pivot.Setup(server, config)
@@ -212,9 +212,9 @@ func createEdgeTestServerNoSync(pivotIP string) *ooo.Server {
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotIP,
+		Keys:       []pivot.Key{{Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: pivotIP,
 	}
 
 	pivot.Setup(server, config)

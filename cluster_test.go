@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,8 +78,17 @@ func Authorize(t *testing.T, server *ooo.Server, account string) string {
 }
 
 // FakeServer creates a server using storage-level synchronization via pivot.Setup.
-// Optional afterAuthWrite is called after each auth storage write (for test synchronization).
-func FakeServer(t *testing.T, pivotIP string, afterAuthWrite func(key string)) *ooo.Server {
+// Returns the server and a WaitGroup controlled by storage AfterWrite callbacks.
+func FakeServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) {
+	wg := &sync.WaitGroup{}
+
+	afterWrite := func(key string) {
+		if strings.HasPrefix(key, "pivot/") {
+			return
+		}
+		t.Logf("[server] storage write: %s", key)
+		wg.Done()
+	}
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -115,16 +123,19 @@ func FakeServer(t *testing.T, pivotIP string, afterAuthWrite func(key string)) *
 			{Path: "policies", Database: authStorage},
 			{Path: "settings"},
 		},
-		NodesKey: "things/*",
-		PivotIP:  pivotIP,
+		NodesKey:   "things/*",
+		ClusterURL: clusterURL,
 	}
 
 	// Setup pivot - modifies server (routes, OnStorageEvent, BeforeRead)
 	pivot.Setup(server, config)
 
-	// Use Attach for simplified external storage setup
-	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterAuthWrite})
+	// Use Attach for simplified external storage setup with AfterWrite callback
+	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterWrite})
 	require.NoError(t, err)
+
+	// Start main storage with AfterWrite callback
+	server.Storage.Start(storage.Options{AfterWrite: afterWrite})
 
 	server.OpenFilter("things/*")
 	server.OpenFilter("settings")
@@ -170,7 +181,7 @@ func FakeServer(t *testing.T, pivotIP string, afterAuthWrite func(key string)) *
 	}).Methods(http.MethodGet, http.MethodPost, http.MethodDelete)
 
 	server.Start("localhost:0")
-	return server
+	return server, wg
 }
 
 // syncTestOps provides operations that can be local or remote based on the useRemote flag
@@ -178,6 +189,8 @@ type syncTestOps struct {
 	useRemote   bool
 	pivotServer *ooo.Server
 	nodeServer  *ooo.Server
+	pivotWg     *sync.WaitGroup
+	nodeWg      *sync.WaitGroup
 	pivotCfg    ooio.RemoteConfig
 	nodeCfg     ooio.RemoteConfig
 }
@@ -401,33 +414,23 @@ func (ops *syncTestOps) deletePolicies(t *testing.T, fromPivot bool) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
-func testBasicPivotSync(t *testing.T, useRemote bool) {
+func testClusterSync(t *testing.T, useRemote bool) {
 	var wsWg sync.WaitGroup
-	var authWg sync.WaitGroup
 	var pivotThings, nodeThings []client.Meta[Thing]
 	var pivotSettings, nodeSettings []client.Meta[Settings]
 	var mu sync.Mutex
-	var pendingWrites int32
 
-	afterAuthWrite := func(key string) {
-		// Skip pivot activity keys - they are internal metadata, not user data
-		if strings.HasPrefix(key, "pivot/") {
-			return
-		}
-		if atomic.AddInt32(&pendingWrites, -1) >= 0 {
-			authWg.Done()
-		}
-	}
-
-	pivotServer := FakeServer(t, "", afterAuthWrite)
+	pivotServer, pivotWg := FakeServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
-	nodeServer := FakeServer(t, pivotServer.Address, afterAuthWrite)
+	nodeServer, nodeWg := FakeServer(t, pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
 	ops := &syncTestOps{
 		useRemote:   useRemote,
 		pivotServer: pivotServer,
 		nodeServer:  nodeServer,
+		pivotWg:     pivotWg,
+		nodeWg:      nodeWg,
 	}
 	if useRemote {
 		ops.pivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: pivotServer.Address}
@@ -435,17 +438,15 @@ func testBasicPivotSync(t *testing.T, useRemote bool) {
 	}
 
 	// Register and authorize users
-	atomic.StoreInt32(&pendingWrites, 1)
-	authWg.Add(1)
+	pivotWg.Add(1)
 	token := RegisterUser(t, pivotServer, "root")
 	require.NotEqual(t, "", token)
-	authWg.Wait()
+	pivotWg.Wait()
 
-	atomic.StoreInt32(&pendingWrites, 1)
-	authWg.Add(1)
+	nodeWg.Add(1)
 	token = Authorize(t, nodeServer, "root")
 	require.NotEqual(t, "", token)
-	authWg.Wait()
+	nodeWg.Wait()
 
 	authHeader := http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
@@ -624,10 +625,11 @@ func testBasicPivotSync(t *testing.T, useRemote bool) {
 	// === Policies sync tests (stored in authStorage, not server.Storage) ===
 
 	// Set policies on pivot - expect sync to node via authStorage AfterWrite callback
-	atomic.StoreInt32(&pendingWrites, 2) // pivot write + node sync write
-	authWg.Add(2)
+	pivotWg.Add(1)
+	nodeWg.Add(1)
 	ops.setPolicies(t, true, Policies{MaxRetries: 3, Allowed: []string{"read", "write"}})
-	authWg.Wait()
+	pivotWg.Wait()
+	nodeWg.Wait()
 
 	// Verify policies synced to node
 	pivotPolicies := ops.getPolicies(t, true)
@@ -638,10 +640,11 @@ func testBasicPivotSync(t *testing.T, useRemote bool) {
 	require.Equal(t, []string{"read", "write"}, nodePolicies.Allowed)
 
 	// Update policies on node - expect sync to pivot
-	atomic.StoreInt32(&pendingWrites, 2)
-	authWg.Add(2)
+	nodeWg.Add(1)
+	pivotWg.Add(1)
 	ops.setPolicies(t, false, Policies{MaxRetries: 5, Allowed: []string{"admin"}})
-	authWg.Wait()
+	nodeWg.Wait()
+	pivotWg.Wait()
 
 	// Verify policies synced to pivot
 	pivotPolicies = ops.getPolicies(t, true)
@@ -652,20 +655,22 @@ func testBasicPivotSync(t *testing.T, useRemote bool) {
 	require.Equal(t, []string{"admin"}, nodePolicies.Allowed)
 
 	// Delete policies from pivot - expect sync to node
-	atomic.StoreInt32(&pendingWrites, 2)
-	authWg.Add(2)
+	pivotWg.Add(1)
+	nodeWg.Add(1)
 	ops.deletePolicies(t, true)
-	authWg.Wait()
+	pivotWg.Wait()
+	nodeWg.Wait()
 
 	// Verify policies deleted from both
 	ops.getPoliciesExpectError(t, true, "policies should be deleted from pivot")
 	ops.getPoliciesExpectError(t, false, "policies should be deleted from node after sync")
 
 	// Set policies on node after delete - expect sync to pivot
-	atomic.StoreInt32(&pendingWrites, 2)
-	authWg.Add(2)
+	nodeWg.Add(1)
+	pivotWg.Add(1)
 	ops.setPolicies(t, false, Policies{MaxRetries: 10, Allowed: []string{"guest"}})
-	authWg.Wait()
+	nodeWg.Wait()
+	pivotWg.Wait()
 
 	// Verify policies synced to pivot
 	pivotPolicies = ops.getPolicies(t, true)
@@ -673,22 +678,23 @@ func testBasicPivotSync(t *testing.T, useRemote bool) {
 	require.Equal(t, []string{"guest"}, pivotPolicies.Allowed)
 
 	// Delete policies from node - expect sync to pivot
-	atomic.StoreInt32(&pendingWrites, 2)
-	authWg.Add(2)
+	nodeWg.Add(1)
+	pivotWg.Add(1)
 	ops.deletePolicies(t, false)
-	authWg.Wait()
+	nodeWg.Wait()
+	pivotWg.Wait()
 
 	// Verify policies deleted from both
 	ops.getPoliciesExpectError(t, false, "policies should be deleted from node")
 	ops.getPoliciesExpectError(t, true, "policies should be deleted from pivot after sync")
 }
 
-func TestBasicPivotSyncLocal(t *testing.T) {
-	testBasicPivotSync(t, false)
+func TestClusterSyncLocal(t *testing.T) {
+	testClusterSync(t, false)
 }
 
-func TestBasicPivotSyncRemote(t *testing.T) {
-	testBasicPivotSync(t, true)
+func TestClusterSyncRemote(t *testing.T) {
+	testClusterSync(t, true)
 }
 
 func TestOnStartSync(t *testing.T) {
@@ -701,9 +707,9 @@ func TestOnStartSync(t *testing.T) {
 	pivotServer.OpenFilter("settings")
 
 	pivotConfig := pivot.Config{
-		Keys:     []pivot.Key{{Path: "things/*"}, {Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  "", // This is the pivot
+		Keys:       []pivot.Key{{Path: "things/*"}, {Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: "", // This is the pivot
 	}
 	pivot.Setup(pivotServer, pivotConfig)
 	pivotServer.Start("localhost:0")
@@ -724,9 +730,9 @@ func TestOnStartSync(t *testing.T) {
 	nodeServer.OpenFilter("settings")
 
 	nodeConfig := pivot.Config{
-		Keys:     []pivot.Key{{Path: "things/*"}, {Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotServer.Address, // This is a node
+		Keys:       []pivot.Key{{Path: "things/*"}, {Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: pivotServer.Address, // This is a node
 	}
 	pivot.Setup(nodeServer, nodeConfig)
 	nodeServer.Start("localhost:0")
@@ -755,9 +761,9 @@ func TestOnStartComposition(t *testing.T) {
 	pivotServer.OpenFilter("things/*")
 
 	pivotConfig := pivot.Config{
-		Keys:     []pivot.Key{{Path: "things/*"}},
-		NodesKey: "things/*",
-		PivotIP:  "",
+		Keys:       []pivot.Key{{Path: "things/*"}},
+		NodesKey:   "things/*",
+		ClusterURL: "",
 	}
 	pivot.Setup(pivotServer, pivotConfig)
 	pivotServer.Start("localhost:0")
@@ -773,9 +779,9 @@ func TestOnStartComposition(t *testing.T) {
 	}
 
 	nodeConfig := pivot.Config{
-		Keys:     []pivot.Key{{Path: "things/*"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotServer.Address,
+		Keys:       []pivot.Key{{Path: "things/*"}},
+		NodesKey:   "things/*",
+		ClusterURL: pivotServer.Address,
 	}
 	pivot.Setup(nodeServer, nodeConfig)
 	nodeServer.Start("localhost:0")

@@ -373,6 +373,111 @@ func newSyncer(client *http.Client, pivot string, keys []Key) *syncer {
 	}
 }
 
+// syncerPool manages multiple syncers, one per unique pivot URL.
+// Keys are grouped by their effective ClusterURL and each group gets its own syncer.
+type syncerPool struct {
+	syncers  map[string]*syncer // pivotURL -> syncer
+	keyMap   map[string]string  // key path -> pivotURL (for routing)
+	client   *http.Client
+	nodeAddr string
+}
+
+// newSyncerPool creates a syncer pool from keys grouped by their effective ClusterURL.
+// configClusterURL is used as fallback for keys without explicit ClusterURL.
+func newSyncerPool(client *http.Client, keys []Key, configClusterURL string) *syncerPool {
+	pool := &syncerPool{
+		syncers: make(map[string]*syncer),
+		keyMap:  make(map[string]string),
+		client:  client,
+	}
+
+	// Group keys by effective ClusterURL
+	keysByPivot := make(map[string][]Key)
+	for _, k := range keys {
+		effectiveURL := k.EffectiveClusterURL(configClusterURL)
+		if effectiveURL == "" {
+			// This key is in pivot mode (Local=true or both empty) - no syncer needed
+			continue
+		}
+		keysByPivot[effectiveURL] = append(keysByPivot[effectiveURL], k)
+		pool.keyMap[k.Path] = effectiveURL
+	}
+
+	// Create a syncer for each unique pivot URL
+	for pivotURL, pivotKeys := range keysByPivot {
+		pool.syncers[pivotURL] = newSyncer(client, pivotURL, pivotKeys)
+	}
+
+	return pool
+}
+
+// SetNodeAddr sets the node address on all syncers
+func (p *syncerPool) SetNodeAddr(addr string) {
+	p.nodeAddr = addr
+	for _, s := range p.syncers {
+		s.SetNodeAddr(addr)
+	}
+}
+
+// GetSyncer returns the syncer for a given key path, or nil if key is in pivot mode
+func (p *syncerPool) GetSyncer(keyPath string) *syncer {
+	pivotURL, ok := p.keyMap[keyPath]
+	if !ok {
+		return nil
+	}
+	return p.syncers[pivotURL]
+}
+
+// GetSyncerForKey returns the syncer for a key that matches the given index
+func (p *syncerPool) GetSyncerForKey(index string, keys []Key, configClusterURL string) *syncer {
+	for _, k := range keys {
+		if key.Match(k.Path, index) {
+			effectiveURL := k.EffectiveClusterURL(configClusterURL)
+			if effectiveURL == "" {
+				return nil // pivot mode
+			}
+			return p.syncers[effectiveURL]
+		}
+	}
+	return nil
+}
+
+// AllSyncers returns all syncers in the pool
+func (p *syncerPool) AllSyncers() []*syncer {
+	result := make([]*syncer, 0, len(p.syncers))
+	for _, s := range p.syncers {
+		result = append(result, s)
+	}
+	return result
+}
+
+// ClusterURLs returns all unique pivot URLs in the pool
+func (p *syncerPool) ClusterURLs() []string {
+	result := make([]string, 0, len(p.syncers))
+	for url := range p.syncers {
+		result = append(result, url)
+	}
+	return result
+}
+
+// PullAll triggers Pull on all syncers
+func (p *syncerPool) PullAll() {
+	for _, s := range p.syncers {
+		s.Pull()
+	}
+}
+
+// SyncAll triggers Sync on all syncers
+func (p *syncerPool) SyncAll() error {
+	var lastErr error
+	for _, s := range p.syncers {
+		if err := s.Sync(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
 // SetNodeAddr sets the node's address (called after server starts)
 func (s *syncer) SetNodeAddr(addr string) {
 	s.nodeAddr = addr
@@ -568,34 +673,45 @@ func (t *OriginatorTracker) Get(key string) string {
 }
 
 // makeStorageSync creates a callback that triggers synchronization on storage events.
-// For pivot servers (pivotIP == ""), it notifies all nodes on any storage change.
-// For node servers, it synchronizes with the pivot on any storage change.
+// For keys where server IS pivot - broadcasts to nodes.
+// For keys where server IS node - syncs to the appropriate pivot via syncerPool.
 // originatorTracker is used by pivot to skip TriggerNodeSync back to the originating node.
-func makeStorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes getNodes, s *syncer, nodeHealth *NodeHealth, originatorTracker *OriginatorTracker) StorageSyncCallback {
+func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _getNodes getNodes, pool *syncerPool, nodeHealth *NodeHealth, originatorTracker *OriginatorTracker) StorageSyncCallback {
 	return func(event storage.Event) {
-		// For node servers, skip events caused by a pull operation
-		if pivotIP != "" && s != nil {
-			if event.Operation == "set" && s.PulledSet(event.Key) {
-				return
-			}
-			if event.Operation == "del" && s.PulledDelete(event.Key) {
-				return
-			}
-		}
-
 		// Find matching key and its database for this event
+		var matchedKeyConfig Key
 		var matchedKey string
 		var matchedDB storage.Database
+		var found bool
 		for _, k := range keys {
 			if key.Match(k.Path, event.Key) {
+				matchedKeyConfig = k
 				matchedKey = strings.Replace(k.Path, "/*", "", 1)
 				matchedDB = k.Database
+				found = true
 				break
 			}
 		}
 
-		if matchedKey == "" || matchedDB == nil {
+		if !found || matchedDB == nil {
 			return
+		}
+
+		// Determine if this server is pivot or node for this specific key
+		effectiveClusterURL := matchedKeyConfig.EffectiveClusterURL(configClusterURL)
+		isPivotForKey := effectiveClusterURL == ""
+
+		// For node keys, skip events caused by a pull operation
+		if !isPivotForKey && pool != nil {
+			s := pool.syncers[effectiveClusterURL]
+			if s != nil {
+				if event.Operation == "set" && s.PulledSet(event.Key) {
+					return
+				}
+				if event.Operation == "del" && s.PulledDelete(event.Key) {
+					return
+				}
+			}
 		}
 
 		// Track delete timestamps for proper sync
@@ -606,8 +722,8 @@ func makeStorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes 
 			matchedDB.Del(StoragePrefix + matchedKey)
 		}
 
-		if pivotIP == "" {
-			// This is the pivot server - notify all nodes asynchronously
+		if isPivotForKey {
+			// This server IS pivot for this key - notify all nodes asynchronously
 			// Get and clear the originator for this key (set by handler before storage write)
 			var originator string
 			if originatorTracker != nil {
@@ -631,14 +747,17 @@ func makeStorageSync(client *http.Client, pivotIP string, keys []Key, _getNodes 
 				}(node)
 			}
 		} else {
-			// This is a node - use per-key operations to sync with pivot
-			if s != nil {
-				if event.Operation == "del" {
-					s.QueueOrSendDelete(event.Key, time.Now().UnixNano())
-				} else {
-					obj, err := matchedDB.Get(event.Key)
-					if err == nil {
-						s.QueueOrSendSet(event.Key, obj)
+			// This server is node for this key - sync to the appropriate pivot
+			if pool != nil {
+				s := pool.syncers[effectiveClusterURL]
+				if s != nil {
+					if event.Operation == "del" {
+						s.QueueOrSendDelete(event.Key, time.Now().UnixNano())
+					} else {
+						obj, err := matchedDB.Get(event.Key)
+						if err == nil {
+							s.QueueOrSendSet(event.Key, obj)
+						}
 					}
 				}
 			}

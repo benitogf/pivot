@@ -159,8 +159,8 @@ func startPivotServer(pivotIP string) (*ooo.Server, *sync.WaitGroup) {
 		Keys: []pivot.Key{
 			{Path: "settings"},
 		},
-		NodesKey: "things/*",
-		PivotIP:  pivotIP,
+		NodesKey:   "things/*",
+		ClusterURL: pivotIP,
 	}
 
 	pivot.Setup(server, config)
@@ -211,8 +211,8 @@ func startNodeServer(pivotIP string, nodeStorage storage.Database) (*ooo.Server,
 		Keys: []pivot.Key{
 			{Path: "settings"},
 		},
-		NodesKey: "things/*",
-		PivotIP:  pivotIP,
+		NodesKey:   "things/*",
+		ClusterURL: pivotIP,
 	}
 
 	pivot.Setup(server, config)

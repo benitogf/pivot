@@ -202,9 +202,9 @@ func TestNodeHealth_Stop_SafeWithoutStart(t *testing.T) {
 // The node connects to pivot's health path via WebSocket subscription.
 // =============================================================================
 
-func TestE2E_NodeHealth_PivotHasHealthTracker(t *testing.T) {
+func TestE2E_NodeHealth_LeaderHasHealthTracker(t *testing.T) {
 	// Create pivot server
-	pivotServer := FakeServer(t, "", nil)
+	pivotServer, _ := FakeServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
 	// Get pivot instance to access NodeHealth
@@ -215,11 +215,11 @@ func TestE2E_NodeHealth_PivotHasHealthTracker(t *testing.T) {
 
 func TestE2E_NodeHealth_NodeServerNoHealthTracking(t *testing.T) {
 	// Create pivot server
-	pivotServer := FakeServer(t, "", nil)
+	pivotServer, _ := FakeServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
 	// Create node server
-	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	nodeServer, _ := FakeServer(t, pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
 	// Node servers should NOT have NodeHealth (only pivot servers do)
@@ -235,11 +235,11 @@ func TestE2E_NodeHealth_NodeServerNoHealthTracking(t *testing.T) {
 
 func TestE2E_NodeHealth_HealthEndpointOnNode(t *testing.T) {
 	// Create pivot server
-	pivotServer := FakeServer(t, "", nil)
+	pivotServer, _ := FakeServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
 	// Create node server
-	nodeServer := FakeServer(t, pivotServer.Address, nil)
+	nodeServer, _ := FakeServer(t, pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
 	// Node server health endpoint should return empty array (no health tracking)

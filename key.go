@@ -9,8 +9,27 @@ import (
 
 // Key defines a path to synchronize and its associated database.
 type Key struct {
-	Path     string
-	Database storage.Database // nil means server.Storage
+	Path       string
+	Database   storage.Database // nil means server.Storage
+	ClusterURL string           // if set, sync FROM this cluster (overrides Config.ClusterURL)
+	Local      bool             // if true, IS cluster leader for this key (ignores ClusterURL fallback)
+}
+
+// EffectiveClusterURL returns the cluster URL for this key.
+// Resolution order: Local=true returns "", Key.ClusterURL if set, otherwise fallback.
+func (k Key) EffectiveClusterURL(fallback string) string {
+	if k.Local {
+		return ""
+	}
+	if k.ClusterURL != "" {
+		return k.ClusterURL
+	}
+	return fallback
+}
+
+// IsClusterLeaderFor returns true if this server IS the cluster leader for this key.
+func (k Key) IsClusterLeaderFor(configClusterURL string) bool {
+	return k.EffectiveClusterURL(configClusterURL) == ""
 }
 
 // FindKeyStorage finds the storage database for a given index by matching against the key paths.

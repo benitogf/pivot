@@ -59,10 +59,10 @@ func createBenchPivotServer() *ooo.Server {
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  "",
-		Client:   benchClient(),
+		Keys:       []pivot.Key{{Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: "",
+		Client:     benchClient(),
 	}
 	pivot.Setup(server, config)
 
@@ -82,10 +82,10 @@ func createBenchNodeServer(pivotAddress string) *ooo.Server {
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotAddress,
-		Client:   benchClient(),
+		Keys:       []pivot.Key{{Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: pivotAddress,
+		Client:     benchClient(),
 	}
 	pivot.Setup(server, config)
 
@@ -127,10 +127,10 @@ func BenchmarkBaseline_Read(b *testing.B) {
 }
 
 // =============================================================================
-// PIVOT SERVER BENCHMARKS (no nodes registered)
+// CLUSTER LEADER BENCHMARKS (no nodes registered)
 // =============================================================================
 
-func BenchmarkPivotServer_NoNodes_Set(b *testing.B) {
+func BenchmarkClusterLeader_NoNodes_Set(b *testing.B) {
 	server := createBenchPivotServer()
 	defer server.Close(os.Interrupt)
 	i := 0
@@ -141,10 +141,10 @@ func BenchmarkPivotServer_NoNodes_Set(b *testing.B) {
 }
 
 // =============================================================================
-// PIVOT SERVER BENCHMARKS (with unreachable node registered)
+// CLUSTER LEADER BENCHMARKS (with unreachable node registered)
 // =============================================================================
 
-func BenchmarkPivotServer_UnreachableNode_Set(b *testing.B) {
+func BenchmarkClusterLeader_UnreachableNode_Set(b *testing.B) {
 	server := createBenchPivotServer()
 	defer server.Close(os.Interrupt)
 
@@ -159,10 +159,10 @@ func BenchmarkPivotServer_UnreachableNode_Set(b *testing.B) {
 }
 
 // =============================================================================
-// PIVOT SERVER BENCHMARKS (with reachable node)
+// CLUSTER LEADER BENCHMARKS (with reachable node)
 // =============================================================================
 
-func BenchmarkPivotServer_ReachableNode_Set(b *testing.B) {
+func BenchmarkClusterLeader_ReachableNode_Set(b *testing.B) {
 	pivotServer := createBenchPivotServer()
 	defer pivotServer.Close(os.Interrupt)
 
@@ -270,10 +270,10 @@ func createBenchPivotServerWithWaiter(waiter *eventWaiter) *ooo.Server {
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  "",
-		Client:   benchClient(),
+		Keys:       []pivot.Key{{Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: "",
+		Client:     benchClient(),
 	}
 	pivot.Setup(server, config)
 
@@ -304,10 +304,10 @@ func createBenchNodeServerWithWaiter(pivotAddress string, waiter *eventWaiter) *
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "settings"}},
-		NodesKey: "things/*",
-		PivotIP:  pivotAddress,
-		Client:   benchClient(),
+		Keys:       []pivot.Key{{Path: "settings"}},
+		NodesKey:   "things/*",
+		ClusterURL: pivotAddress,
+		Client:     benchClient(),
 	}
 	pivot.Setup(server, config)
 
@@ -328,8 +328,8 @@ func createBenchNodeServerWithWaiter(pivotAddress string, waiter *eventWaiter) *
 	return server
 }
 
-// BenchmarkE2E_PivotToNode_Set measures: write on pivot -> wait for sync on node -> verify
-func BenchmarkE2E_PivotToNode_Set(b *testing.B) {
+// BenchmarkE2E_LeaderToNode_Set measures: write on leader -> wait for sync on node -> verify
+func BenchmarkE2E_LeaderToNode_Set(b *testing.B) {
 	pivotWaiter := newEventWaiter()
 	nodeWaiter := newEventWaiter()
 
@@ -354,8 +354,8 @@ func BenchmarkE2E_PivotToNode_Set(b *testing.B) {
 	}
 }
 
-// BenchmarkE2E_NodeToPivot_Set measures: write on node -> wait for sync on pivot -> verify
-func BenchmarkE2E_NodeToPivot_Set(b *testing.B) {
+// BenchmarkE2E_NodeToLeader_Set measures: write on node -> wait for sync on leader -> verify
+func BenchmarkE2E_NodeToLeader_Set(b *testing.B) {
 	pivotWaiter := newEventWaiter()
 	nodeWaiter := newEventWaiter()
 
@@ -376,8 +376,8 @@ func BenchmarkE2E_NodeToPivot_Set(b *testing.B) {
 	}
 }
 
-// BenchmarkE2E_PivotToNode_Write measures: push on pivot -> wait for sync on node -> verify
-func BenchmarkE2E_PivotToNode_Write(b *testing.B) {
+// BenchmarkE2E_LeaderToNode_Write measures: push on leader -> wait for sync on node -> verify
+func BenchmarkE2E_LeaderToNode_Write(b *testing.B) {
 	pivotWaiter := newEventWaiter()
 	nodeWaiter := newEventWaiter()
 
@@ -401,8 +401,8 @@ func BenchmarkE2E_PivotToNode_Write(b *testing.B) {
 	}
 }
 
-// BenchmarkE2E_NodeToPivot_Write measures: push on node -> wait for sync on pivot -> verify
-func BenchmarkE2E_NodeToPivot_Write(b *testing.B) {
+// BenchmarkE2E_NodeToLeader_Write measures: push on node -> wait for sync on leader -> verify
+func BenchmarkE2E_NodeToLeader_Write(b *testing.B) {
 	pivotWaiter := newEventWaiter()
 	nodeWaiter := newEventWaiter()
 

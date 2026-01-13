@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGetPivotInfoWithNodes(t *testing.T) {
+func TestGetClusterLeaderInfoWithNodes(t *testing.T) {
 	// Create a server with storage
 	server := &ooo.Server{
 		Router:  mux.NewRouter(),
@@ -26,9 +26,9 @@ func TestGetPivotInfoWithNodes(t *testing.T) {
 
 	// Setup pivot with nodes key
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "test/*"}},
-		NodesKey: "nodes/*",
-		PivotIP:  "", // Empty = pivot server
+		Keys:       []pivot.Key{{Path: "test/*"}},
+		NodesKey:   "nodes/*",
+		ClusterURL: "", // Empty = pivot server
 	}
 
 	pivot.Setup(server, config)
@@ -49,7 +49,7 @@ func TestGetPivotInfoWithNodes(t *testing.T) {
 	require.Equal(t, "192.168.1.100:8080", info.Nodes[0].Address)
 }
 
-func TestGetPivotInfoWithMultipleNodes(t *testing.T) {
+func TestGetClusterLeaderInfoWithMultipleNodes(t *testing.T) {
 	server := &ooo.Server{
 		Router:  mux.NewRouter(),
 		Silence: true,
@@ -59,9 +59,9 @@ func TestGetPivotInfoWithMultipleNodes(t *testing.T) {
 	}
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "test/*"}},
-		NodesKey: "nodes/*",
-		PivotIP:  "",
+		Keys:       []pivot.Key{{Path: "test/*"}},
+		NodesKey:   "nodes/*",
+		ClusterURL: "",
 	}
 
 	pivot.Setup(server, config)
@@ -80,7 +80,7 @@ func TestGetPivotInfoWithMultipleNodes(t *testing.T) {
 	require.Len(t, info.Nodes, 2, "Should have 2 nodes (only entries with ip AND port)")
 }
 
-func TestGetPivotInfoViaHTTPAPI(t *testing.T) {
+func TestGetClusterLeaderInfoViaHTTPAPI(t *testing.T) {
 	// This test simulates how data would be written through the HTTP API
 	server := &ooo.Server{
 		Router:  mux.NewRouter(),
@@ -96,9 +96,9 @@ func TestGetPivotInfoViaHTTPAPI(t *testing.T) {
 	})
 
 	config := pivot.Config{
-		Keys:     []pivot.Key{{Path: "test/*"}},
-		NodesKey: "nodes/*",
-		PivotIP:  "",
+		Keys:       []pivot.Key{{Path: "test/*"}},
+		NodesKey:   "nodes/*",
+		ClusterURL: "",
 	}
 
 	pivot.Setup(server, config)
