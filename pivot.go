@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,7 +160,7 @@ func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNo
 				ip = v
 			}
 
-			// Look for port/Port field - handle both int and float64 (JSON numbers)
+			// Look for port/Port field - handle int, float64, and string
 			var port int
 			if v, ok := rawData["port"].(float64); ok {
 				port = int(v)
@@ -169,6 +170,10 @@ func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNo
 				port = v
 			} else if v, ok := rawData["Port"].(int); ok {
 				port = v
+			} else if v, ok := rawData["port"].(string); ok {
+				port, _ = strconv.Atoi(v)
+			} else if v, ok := rawData["Port"].(string); ok {
+				port, _ = strconv.Atoi(v)
 			}
 
 			// Only include entries with both ip and port
