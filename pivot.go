@@ -333,12 +333,11 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// Keys with Local=true or where server IS pivot won't have syncers
 	pool := newSyncerPool(client, keys, pivotURL)
 
-	// Create node health tracker for pivot servers
-	// Health is tracked via periodic pings and sync success/failure
+	// Create node health tracker
 	var nodeHealth *NodeHealth
 	if pivotURL == "" {
 		nodeHealth = NewNodeHealth(client)
-		// Set callback to broadcast to pivot/status subscribers when health changes
+		// Broadcast health changes
 		nodeHealth.SetOnHealthChange(func() {
 			info := GetPivotInfo(server)()
 			data, _ := json.Marshal(info)
@@ -362,8 +361,14 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		server.RegisterPreClose(func() {
 			nodeHealth.Stop()
 		})
-		// Start background health check every 3 seconds
-		nodeHealth.StartBackgroundCheck(getNodes, 3*time.Second)
+		// Start background health check in OnStart (after storage is initialized)
+		existingOnStartPivot := server.OnStart
+		server.OnStart = func() {
+			if existingOnStartPivot != nil {
+				existingOnStartPivot()
+			}
+			nodeHealth.StartBackgroundCheck(getNodes, 3*time.Second)
+		}
 	}
 
 	// Create read filter for pivot/status WebSocket subscription (works for both pivot and node)
