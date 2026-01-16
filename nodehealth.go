@@ -20,6 +20,7 @@ type NodeHealth struct {
 	lastConnect    map[string]time.Time // node address -> last connection time
 	lastDisconnect map[string]time.Time // node address -> last disconnection time
 	stopChan       chan struct{}
+	wg             sync.WaitGroup // tracks background goroutine
 	client         *http.Client
 	onHealthChange func() // callback when health status changes
 }
@@ -139,18 +140,28 @@ func NodeHealthHandler(nh *NodeHealth) http.HandlerFunc {
 	}
 }
 
-// Stop stops the background health checker
+// Stop stops the background health checker and waits for it to finish
 func (nh *NodeHealth) Stop() {
 	if nh.stopChan != nil {
 		close(nh.stopChan)
 	}
+	nh.wg.Wait()
 }
 
 // StartBackgroundCheck starts a goroutine that periodically checks node health
 func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, interval time.Duration) {
+	nh.wg.Add(1)
 	go func() {
+		defer nh.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+
+		// Check if already stopped before initial check
+		select {
+		case <-nh.stopChan:
+			return
+		default:
+		}
 
 		// Do an initial check immediately
 		nh.checkAllNodes(getNodes())
