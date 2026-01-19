@@ -14,18 +14,24 @@ import (
 
 // TriggerNodeSync will call pivot on a node server
 func TriggerNodeSync(client *http.Client, node string) {
-	TriggerNodeSyncWithHealth(client, node)
+	TriggerNodeSyncWithHealth(client, node, "")
 }
 
 // TriggerNodeSyncWithHealth triggers a pull-only sync on a node server.
 // Uses /synchronize/pivot endpoint so node pulls from pivot without sending data back.
 // This prevents re-adding items that pivot just deleted.
 // Uses a 5 second timeout to allow sync to complete on slow networks.
-func TriggerNodeSyncWithHealth(client *http.Client, node string) bool {
+// If keyPath is provided, only that specific key will be synced.
+func TriggerNodeSyncWithHealth(client *http.Client, node string, keyPath string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://"+node+RoutePrefix+"/synchronize/pivot", nil)
+	url := "http://" + node + RoutePrefix + "/synchronize/pivot"
+	if keyPath != "" {
+		url += "?key=" + keyPath
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false
 	}

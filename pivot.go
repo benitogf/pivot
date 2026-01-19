@@ -390,7 +390,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		originatorTracker = NewOriginatorTracker()
 	}
 
-	syncCallback := makeStorageSync(client, pivotURL, keys, getNodes, pool, nodeHealth, originatorTracker)
+	syncCallback := makeStorageSync(client, pivotURL, keys, getNodes, pool, nodeHealth, originatorTracker, instance)
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage
 	server.OnStorageEvent = storage.EventCallback(syncCallback)
@@ -403,6 +403,8 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 
 	// Node health endpoint (only meaningful on pivot servers)
 	server.Router.HandleFunc(RoutePrefix+"/health/nodes", NodeHealthHandler(nodeHealth)).Methods("GET")
+	// Version endpoint for protocol detection
+	server.Router.HandleFunc(RoutePrefix+"/version", VersionHandler()).Methods("GET")
 	for _, k := range keys {
 		baseKey := strings.Replace(k.Path, "/*", "", 1)
 		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k)).Methods("GET")
@@ -424,7 +426,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	}
 
 	// Create BeforeRead callback for sync-on-read
-	// Uses TryPull() on the appropriate syncer based on key's effective ClusterURL
+	// Uses TryPullKey() on the appropriate syncer based on key's effective ClusterURL
 	var syncing int32
 	beforeRead := func(readKey string) {
 		if !atomic.CompareAndSwapInt32(&syncing, 0, 1) {
@@ -437,7 +439,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 				effectiveURL := k.EffectiveClusterURL(pivotURL)
 				if effectiveURL != "" && pool != nil {
 					if s := pool.syncers[effectiveURL]; s != nil {
-						s.TryPull()
+						s.TryPullKey(k.Path)
 					}
 				}
 				return
@@ -631,7 +633,8 @@ func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instan
 // SyncDeleteFilter returns a delete filter that syncs deletes to pivot and notifies nodes.
 // This is for backward compatibility with code that uses the old pivot API.
 // nodeAddr is the address of this node (empty for pivot servers).
-func SyncDeleteFilter(client *http.Client, pivotURL string, db storage.Database, keyPath string, _getNodes GetNodes, nodeAddr string) func(index string) error {
+// nodeHealth is optional - if provided, incompatible nodes will be skipped.
+func SyncDeleteFilter(client *http.Client, pivotURL string, db storage.Database, keyPath string, _getNodes GetNodes, nodeAddr string, nodeHealth *NodeHealth) func(index string) error {
 	return func(index string) error {
 		// Delete locally first
 		err := db.Del(keyPath + "/" + index)
@@ -648,10 +651,14 @@ func SyncDeleteFilter(client *http.Client, pivotURL string, db storage.Database,
 			if len(nodes) > 0 {
 				var wg sync.WaitGroup
 				for _, node := range nodes {
+					// Skip incompatible nodes
+					if nodeHealth != nil && !nodeHealth.IsCompatible(node) {
+						continue
+					}
 					wg.Add(1)
 					go func(n string) {
 						defer wg.Done()
-						TriggerNodeSyncWithHealth(client, n)
+						TriggerNodeSyncWithHealth(client, n, "")
 					}(node)
 				}
 				wg.Wait()

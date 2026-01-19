@@ -467,6 +467,13 @@ func (p *syncerPool) PullAll() {
 	}
 }
 
+// PullKey triggers PullKey on all syncers for a specific key path (blocking)
+func (p *syncerPool) PullKey(keyPath string) {
+	for _, s := range p.syncers {
+		s.PullKey(keyPath)
+	}
+}
+
 // SyncAll triggers Sync on all syncers
 func (p *syncerPool) SyncAll() error {
 	var lastErr error
@@ -508,6 +515,70 @@ func (s *syncer) TryPull() error {
 		return nil
 	}
 	err := pullFromPivotWithTracking(s.client, s.pivot, s.keys,
+		s.tracker.trackDelete,
+		s.tracker.trackSet,
+		nil)
+	s.mu.Unlock()
+
+	// Process any queued per-key operations
+	s.processQueue()
+
+	// Call AfterPull callback if set (for test synchronization)
+	if s.AfterPull != nil {
+		s.AfterPull()
+	}
+	return err
+}
+
+// TryPullKey attempts to sync a specific key FROM pivot, skipping if already in progress
+func (s *syncer) TryPullKey(keyPath string) error {
+	if !s.mu.TryLock() {
+		return nil
+	}
+	// Find the matching key configuration
+	var matchingKeys []Key
+	for _, k := range s.keys {
+		if k.Path == keyPath {
+			matchingKeys = append(matchingKeys, k)
+			break
+		}
+	}
+	if len(matchingKeys) == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	err := pullFromPivotWithTracking(s.client, s.pivot, matchingKeys,
+		s.tracker.trackDelete,
+		s.tracker.trackSet,
+		nil)
+	s.mu.Unlock()
+
+	// Process any queued per-key operations
+	s.processQueue()
+
+	// Call AfterPull callback if set (for test synchronization)
+	if s.AfterPull != nil {
+		s.AfterPull()
+	}
+	return err
+}
+
+// PullKey syncs a specific key FROM pivot (blocking - waits for lock)
+func (s *syncer) PullKey(keyPath string) error {
+	s.mu.Lock()
+	// Find the matching key configuration
+	var matchingKeys []Key
+	for _, k := range s.keys {
+		if k.Path == keyPath {
+			matchingKeys = append(matchingKeys, k)
+			break
+		}
+	}
+	if len(matchingKeys) == 0 {
+		s.mu.Unlock()
+		return nil
+	}
+	err := pullFromPivotWithTracking(s.client, s.pivot, matchingKeys,
 		s.tracker.trackDelete,
 		s.tracker.trackSet,
 		nil)
@@ -676,7 +747,8 @@ func (t *OriginatorTracker) Get(key string) string {
 // For keys where server IS pivot - broadcasts to nodes.
 // For keys where server IS node - syncs to the appropriate pivot via syncerPool.
 // originatorTracker is used by pivot to skip TriggerNodeSync back to the originating node.
-func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _getNodes getNodes, pool *syncerPool, nodeHealth *NodeHealth, originatorTracker *OriginatorTracker) StorageSyncCallback {
+// instance is used to access pivot Instance for sync tracking (can be nil).
+func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _getNodes getNodes, pool *syncerPool, nodeHealth *NodeHealth, originatorTracker *OriginatorTracker, instance *Instance) StorageSyncCallback {
 	return func(event storage.Event) {
 		// Find matching key and its database for this event
 		var matchedKeyConfig Key
@@ -735,8 +807,12 @@ func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _
 				if node == originator {
 					continue
 				}
-				go func(n string) {
-					ok := TriggerNodeSyncWithHealth(client, n)
+				// Skip incompatible nodes - don't sync to nodes with different protocol version
+				if nodeHealth != nil && !nodeHealth.IsCompatible(node) {
+					continue
+				}
+				go func(n string, keyPath string) {
+					ok := TriggerNodeSyncWithHealth(client, n, keyPath)
 					if nodeHealth != nil {
 						if ok {
 							nodeHealth.MarkHealthy(n)
@@ -744,7 +820,7 @@ func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _
 							nodeHealth.MarkUnhealthy(n)
 						}
 					}
-				}(node)
+				}(node, matchedKeyConfig.Path)
 			}
 		} else {
 			// This server is node for this key - sync to the appropriate pivot

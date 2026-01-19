@@ -118,10 +118,13 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 						Address:   addr,
 						Healthy:   false, // Unknown until checked
 						LastCheck: "Never",
+						Protocol:  "unknown", // Default until version check
 					}
 					if hs, ok := healthStatus[addr]; ok {
 						status.Healthy = hs.Healthy
 						status.LastCheck = hs.LastCheck
+						status.Protocol = hs.Protocol
+						status.Compatible = hs.Compatible
 					}
 					nodes = append(nodes, status)
 				}
@@ -137,9 +140,11 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 				for _, status := range healthStatuses {
 					if !existingAddrs[status.Address] {
 						nodes = append(nodes, ui.PivotNodeStatus{
-							Address:   status.Address,
-							Healthy:   status.Healthy,
-							LastCheck: status.LastCheck,
+							Address:    status.Address,
+							Healthy:    status.Healthy,
+							LastCheck:  status.LastCheck,
+							Protocol:   status.Protocol,
+							Compatible: status.Compatible,
 						})
 					}
 				}
