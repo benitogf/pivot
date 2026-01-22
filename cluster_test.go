@@ -459,15 +459,44 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	wsWg.Add(4)
 
 	// Subscribe to things and settings on both servers
-	go client.SubscribeList(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: pivotServer.Address}, Header: authHeader, Silence: true}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) { mu.Lock(); pivotThings = data; mu.Unlock(); wsWg.Done() }})
-	go client.SubscribeList(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: nodeServer.Address}, Header: authHeader, Silence: true}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) { mu.Lock(); nodeThings = data; mu.Unlock(); wsWg.Done() }})
-	go client.Subscribe(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: nodeServer.Address}, Header: authHeader, Silence: true}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) {
+		mu.Lock()
+		pivotThings = data
+		mu.Unlock()
+		wsWg.Done()
+	}})
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:    ctx,
+		Server: client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Header: authHeader, Silence: true}, "things/*",
+		client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) {
+			mu.Lock()
+			nodeThings = data
+			mu.Unlock()
+			wsWg.Done()
+		}})
+	go client.Subscribe(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		nodeSettings = []client.Meta[Settings]{data}
 		mu.Unlock()
 		wsWg.Done()
 	}})
-	go client.Subscribe(client.SubscribeConfig{Ctx: ctx, Server: client.Server{Protocol: "ws", Host: pivotServer.Address}, Header: authHeader, Silence: true}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
+	go client.Subscribe(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		pivotSettings = []client.Meta[Settings]{data}
 		mu.Unlock()
