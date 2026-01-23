@@ -19,10 +19,13 @@ type NodeHealth struct {
 	connected      map[string]bool      // node address -> is connected
 	lastConnect    map[string]time.Time // node address -> last connection time
 	lastDisconnect map[string]time.Time // node address -> last disconnection time
+	protocol       map[string]string    // node address -> protocol version ("2.0", "unknown")
 	stopChan       chan struct{}
 	wg             sync.WaitGroup // tracks background goroutine
+	callbackWg     sync.WaitGroup // tracks in-flight callbacks
 	client         *http.Client
 	onHealthChange func() // callback when health status changes
+	stopped        bool   // true after Stop() is called, prevents callbacks
 }
 
 // NewNodeHealth creates a new NodeHealth tracker.
@@ -34,6 +37,7 @@ func NewNodeHealth(client *http.Client) *NodeHealth {
 		connected:      make(map[string]bool),
 		lastConnect:    make(map[string]time.Time),
 		lastDisconnect: make(map[string]time.Time),
+		protocol:       make(map[string]string),
 		stopChan:       make(chan struct{}),
 		client:         client,
 	}
@@ -97,9 +101,11 @@ func (nh *NodeHealth) GetHealthyNodes(nodes []string) []string {
 
 // NodeStatus represents the health status of a single node
 type NodeStatus struct {
-	Address   string `json:"address"`
-	Healthy   bool   `json:"healthy"`
-	LastCheck string `json:"lastCheck"` // RFC3339 formatted timestamp
+	Address    string `json:"address"`
+	Healthy    bool   `json:"healthy"`
+	LastCheck  string `json:"lastCheck"`  // RFC3339 formatted timestamp
+	Protocol   string `json:"protocol"`   // "2.0", "unknown"
+	Compatible bool   `json:"compatible"` // true if protocol matches current version
 }
 
 // GetStatus returns the health status of all known nodes
@@ -108,9 +114,15 @@ func (nh *NodeHealth) GetStatus() []NodeStatus {
 	defer nh.mu.RUnlock()
 	result := make([]NodeStatus, 0, len(nh.connected))
 	for addr, connected := range nh.connected {
+		proto := nh.protocol[addr]
+		if proto == "" {
+			proto = "unknown"
+		}
 		status := NodeStatus{
-			Address: addr,
-			Healthy: connected,
+			Address:    addr,
+			Healthy:    connected,
+			Protocol:   proto,
+			Compatible: proto == ProtocolVersion,
 		}
 		if connected {
 			if t, ok := nh.lastConnect[addr]; ok {
@@ -142,10 +154,14 @@ func NodeHealthHandler(nh *NodeHealth) http.HandlerFunc {
 
 // Stop stops the background health checker and waits for it to finish
 func (nh *NodeHealth) Stop() {
+	nh.mu.Lock()
+	nh.stopped = true
+	nh.mu.Unlock()
 	if nh.stopChan != nil {
 		close(nh.stopChan)
 	}
 	nh.wg.Wait()
+	nh.callbackWg.Wait() // wait for in-flight callbacks to complete
 }
 
 // StartBackgroundCheck starts a goroutine that periodically checks node health
@@ -184,11 +200,80 @@ func (nh *NodeHealth) checkAllNodes(nodes []string) {
 			healthy := nh.pingNode(n)
 			if healthy {
 				nh.MarkHealthy(n)
+				// Check protocol version
+				proto := nh.checkNodeVersion(n)
+				nh.setProtocol(n, proto)
 			} else {
 				nh.MarkUnhealthy(n)
 			}
 		}(node)
 	}
+}
+
+// checkNodeVersion queries the node's version endpoint to determine protocol version
+func (nh *NodeHealth) checkNodeVersion(node string) string {
+	url := "http://" + node + RoutePrefix + "/version"
+	resp, err := nh.client.Get(url)
+	if err != nil {
+		return "unknown"
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "unknown"
+	}
+
+	var info VersionInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return "unknown"
+	}
+
+	if info.Protocol == "" {
+		return "unknown"
+	}
+
+	return info.Protocol
+}
+
+// setProtocol updates the protocol version for a node
+func (nh *NodeHealth) setProtocol(node, protocol string) {
+	nh.mu.Lock()
+	oldProto := nh.protocol[node]
+	nh.protocol[node] = protocol
+	callback := nh.onHealthChange
+	nh.mu.Unlock()
+
+	// Notify if protocol changed
+	if oldProto != protocol && callback != nil {
+		callback()
+	}
+}
+
+// GetProtocol returns the detected protocol version for a node
+func (nh *NodeHealth) GetProtocol(node string) string {
+	nh.mu.RLock()
+	defer nh.mu.RUnlock()
+	proto := nh.protocol[node]
+	if proto == "" {
+		return "unknown"
+	}
+	return proto
+}
+
+// IsCompatible returns true if the node is running a compatible protocol version.
+// If the protocol is not yet known, it checks on-demand before deciding.
+func (nh *NodeHealth) IsCompatible(node string) bool {
+	nh.mu.RLock()
+	proto := nh.protocol[node]
+	nh.mu.RUnlock()
+
+	// If protocol not yet detected, check on-demand
+	if proto == "" {
+		proto = nh.checkNodeVersion(node)
+		nh.setProtocol(node, proto)
+	}
+
+	return proto == ProtocolVersion
 }
 
 // pingNode checks if a node is reachable
@@ -212,29 +297,45 @@ func (nh *NodeHealth) SetOnHealthChange(callback func()) {
 // MarkHealthy marks a node as healthy (called when sync succeeds)
 func (nh *NodeHealth) MarkHealthy(node string) {
 	nh.mu.Lock()
+	if nh.stopped {
+		nh.mu.Unlock()
+		return
+	}
 	wasHealthy := nh.connected[node]
 	nh.connected[node] = true
 	nh.lastConnect[node] = time.Now()
 	callback := nh.onHealthChange
+	if !wasHealthy && callback != nil {
+		nh.callbackWg.Add(1)
+	}
 	nh.mu.Unlock()
 
 	// Notify if status changed
 	if !wasHealthy && callback != nil {
 		callback()
+		nh.callbackWg.Done()
 	}
 }
 
 // MarkUnhealthy marks a node as unhealthy (called when sync fails)
 func (nh *NodeHealth) MarkUnhealthy(node string) {
 	nh.mu.Lock()
+	if nh.stopped {
+		nh.mu.Unlock()
+		return
+	}
 	wasHealthy := nh.connected[node]
 	nh.connected[node] = false
 	nh.lastDisconnect[node] = time.Now()
 	callback := nh.onHealthChange
+	if wasHealthy && callback != nil {
+		nh.callbackWg.Add(1)
+	}
 	nh.mu.Unlock()
 
 	// Notify if status changed
 	if wasHealthy && callback != nil {
 		callback()
+		nh.callbackWg.Done()
 	}
 }

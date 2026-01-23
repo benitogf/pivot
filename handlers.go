@@ -12,6 +12,7 @@ import (
 
 // SynchronizePivotHandler handles /synchronize/pivot - pull-only sync from pivot.
 // Called by pivot when it has changes (including deletes) that nodes should pull.
+// If ?key=path is provided, only that specific key will be synced.
 func SynchronizePivotHandler(pivot string, pool *syncerPool) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pool == nil || len(pool.syncers) == 0 {
@@ -20,7 +21,12 @@ func SynchronizePivotHandler(pivot string, pool *syncerPool) func(w http.Respons
 			return
 		}
 
-		pool.PullAll()
+		keyPath := r.URL.Query().Get("key")
+		if keyPath != "" {
+			pool.PullKey(keyPath)
+		} else {
+			pool.PullAll()
+		}
 		w.WriteHeader(http.StatusOK)
 	}
 }

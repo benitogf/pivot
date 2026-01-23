@@ -8,8 +8,8 @@ github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 h1:0ERndS9JkEvEq
 github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559/go.mod h1:gg2qmcNCGq/FXh5kQpsaEIf6GebYe2JMKrDSqZkuImc=
 github.com/benitogf/jsonpatch v0.0.0-20260109052650-eec54232a9a2 h1:OC5ZiOG0sQ5Qmp5XOA3iIBBjhDjze010jHicNTD27kU=
 github.com/benitogf/jsonpatch v0.0.0-20260109052650-eec54232a9a2/go.mod h1:O1Z+hTPUrXzHUjmKlpmNYK9wcncZ5rS3K8PqItDO0x0=
-github.com/benitogf/ooo v0.0.0-20260115160433-3dcced5cc10b h1:fWlzyf5li8/GPH8owayYb05fbqVRcTsmoIvRgQVn0zA=
-github.com/benitogf/ooo v0.0.0-20260115160433-3dcced5cc10b/go.mod h1:fqf1bDkBBOOiCExWW1qdj59ldb/yqfJc3gTfskl02cU=
+github.com/benitogf/ooo v0.0.0-20260123031954-acc65fb69f57 h1:qqjmBad6mciF4MINA0a/Vt7JuXV7W5FqKJQXxx26lKU=
+github.com/benitogf/ooo v0.0.0-20260123031954-acc65fb69f57/go.mod h1:fqf1bDkBBOOiCExWW1qdj59ldb/yqfJc3gTfskl02cU=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/felixge/httpsnoop v1.0.4 h1:NFTV2Zj1bL4mc9sqWACXbQFVBBg2W3GPvqp8/ESS2Wg=
