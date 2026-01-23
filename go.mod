@@ -5,7 +5,7 @@ go 1.25
 require (
 	github.com/benitogf/auth v0.0.0-20260109062751-db0dd7187682
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec
-	github.com/benitogf/ooo v0.0.0-20260115160433-3dcced5cc10b
+	github.com/benitogf/ooo v0.0.0-20260123031954-acc65fb69f57
 	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/mux v1.8.1
 	github.com/stretchr/testify v1.11.1
@@ -30,5 +30,3 @@ require (
 	golang.org/x/crypto v0.46.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/benitogf/ooo => ../ooo
