@@ -20,6 +20,9 @@ import (
 // onSet is called for each key set locally (item exists on pivot but not locally, or pivot is newer)
 // skipSet is called before setting - if it returns true, the set is skipped (for locally deleted keys)
 func syncLocalEntriesWithTracking(client *http.Client, pivot string, _key Key, lastEntry int64, onDelete func(key string), onSet func(key string), skipSet func(key string) bool) error {
+	if _key.Database == nil || !_key.Database.Active() {
+		return ErrStorageNotActive
+	}
 	if key.LastIndex(_key.Path) == "*" {
 		baseKey := strings.Replace(_key.Path, "/*", "", 1)
 		objsPivot, err := getEntriesFromPivot(client, pivot, _key.Path)
@@ -109,6 +112,9 @@ func syncLocalEntriesWithTracking(client *http.Client, pivot string, _key Key, l
 // This function also sends delete commands to pivot for items that were deleted locally.
 // originator is passed to pivot so it can skip TriggerNodeSync back to the originating node.
 func syncPivotEntriesWithDeleteCheck(client *http.Client, pivot string, _key Key, pivotActivity int64, isRecentDelete func(key string) bool, originator string) error {
+	if _key.Database == nil || !_key.Database.Active() {
+		return ErrStorageNotActive
+	}
 	if key.LastIndex(_key.Path) == "*" {
 		baseKey := strings.Replace(_key.Path, "/*", "", 1)
 		objsLocal, err := _key.Database.GetList(_key.Path)
