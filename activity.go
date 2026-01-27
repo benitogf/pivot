@@ -29,6 +29,9 @@ func lastActivity(objs []meta.Object) int64 {
 }
 
 func checkLastDelete(db storage.Database, lastEntry int64, key string) int64 {
+	if db == nil || !db.Active() {
+		return lastEntry
+	}
 	obj, err := db.Get(StoragePrefix + key)
 	if err != nil {
 		return lastEntry
@@ -42,8 +45,13 @@ func checkLastDelete(db storage.Database, lastEntry int64, key string) int64 {
 	return max(lastEntry, int64(lastDeleteNum))
 }
 
+var ErrStorageNotActive = errors.New("storage not active")
+
 func checkActivity(_key Key) (ActivityEntry, error) {
 	var activity ActivityEntry
+	if _key.Database == nil || !_key.Database.Active() {
+		return activity, ErrStorageNotActive
+	}
 	baseKey := _key
 
 	if key.LastIndex(_key.Path) == "*" {

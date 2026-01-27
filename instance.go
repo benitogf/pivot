@@ -198,9 +198,12 @@ func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) e
 		opts.Workers = userOpts.Workers
 		// Always use our BeforeRead for sync-on-read
 	}
-	err := db.Start(opts)
-	if err != nil {
-		return err
+	// Only start if not already active - avoids corrupting already-started storage
+	if !db.Active() {
+		err := db.Start(opts)
+		if err != nil {
+			return err
+		}
 	}
 	storage.WatchWithCallback(db, i.SyncCallback)
 	return nil
