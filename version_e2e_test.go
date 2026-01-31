@@ -17,6 +17,7 @@ import (
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/client"
 	"github.com/benitogf/ooo/storage"
+	"github.com/benitogf/ooo/ui"
 	"github.com/benitogf/pivot"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/require"
@@ -243,6 +244,68 @@ func TestE2E_VersionSync_NodeBlocksIncompatiblePivot(t *testing.T) {
 	require.Equal(t, 1, len(nodeItems), "node should have 1 item locally")
 	require.Equal(t, "nodeItem", nodeItems[0].Data.Name)
 	mu.Unlock()
+}
+
+func TestE2E_VersionSync_NodeDetectsPivotProtocol(t *testing.T) {
+	pivotServer, _ := VersionTestServer(t, "")
+	defer pivotServer.Close(os.Interrupt)
+
+	nodeServer, _ := VersionTestServer(t, "http://"+pivotServer.Address)
+	defer nodeServer.Close(os.Interrupt)
+
+	// Poll until health check detects pivot protocol (initial check runs async)
+	var nodeInfo *ui.PivotInfo
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		nodeInfo = pivot.GetPivotInfo(nodeServer)()
+		if nodeInfo != nil && nodeInfo.PivotProtocol != "unknown" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	require.NotNil(t, nodeInfo)
+	require.Equal(t, "node", nodeInfo.Role)
+	require.Equal(t, "http://"+pivotServer.Address, nodeInfo.PivotIP)
+	require.Equal(t, pivot.ProtocolVersion, nodeInfo.PivotProtocol, "node should detect pivot's protocol version")
+	require.True(t, nodeInfo.PivotCompatible, "node should report pivot as compatible")
+	require.True(t, nodeInfo.PivotHealthy, "node should report pivot as healthy")
+}
+
+func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
+	mockPivot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == pivot.RoutePrefix+"/version" {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(pivot.VersionInfo{Protocol: "1.0"})
+			return
+		}
+		if r.URL.Path == "/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockPivot.Close()
+
+	nodeServer, _ := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
+	defer nodeServer.Close(os.Interrupt)
+
+	// Poll until health check detects pivot protocol
+	var nodeInfo *ui.PivotInfo
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		nodeInfo = pivot.GetPivotInfo(nodeServer)()
+		if nodeInfo != nil && nodeInfo.PivotProtocol != "unknown" {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	require.NotNil(t, nodeInfo)
+	require.Equal(t, "node", nodeInfo.Role)
+	require.Equal(t, "1.0", nodeInfo.PivotProtocol, "node should detect pivot's protocol version 1.0")
+	require.False(t, nodeInfo.PivotCompatible, "node should report pivot as incompatible")
+	require.True(t, nodeInfo.PivotHealthy, "node should still report pivot as healthy (reachable)")
 }
 
 func TestE2E_VersionSync_OldNodeWithoutVersionEndpoint(t *testing.T) {

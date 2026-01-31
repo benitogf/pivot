@@ -552,7 +552,9 @@ func retryInitialSyncPool(pool *syncerPool, console *coat.Console, stop <-chan s
 }
 
 // startPivotHealthCheck periodically pings the pivot server and updates the instance health status
-func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instance, server *ooo.Server, stop <-chan struct{}) {
+func startPivotHealthCheck(client *http.Client, pivotURL string, instance *Instance, server *ooo.Server, stop <-chan struct{}) {
+	// Strip http:// prefix if present for URL construction
+	pivotHost := strings.TrimPrefix(pivotURL, "http://")
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -571,20 +573,37 @@ func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instan
 		if isStopped() {
 			return
 		}
-		url := "http://" + pivotIP + "/"
+		url := "http://" + pivotHost + "/"
 		resp, err := client.Get(url)
 		now := time.Now().Format(time.RFC3339)
+
+		// Check pivot version
+		protocol := "unknown"
+		compatible := false
+		versionURL := "http://" + pivotHost + RoutePrefix + "/version"
+		versionResp, versionErr := client.Get(versionURL)
+		if versionErr == nil {
+			defer versionResp.Body.Close()
+			if versionResp.StatusCode == http.StatusOK {
+				var info VersionInfo
+				if json.NewDecoder(versionResp.Body).Decode(&info) == nil && info.Protocol != "" {
+					protocol = info.Protocol
+					compatible = info.Protocol == ProtocolVersion
+				}
+			}
+		}
 
 		instance.healthMu.Lock()
 		if instance.PivotHealth == nil {
 			instance.PivotHealth = make(map[string]*PivotHealthStatus)
 		}
-		status := instance.PivotHealth[pivotIP]
+		status := instance.PivotHealth[pivotURL]
 		if status == nil {
 			status = &PivotHealthStatus{}
-			instance.PivotHealth[pivotIP] = status
+			instance.PivotHealth[pivotURL] = status
 		}
 		wasHealthy := status.Healthy
+		wasCompatible := status.Compatible
 		if err != nil {
 			status.Healthy = false
 			status.LastCheck = now
@@ -593,10 +612,12 @@ func startPivotHealthCheck(client *http.Client, pivotIP string, instance *Instan
 			status.Healthy = resp.StatusCode == http.StatusOK
 			status.LastCheck = now
 		}
+		status.Protocol = protocol
+		status.Compatible = compatible
 		instance.healthMu.Unlock()
 
 		// Broadcast if status changed - check stop again before accessing server.Stream
-		if wasHealthy != status.Healthy && !isStopped() {
+		if (wasHealthy != status.Healthy || wasCompatible != status.Compatible) && !isStopped() {
 			info := GetPivotInfo(server)()
 			data, _ := json.Marshal(info)
 			now := time.Now().UTC().UnixNano()

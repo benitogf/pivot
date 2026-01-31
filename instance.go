@@ -14,8 +14,10 @@ var instancesMu sync.RWMutex
 
 // PivotHealthStatus tracks health status for a single pivot connection
 type PivotHealthStatus struct {
-	Healthy   bool
-	LastCheck string
+	Healthy    bool
+	LastCheck  string
+	Protocol   string // Protocol version of the pivot ("2.0", "unknown")
+	Compatible bool   // true if pivot protocol matches local version
 }
 
 // Instance contains pivot callbacks for use with external storages.
@@ -158,24 +160,39 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 		// Get overall pivot health (all pivots healthy = healthy)
 		pivotHealthy := true
 		pivotLastCheck := ""
+		pivotProtocol := ""
+		pivotCompatible := true
 		instance.healthMu.RLock()
 		for _, status := range instance.PivotHealth {
 			if !status.Healthy {
 				pivotHealthy = false
 			}
+			if !status.Compatible {
+				pivotCompatible = false
+			}
 			if status.LastCheck > pivotLastCheck {
 				pivotLastCheck = status.LastCheck
+			}
+			// Use the protocol from the first pivot (typically only one for node servers)
+			if pivotProtocol == "" && status.Protocol != "" {
+				pivotProtocol = status.Protocol
 			}
 		}
 		instance.healthMu.RUnlock()
 
+		if pivotProtocol == "" {
+			pivotProtocol = "unknown"
+		}
+
 		return &ui.PivotInfo{
-			Role:           role,
-			PivotIP:        instance.ClusterURL,
-			SyncedKeys:     instance.SyncedKeys,
-			Nodes:          nodes,
-			PivotHealthy:   pivotHealthy,
-			PivotLastCheck: pivotLastCheck,
+			Role:            role,
+			PivotIP:         instance.ClusterURL,
+			SyncedKeys:      instance.SyncedKeys,
+			Nodes:           nodes,
+			PivotHealthy:    pivotHealthy,
+			PivotLastCheck:  pivotLastCheck,
+			PivotProtocol:   pivotProtocol,
+			PivotCompatible: pivotCompatible,
 		}
 	}
 }
