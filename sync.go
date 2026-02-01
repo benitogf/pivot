@@ -367,15 +367,24 @@ type syncer struct {
 	queueMu   sync.Mutex
 	queue     []pendingOp // Per-key operations queued during Pull
 	AfterPull func()      // Optional callback after Pull completes (for testing)
+
+	// Activity cache: tracks last synced pivot activity per key to skip HTTP requests
+	// when local activity hasn't changed since last sync.
+	// Only used after receiving at least one TriggerNodeSync (connected flag is true).
+	activityMu         sync.RWMutex
+	lastSyncedActivity map[string]int64 // baseKey -> last known pivot LastEntry after sync
+	connected          map[string]bool  // baseKey -> true if we've received TriggerNodeSync for this key
 }
 
 func newSyncer(client *http.Client, pivot string, keys []Key) *syncer {
 	return &syncer{
-		tracker: newPullTracker(),
-		client:  client,
-		pivot:   pivot,
-		keys:    keys,
-		queue:   make([]pendingOp, 0),
+		tracker:            newPullTracker(),
+		client:             client,
+		pivot:              pivot,
+		keys:               keys,
+		queue:              make([]pendingOp, 0),
+		lastSyncedActivity: make(map[string]int64),
+		connected:          make(map[string]bool),
 	}
 }
 
@@ -497,12 +506,20 @@ func (s *syncer) SetNodeAddr(addr string) {
 }
 
 // Pull syncs FROM pivot only (used when pivot notifies node of changes)
+// This is called by TriggerNodeSync when pivot has new data.
 func (s *syncer) Pull() error {
+	// Mark all keys as connected since pivot is sending us notifications
+	s.activityMu.Lock()
+	for _, k := range s.keys {
+		baseKey := strings.Replace(k.Path, "/*", "", 1)
+		s.connected[baseKey] = true
+		// Invalidate cache since pivot has new data
+		delete(s.lastSyncedActivity, baseKey)
+	}
+	s.activityMu.Unlock()
+
 	s.mu.Lock()
-	err := pullFromPivotWithTracking(s.client, s.pivot, s.keys,
-		s.tracker.trackDelete,
-		s.tracker.trackSet,
-		nil)
+	err := s.pullKeyWithCacheUpdate(s.keys)
 	s.mu.Unlock()
 
 	// Process any queued per-key operations
@@ -536,27 +553,45 @@ func (s *syncer) TryPull() error {
 	return err
 }
 
-// TryPullKey attempts to sync a specific key FROM pivot, skipping if already in progress
+// TryPullKey attempts to sync a specific key FROM pivot, skipping if already in progress.
+// Uses activity caching to skip HTTP requests when local data hasn't changed since last sync.
+// Caching only activates after receiving at least one TriggerNodeSync for the key.
 func (s *syncer) TryPullKey(keyPath string) error {
-	if !s.mu.TryLock() {
-		return nil
-	}
-	// Find the matching key configuration
-	var matchingKeys []Key
-	for _, k := range s.keys {
-		if k.Path == keyPath {
-			matchingKeys = append(matchingKeys, k)
+	// Find the matching key configuration first (before lock)
+	var matchingKey *Key
+	for i := range s.keys {
+		if s.keys[i].Path == keyPath {
+			matchingKey = &s.keys[i]
 			break
 		}
 	}
-	if len(matchingKeys) == 0 {
-		s.mu.Unlock()
+	if matchingKey == nil {
 		return nil
 	}
-	err := pullFromPivotWithTracking(s.client, s.pivot, matchingKeys,
-		s.tracker.trackDelete,
-		s.tracker.trackSet,
-		nil)
+
+	// Check if we can skip based on activity cache (no lock needed for read)
+	// Only use cache if we're "connected" (have received TriggerNodeSync for this key)
+	baseKey := strings.Replace(keyPath, "/*", "", 1)
+	s.activityMu.RLock()
+	isConnected := s.connected[baseKey]
+	lastSynced, hasCached := s.lastSyncedActivity[baseKey]
+	s.activityMu.RUnlock()
+
+	if isConnected && hasCached {
+		activityLocal, err := checkActivity(*matchingKey)
+		if err == nil && activityLocal.LastEntry == lastSynced {
+			// Local activity equals what we last synced, nothing has changed
+			// No need to make HTTP request to check pivot activity
+			return nil
+		}
+	}
+
+	if !s.mu.TryLock() {
+		return nil
+	}
+
+	// Perform sync with cache update
+	err := s.pullKeyWithCacheUpdate([]Key{*matchingKey})
 	s.mu.Unlock()
 
 	// Process any queued per-key operations
@@ -569,8 +604,66 @@ func (s *syncer) TryPullKey(keyPath string) error {
 	return err
 }
 
+// pullKeyWithCacheUpdate syncs from pivot and updates the activity cache.
+// Caller must hold s.mu lock.
+func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
+	update := false
+	for _, _key := range keys {
+		baseKey := strings.Replace(_key.Path, "/*", "", 1)
+		activityPivot, err := checkPivotActivity(s.client, s.pivot, baseKey)
+		if err != nil {
+			continue
+		}
+		activityLocal, err := checkActivity(_key)
+		if err != nil {
+			continue
+		}
+
+		// Update cache with pivot's current activity
+		s.activityMu.Lock()
+		s.lastSyncedActivity[baseKey] = activityPivot.LastEntry
+		s.activityMu.Unlock()
+
+		// Only sync if pivot has newer data
+		if activityPivot.LastEntry > activityLocal.LastEntry {
+			if err := syncLocalEntriesWithTracking(s.client, s.pivot, _key, activityPivot.LastEntry,
+				s.tracker.trackDelete, s.tracker.trackSet, nil); err == nil {
+				update = true
+			}
+		}
+	}
+	if update {
+		return nil
+	}
+	return errors.New("nothing to synchronize")
+}
+
+// InvalidateCache clears the activity cache for a key, forcing next read to check pivot.
+// Called when we know pivot has new data (e.g., TriggerNodeSync received).
+func (s *syncer) InvalidateCache(keyPath string) {
+	baseKey := strings.Replace(keyPath, "/*", "", 1)
+	s.activityMu.Lock()
+	delete(s.lastSyncedActivity, baseKey)
+	s.activityMu.Unlock()
+}
+
+// InvalidateAllCache clears all cached activity, forcing next reads to check pivot.
+func (s *syncer) InvalidateAllCache() {
+	s.activityMu.Lock()
+	s.lastSyncedActivity = make(map[string]int64)
+	s.activityMu.Unlock()
+}
+
 // PullKey syncs a specific key FROM pivot (blocking - waits for lock)
+// This is called by TriggerNodeSync when pivot has new data.
 func (s *syncer) PullKey(keyPath string) error {
+	// Mark key as connected and invalidate cache since pivot is telling us it has new data
+	baseKey := strings.Replace(keyPath, "/*", "", 1)
+	s.activityMu.Lock()
+	s.connected[baseKey] = true
+	delete(s.lastSyncedActivity, baseKey)
+	s.activityMu.Unlock()
+
 	s.mu.Lock()
 	// Find the matching key configuration
 	var matchingKeys []Key
@@ -584,10 +677,7 @@ func (s *syncer) PullKey(keyPath string) error {
 		s.mu.Unlock()
 		return nil
 	}
-	err := pullFromPivotWithTracking(s.client, s.pivot, matchingKeys,
-		s.tracker.trackDelete,
-		s.tracker.trackSet,
-		nil)
+	err := s.pullKeyWithCacheUpdate(matchingKeys)
 	s.mu.Unlock()
 
 	// Process any queued per-key operations
