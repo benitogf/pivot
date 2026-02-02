@@ -213,10 +213,14 @@ func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) e
 		opts.NoBroadcastKeys = userOpts.NoBroadcastKeys
 		opts.AfterWrite = userOpts.AfterWrite
 		opts.Workers = userOpts.Workers
-		// Always use our BeforeRead for sync-on-read
 	}
-	// Only start if not already active - avoids corrupting already-started storage
-	if !db.Active() {
+
+	if db.Active() {
+		// Storage already started - use SetBeforeRead to update callback safely
+		// This works for both memory-only and embedded storage
+		db.SetBeforeRead(i.BeforeRead)
+	} else {
+		// Storage not started - start it with BeforeRead configured
 		err := db.Start(opts)
 		if err != nil {
 			return err
