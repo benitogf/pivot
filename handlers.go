@@ -77,7 +77,8 @@ func GetSingle(db storage.Database, path string) func(w http.ResponseWriter, r *
 
 // Set set data on the pivot instance
 // originatorTracker is used to track which node originated the change (for pivot servers)
-func Set(db storage.Database, path string, originatorTracker *OriginatorTracker) func(w http.ResponseWriter, r *http.Request) {
+// vvManager is the version vector manager for pivot servers (nil for nodes)
+func Set(db storage.Database, path string, originatorTracker *OriginatorTracker, vvManager *VVManager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		decoded, err := meta.DecodeFromReader(r.Body)
 		if err != nil {
@@ -93,6 +94,10 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker)
 		if originatorTracker != nil {
 			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
 		}
+		// Increment version vector on pivot before storage write
+		if vvManager != nil {
+			vvManager.Increment(itemKey)
+		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -104,7 +109,8 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker)
 
 // Delete delete data on the pivot instance
 // originatorTracker is used to track which node originated the change (for pivot servers)
-func Delete(db storage.Database, path string, originatorTracker *OriginatorTracker) func(w http.ResponseWriter, r *http.Request) {
+// vvManager is the version vector manager for pivot servers (nil for nodes)
+func Delete(db storage.Database, path string, originatorTracker *OriginatorTracker, vvManager *VVManager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		index := mux.Vars(r)["index"]
 		time := mux.Vars(r)["time"]
@@ -120,6 +126,10 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		if originatorTracker != nil {
 			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
 		}
+		// Increment version vector on pivot before storage write
+		if vvManager != nil {
+			vvManager.Increment(itemKey)
+		}
 		err := db.Del(itemKey)
 		db.Set(StoragePrefix+path, json.RawMessage(time))
 		if err != nil {
@@ -131,13 +141,18 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 }
 
 // Activity route to get activity info from the pivot instance
-func Activity(_key Key) func(w http.ResponseWriter, r *http.Request) {
+// vvManager is the version vector manager for pivot servers (nil for nodes)
+func Activity(_key Key, vvManager *VVManager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if _key.Database == nil || !_key.Database.Active() {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		activity, _ := checkActivity(_key)
+		// Include version vector if available (pivot servers)
+		if vvManager != nil {
+			activity.VV = vvManager.Get(_key.Path)
+		}
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(activity)
 	}

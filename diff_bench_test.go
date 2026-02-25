@@ -10,7 +10,7 @@ import (
 
 func generateObjects(n int) []meta.Object {
 	objs := make([]meta.Object, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		objs[i] = meta.Object{
 			Index:   fmt.Sprintf("item_%d", i),
 			Created: int64(i),
@@ -23,7 +23,7 @@ func generateObjects(n int) []meta.Object {
 
 func generateObjectsWithOffset(n, offset int) []meta.Object {
 	objs := make([]meta.Object, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		objs[i] = meta.Object{
 			Index:   fmt.Sprintf("item_%d", i+offset),
 			Created: int64(i + offset),
@@ -136,7 +136,7 @@ func BenchmarkGetEntriesPositiveDiff_AllUpdated(b *testing.B) {
 	dst := generateObjects(1000)
 	// Same indices but updated timestamps
 	src := make([]meta.Object, 1000)
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		src[i] = meta.Object{
 			Index:   fmt.Sprintf("item_%d", i),
 			Created: int64(i),

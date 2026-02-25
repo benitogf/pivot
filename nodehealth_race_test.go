@@ -25,7 +25,7 @@ import (
 //
 // Run with: go test -race -run TestRace_BackgroundHealthCheck_StorageInit
 func TestRace_BackgroundHealthCheck_StorageInit(t *testing.T) {
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		server := &ooo.Server{}
 		server.Silence = true
 		server.Static = true
@@ -127,7 +127,7 @@ func TestRace_NodeHealth_StopWaitsForGoroutine(t *testing.T) {
 //
 // Run with: go test -race -run TestRace_NodeHealth_RapidStartStop
 func TestRace_NodeHealth_RapidStartStop(t *testing.T) {
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		nh := pivot.NewNodeHealth(nil)
 
 		var callCount atomic.Int32
@@ -153,7 +153,7 @@ func TestRace_NodeHealth_RapidStartStop(t *testing.T) {
 //
 // Run with: go test -race -run TestRace_PivotServer_RapidStartStop
 func TestRace_PivotServer_RapidStartStop(t *testing.T) {
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		server := &ooo.Server{}
 		server.Silence = true
 		server.Static = true
@@ -192,7 +192,7 @@ func TestRace_ConcurrentHealthAccess(t *testing.T) {
 	done := make(chan struct{})
 
 	// Concurrent readers
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -210,14 +210,17 @@ func TestRace_ConcurrentHealthAccess(t *testing.T) {
 	}
 
 	// Concurrent writers
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			node := "node1:8080"
-			if id == 1 {
+			var node string
+			switch id {
+			case 0:
+				node = "node1:8080"
+			case 1:
 				node = "node2:8080"
-			} else if id == 2 {
+			case 2:
 				node = "node3:8080"
 			}
 			for {
