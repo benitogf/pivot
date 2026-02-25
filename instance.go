@@ -2,6 +2,7 @@ package pivot
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/storage"
@@ -31,9 +32,11 @@ type Instance struct {
 	GetNodes       func() []string               // Function to get registered nodes (only for pivot servers)
 	PivotHealth    map[string]*PivotHealthStatus // Health status per pivot URL (for node servers)
 	ExtraNodeURLs  []string                      // Additional node URLs (can be modified after Setup)
+	VVManager      *VVManager                    // Version vector manager (for both pivot and node servers)
 	syncerPool     *syncerPool                   // Internal syncer pool for node servers (for testing hooks)
 	healthMu       sync.RWMutex                  // Protects PivotHealth map
 	extraNodeURLMu sync.RWMutex                  // Protects ExtraNodeURLs
+	shutdown       int32                         // Atomic flag to prevent access during shutdown
 }
 
 // AddExtraNodeURL adds a node URL to receive sync notifications (for cluster leader servers).
@@ -50,6 +53,16 @@ func (i *Instance) GetExtraNodeURLs() []string {
 	result := make([]string, len(i.ExtraNodeURLs))
 	copy(result, i.ExtraNodeURLs)
 	return result
+}
+
+// Shutdown marks the instance as shutting down to prevent access during close.
+func (i *Instance) Shutdown() {
+	atomic.StoreInt32(&i.shutdown, 1)
+}
+
+// IsShutdown returns true if the instance is shutting down.
+func (i *Instance) IsShutdown() bool {
+	return atomic.LoadInt32(&i.shutdown) != 0
 }
 
 // SetAfterPull sets a callback that fires after each Pull operation completes.
@@ -105,7 +118,7 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 		// Build node status list - only for pivot servers
 		var nodes []ui.PivotNodeStatus
 
-		if role == "pivot" {
+		if role == "pivot" || role == "mixed" {
 			// First, get nodes from GetNodes function (reads from storage)
 			if instance.GetNodes != nil {
 				registeredNodes := instance.GetNodes()

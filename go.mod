@@ -6,7 +6,7 @@ require (
 	github.com/benitogf/auth v0.0.0-20260109062751-db0dd7187682
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec
 	github.com/benitogf/ko v0.0.0-20260211072652-d48fcf4f8988
-	github.com/benitogf/ooo v0.0.0-20260223094437-4fd9da0f47eb
+	github.com/benitogf/ooo v0.0.0-20260225041933-aad9f9448529
 	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/mux v1.8.1
 	github.com/stretchr/testify v1.11.1

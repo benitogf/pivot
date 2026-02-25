@@ -12,9 +12,12 @@ import (
 	"github.com/benitogf/ooo/storage"
 )
 
-// ActivityEntry keeps the time of the last entry
+// ActivityEntry keeps the time of the last entry and the version vector.
+// VV (Version Vector) is the authoritative sync indicator when available.
+// LastEntry is used as fallback for backward compatibility with old nodes.
 type ActivityEntry struct {
-	LastEntry int64 `json:"lastEntry"`
+	LastEntry int64         `json:"lastEntry"`
+	VV        VersionVector `json:"vv,omitempty"`
 }
 
 func lastActivity(objs []meta.Object) int64 {

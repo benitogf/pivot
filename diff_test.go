@@ -193,10 +193,10 @@ func TestGetEntriesNegativeDiff_LargeList(t *testing.T) {
 	dst := make([]meta.Object, 1000)
 	src := make([]meta.Object, 500)
 
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		dst[i] = meta.Object{Index: string(rune('a' + i)), Created: int64(i), Updated: int64(i)}
 	}
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		src[i] = meta.Object{Index: string(rune('a' + i*2)), Created: int64(i * 2), Updated: int64(i * 2)}
 	}
 
@@ -209,10 +209,10 @@ func TestGetEntriesPositiveDiff_LargeList(t *testing.T) {
 	dst := make([]meta.Object, 500)
 	src := make([]meta.Object, 1000)
 
-	for i := 0; i < 500; i++ {
+	for i := range 500 {
 		dst[i] = meta.Object{Index: string(rune('a' + i)), Created: int64(i), Updated: int64(i)}
 	}
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		src[i] = meta.Object{Index: string(rune('a' + i)), Created: int64(i), Updated: int64(i + 1)}
 	}
 

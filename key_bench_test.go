@@ -61,7 +61,7 @@ func BenchmarkFindKeyStorage_FiveKeys_NoMatch(b *testing.B) {
 
 func BenchmarkFindKeyStorage_TwentyKeys(b *testing.B) {
 	keys := make([]pivot.Key, 20)
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		keys[i] = pivot.Key{Path: fmt.Sprintf("path%d/*", i), Database: nil}
 	}
 	b.ResetTimer()

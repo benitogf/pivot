@@ -95,6 +95,12 @@ func syncLocalEntriesWithTracking(client *http.Client, pivot string, _key Key, l
 			return nil
 		}
 	}
+	// Check if local data exists and is up-to-date (skip write if timestamps match)
+	localObj, localErr := _key.Database.Get(_key.Path)
+	if localErr == nil && localObj.Updated >= obj.Updated {
+		// Local data is same or newer - no need to write
+		return nil
+	}
 	// Track BEFORE set so storage callback can skip this event
 	if onSet != nil {
 		onSet(_key.Path)
@@ -223,6 +229,7 @@ func synchronizeItemWithTracking(client *http.Client, pivot string, key Key, isR
 	}
 
 	// sync local to pivot (includes sending deletes for items deleted locally)
+	// Uses timestamp comparison - sequence-based sync is handled by syncer.pullKeyWithCacheUpdate
 	if activityLocal.LastEntry > activityPivot.LastEntry {
 		// Pass pivot's activity and delete check so syncPivotEntries can determine if items are new or deleted
 		err := syncPivotEntriesWithDeleteCheck(client, pivot, key, activityPivot.LastEntry, isRecentDelete, originator)
@@ -267,6 +274,8 @@ func synchronizeKeysWithTracking(client *http.Client, pivot string, keys []Key, 
 }
 
 // pullFromPivotWithTracking syncs FROM pivot and tracks synced keys.
+// Uses timestamp-based comparison (this function doesn't have access to sequence cache).
+// For sequence-based sync, use syncer.pullKeyWithCacheUpdate instead.
 // onDelete is called for each key deleted locally, onSet is called for each key set locally.
 // skipSet is called before setting a key - if it returns true, the set is skipped (for locally deleted keys).
 func pullFromPivotWithTracking(client *http.Client, pivot string, keys []Key, onDelete func(key string), onSet func(key string), skipSet func(key string) bool) error {
@@ -281,7 +290,7 @@ func pullFromPivotWithTracking(client *http.Client, pivot string, keys []Key, on
 		if err != nil {
 			continue
 		}
-		// Only sync if pivot has newer data
+		// Only sync if pivot has newer data (timestamp comparison)
 		if activityPivot.LastEntry > activityLocal.LastEntry {
 			if err := syncLocalEntriesWithTracking(client, pivot, _key, activityPivot.LastEntry, onDelete, onSet, skipSet); err == nil {
 				update = true
@@ -368,9 +377,16 @@ type syncer struct {
 	queue     []pendingOp // Per-key operations queued during Pull
 	AfterPull func()      // Optional callback after Pull completes (for testing)
 
+	// Version vector cache: tracks last synced pivot VV per key.
+	// This is the primary sync indicator, independent of system clocks.
+	// VV comparison is used when pivot returns a non-nil VV.
+	vvMu         sync.RWMutex
+	lastSyncedVV map[string]VersionVector // baseKey -> last known pivot VV after sync
+
 	// Activity cache: tracks last synced pivot activity per key to skip HTTP requests
 	// when local activity hasn't changed since last sync.
 	// Only used after receiving at least one TriggerNodeSync (connected flag is true).
+	// Fallback when pivot doesn't support sequences (backward compatibility).
 	activityMu         sync.RWMutex
 	lastSyncedActivity map[string]int64 // baseKey -> last known pivot LastEntry after sync
 	connected          map[string]bool  // baseKey -> true if we've received TriggerNodeSync for this key
@@ -383,6 +399,7 @@ func newSyncer(client *http.Client, pivot string, keys []Key) *syncer {
 		pivot:              pivot,
 		keys:               keys,
 		queue:              make([]pendingOp, 0),
+		lastSyncedVV:       make(map[string]VersionVector),
 		lastSyncedActivity: make(map[string]int64),
 		connected:          make(map[string]bool),
 	}
@@ -604,7 +621,9 @@ func (s *syncer) TryPullKey(keyPath string) error {
 	return err
 }
 
-// pullKeyWithCacheUpdate syncs from pivot and updates the activity cache.
+// pullKeyWithCacheUpdate syncs from pivot and updates the VV/activity cache.
+// Uses version vector comparison when pivot supports it (VV is non-nil).
+// Falls back to timestamp-based comparison for backward compatibility.
 // Caller must hold s.mu lock.
 func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 	update := false
@@ -614,18 +633,48 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 		if err != nil {
 			continue
 		}
-		activityLocal, err := checkActivity(_key)
-		if err != nil {
-			continue
+
+		// Determine if sync is needed using version vector or timestamp
+		needSync := false
+		s.vvMu.RLock()
+		localVV, hasLocalVV := s.lastSyncedVV[baseKey]
+		s.vvMu.RUnlock()
+
+		if len(activityPivot.VV) > 0 && hasLocalVV {
+			// Version vector comparison (preferred, clock-independent)
+			// Compare pivot's VV with our last synced VV
+			switch localVV.Compare(activityPivot.VV) {
+			case VVLess:
+				// Local is behind pivot - need to sync
+				needSync = true
+			case VVConcurrent:
+				// Conflict detected - log and sync (last-sync-wins)
+				LogConflict(baseKey, localVV, activityPivot.VV, "last-sync-wins: accepting pivot data")
+				needSync = true
+			}
+			// VVEqual or VVGreater means no sync needed
+		} else {
+			// Fallback: timestamp-based comparison
+			// Used for backward compatibility and first sync (before we have local VV)
+			activityLocal, err := checkActivity(_key)
+			if err != nil {
+				continue
+			}
+			needSync = activityPivot.LastEntry > activityLocal.LastEntry
 		}
 
-		// Update cache with pivot's current activity
+		// Update caches with pivot's current values
+		if len(activityPivot.VV) > 0 {
+			s.vvMu.Lock()
+			s.lastSyncedVV[baseKey] = activityPivot.VV.Clone()
+			s.vvMu.Unlock()
+		}
 		s.activityMu.Lock()
 		s.lastSyncedActivity[baseKey] = activityPivot.LastEntry
 		s.activityMu.Unlock()
 
-		// Only sync if pivot has newer data
-		if activityPivot.LastEntry > activityLocal.LastEntry {
+		// Sync if pivot has newer data
+		if needSync {
 			if err := syncLocalEntriesWithTracking(s.client, s.pivot, _key, activityPivot.LastEntry,
 				s.tracker.trackDelete, s.tracker.trackSet, nil); err == nil {
 				update = true
@@ -638,17 +687,23 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 	return errors.New("nothing to synchronize")
 }
 
-// InvalidateCache clears the activity cache for a key, forcing next read to check pivot.
+// InvalidateCache clears the VV and activity cache for a key, forcing next read to check pivot.
 // Called when we know pivot has new data (e.g., TriggerNodeSync received).
 func (s *syncer) InvalidateCache(keyPath string) {
 	baseKey := strings.Replace(keyPath, "/*", "", 1)
+	s.vvMu.Lock()
+	delete(s.lastSyncedVV, baseKey)
+	s.vvMu.Unlock()
 	s.activityMu.Lock()
 	delete(s.lastSyncedActivity, baseKey)
 	s.activityMu.Unlock()
 }
 
-// InvalidateAllCache clears all cached activity, forcing next reads to check pivot.
+// InvalidateAllCache clears all cached VV and activity, forcing next reads to check pivot.
 func (s *syncer) InvalidateAllCache() {
+	s.vvMu.Lock()
+	s.lastSyncedVV = make(map[string]VersionVector)
+	s.vvMu.Unlock()
 	s.activityMu.Lock()
 	s.lastSyncedActivity = make(map[string]int64)
 	s.activityMu.Unlock()
@@ -657,8 +712,11 @@ func (s *syncer) InvalidateAllCache() {
 // PullKey syncs a specific key FROM pivot (blocking - waits for lock)
 // This is called by TriggerNodeSync when pivot has new data.
 func (s *syncer) PullKey(keyPath string) error {
-	// Mark key as connected and invalidate cache since pivot is telling us it has new data
+	// Mark key as connected and invalidate caches since pivot is telling us it has new data
 	baseKey := strings.Replace(keyPath, "/*", "", 1)
+	s.vvMu.Lock()
+	delete(s.lastSyncedVV, baseKey)
+	s.vvMu.Unlock()
 	s.activityMu.Lock()
 	s.connected[baseKey] = true
 	delete(s.lastSyncedActivity, baseKey)
@@ -891,7 +949,10 @@ func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _
 		}
 
 		if isPivotForKey {
-			// This server IS pivot for this key - notify all nodes asynchronously
+			// This server IS pivot for this key - increment VV and notify all nodes asynchronously
+			if instance != nil && instance.VVManager != nil {
+				instance.VVManager.Increment(event.Key)
+			}
 			// Get and clear the originator for this key (set by handler before storage write)
 			var originator string
 			if originatorTracker != nil {
@@ -919,7 +980,10 @@ func makeStorageSync(client *http.Client, configClusterURL string, keys []Key, _
 				}(node, matchedKeyConfig.Path)
 			}
 		} else {
-			// This server is node for this key - sync to the appropriate pivot
+			// This server is node for this key - increment local VV and sync to pivot
+			if instance != nil && instance.VVManager != nil {
+				instance.VVManager.Increment(event.Key)
+			}
 			if pool != nil {
 				s := pool.syncers[effectiveClusterURL]
 				if s != nil {

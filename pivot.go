@@ -127,6 +127,10 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 // Only returns entries with a non-zero port - these are actual node servers.
 func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNodes {
 	return func() []string {
+		// Check shutdown flag to avoid race with server.Close()
+		if instance.IsShutdown() {
+			return nil
+		}
 		// Start with extra node URLs (e.g., auth servers not in nodesKey)
 		extraURLs := instance.GetExtraNodeURLs()
 		result := make([]string, 0, len(extraURLs))
@@ -334,11 +338,23 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	pool := newSyncerPool(client, keys, pivotURL)
 
 	// Create node health tracker
+	// NodeHealth is needed if server is pivot for ANY key (pure pivot or mixed role)
+	hasPivotKeys := false
+	for _, k := range keys {
+		if k.EffectiveClusterURL(pivotURL) == "" {
+			hasPivotKeys = true
+			break
+		}
+	}
 	var nodeHealth *NodeHealth
-	if pivotURL == "" {
+	if hasPivotKeys {
 		nodeHealth = NewNodeHealth(client)
 		// Broadcast health changes
 		nodeHealth.SetOnHealthChange(func() {
+			// Check shutdown flag to avoid broadcasting after stream is closed
+			if instance.IsShutdown() {
+				return
+			}
 			info := GetPivotInfo(server)()
 			data, _ := json.Marshal(info)
 			now := time.Now().UTC().UnixNano()
@@ -385,10 +401,26 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	})
 
 	// Create originator tracker for pivot servers to skip TriggerNodeSync back to originating node
+	// Create version vector manager for all servers (pivot uses LeaderID, nodes use their address)
 	var originatorTracker *OriginatorTracker
+	var vvManager *VVManager
 	if pivotURL == "" {
 		originatorTracker = NewOriginatorTracker()
+		vvManager = NewVVManager(server.Storage, LeaderID)
+	} else {
+		// Node servers: VVManager will be initialized with node address once server starts
+		// For now create with empty ID, will be set via SetNodeID later
+		vvManager = NewVVManager(server.Storage, "")
 	}
+	instance.VVManager = vvManager
+
+	// Shutdown instance and VVManager before storage closes to prevent race conditions
+	server.RegisterPreClose(func() {
+		instance.Shutdown()
+		if vvManager != nil {
+			vvManager.Shutdown()
+		}
+	})
 
 	syncCallback := makeStorageSync(client, pivotURL, keys, getNodes, pool, nodeHealth, originatorTracker, instance)
 
@@ -407,13 +439,13 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	server.Router.HandleFunc(RoutePrefix+"/version", VersionHandler()).Methods("GET")
 	for _, k := range keys {
 		baseKey := strings.Replace(k.Path, "/*", "", 1)
-		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k)).Methods("GET")
+		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k, vvManager)).Methods("GET")
 		if baseKey != k.Path {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, originatorTracker)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, originatorTracker, vvManager)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker, vvManager)).Methods("DELETE")
 		} else {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, originatorTracker)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, originatorTracker, vvManager)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker, vvManager)).Methods("DELETE")
 		}
 		// Expose GET routes for all synced keys
 		if baseKey != k.Path {
@@ -476,9 +508,12 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 			if existingOnStart != nil {
 				existingOnStart()
 			}
-			// Set node address for originator tracking
+			// Set node address for originator tracking and VV manager
 			if pool != nil {
 				pool.SetNodeAddr(server.Address)
+			}
+			if vvManager != nil && vvManager.GetNodeID() == "" {
+				vvManager.SetNodeID(server.Address)
 			}
 			// Start health check goroutine (after Stream is initialized)
 			healthCheckWg.Add(1)
