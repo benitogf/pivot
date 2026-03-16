@@ -82,10 +82,11 @@ func createBenchNodeServer(pivotAddress string) *ooo.Server {
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:       []pivot.Key{{Path: "settings"}},
-		NodesKey:   "things/*",
-		ClusterURL: pivotAddress,
-		Client:     benchClient(),
+		Keys:                []pivot.Key{{Path: "settings"}},
+		NodesKey:            "things/*",
+		ClusterURL:          pivotAddress,
+		Client:              benchClient(),
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 	pivot.Setup(server, config)
 
@@ -304,10 +305,11 @@ func createBenchNodeServerWithWaiter(pivotAddress string, waiter *eventWaiter) *
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:       []pivot.Key{{Path: "settings"}},
-		NodesKey:   "things/*",
-		ClusterURL: pivotAddress,
-		Client:     benchClient(),
+		Keys:                []pivot.Key{{Path: "settings"}},
+		NodesKey:            "things/*",
+		ClusterURL:          pivotAddress,
+		Client:              benchClient(),
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 	pivot.Setup(server, config)
 

@@ -111,7 +111,7 @@ func TestSyncOnRead(t *testing.T) {
 	nodeServer := createEdgeTestServerNoSync(pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
-	pivotCfg := ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: pivotServer.Address}
+	pivotCfg := ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: pivotServer.Address}
 
 	// Write to pivot via HTTP (bypasses node notification since node isn't registered yet)
 	// This simulates pivot having data that node doesn't know about
@@ -160,9 +160,9 @@ func createEdgeTestServer(pivotIP string, nodeStorage storage.Database) (*ooo.Se
 	}
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
-			Dial:              (&net.Dialer{Timeout: 5 * time.Second}).Dial,
+			Dial:              (&net.Dialer{Timeout: 500 * time.Millisecond}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
 		},
@@ -170,9 +170,10 @@ func createEdgeTestServer(pivotIP string, nodeStorage storage.Database) (*ooo.Se
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:       []pivot.Key{{Path: "settings"}},
-		NodesKey:   "things/*",
-		ClusterURL: pivotIP,
+		Keys:                []pivot.Key{{Path: "settings"}},
+		NodesKey:            "things/*",
+		ClusterURL:          pivotIP,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
@@ -202,9 +203,9 @@ func createEdgeTestServerNoSync(pivotIP string) *ooo.Server {
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
-			Dial:              (&net.Dialer{Timeout: 5 * time.Second}).Dial,
+			Dial:              (&net.Dialer{Timeout: 500 * time.Millisecond}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
 		},
@@ -212,9 +213,10 @@ func createEdgeTestServerNoSync(pivotIP string) *ooo.Server {
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:       []pivot.Key{{Path: "settings"}},
-		NodesKey:   "things/*",
-		ClusterURL: pivotIP,
+		Keys:                []pivot.Key{{Path: "settings"}},
+		NodesKey:            "things/*",
+		ClusterURL:          pivotIP,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)

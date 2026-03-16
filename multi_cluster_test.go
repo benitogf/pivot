@@ -41,10 +41,10 @@ type ClusterDevice struct {
 
 func clusterTestClient() *http.Client {
 	return &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -373,7 +373,7 @@ func addPolicyEndpoints(server *ooo.Server, policyStorage storage.Database) {
 // MultiClusterAuthServer creates the authentication server:
 // - IS pivot for users/* and policies (Local=true) - accessed via custom endpoints
 // - IS node for devices/* (syncs from deviceClusterURL) - accessed via OpenFilter
-func MultiClusterAuthServer(t *testing.T, deviceClusterURL string, afterAuthWrite func(key string)) *ooo.Server {
+func MultiClusterAuthServer(t *testing.T, deviceClusterURL string, afterAuthWrite func(key string), afterDeviceWrite func(key string)) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -394,11 +394,23 @@ func MultiClusterAuthServer(t *testing.T, deviceClusterURL string, afterAuthWrit
 			{Path: "policies", Database: authStorage, Local: true},
 			{Path: "devices/*"},
 		},
-		NodesKey:   "devices/*",
-		ClusterURL: deviceClusterURL,
+		NodesKey:            "devices/*",
+		ClusterURL:          deviceClusterURL,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
+
+	// Wrap OnStorageEvent to signal WaitGroup for devices/*
+	originalCallback := server.OnStorageEvent
+	server.OnStorageEvent = func(event storage.Event) {
+		if originalCallback != nil {
+			originalCallback(event)
+		}
+		if strings.HasPrefix(event.Key, "devices/") && afterDeviceWrite != nil {
+			afterDeviceWrite(event.Key)
+		}
+	}
 
 	// Attach auth storage with AfterWrite callback for test synchronization
 	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterAuthWrite})
@@ -418,7 +430,7 @@ func MultiClusterAuthServer(t *testing.T, deviceClusterURL string, afterAuthWrit
 // MultiClusterDevicePivot creates the device pivot server:
 // - IS pivot for devices/* - accessed via OpenFilter
 // Use AddExtraNodeURL after creation to add auth servers that should receive sync notifications
-func MultiClusterDevicePivot(t *testing.T) *ooo.Server {
+func MultiClusterDevicePivot(t *testing.T, afterDeviceWrite func(key string)) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -436,6 +448,18 @@ func MultiClusterDevicePivot(t *testing.T) *ooo.Server {
 	}
 
 	pivot.Setup(server, config)
+
+	// Wrap OnStorageEvent to signal WaitGroup for devices/*
+	originalCallback := server.OnStorageEvent
+	server.OnStorageEvent = func(event storage.Event) {
+		if originalCallback != nil {
+			originalCallback(event)
+		}
+		if strings.HasPrefix(event.Key, "devices/") && afterDeviceWrite != nil {
+			afterDeviceWrite(event.Key)
+		}
+	}
+
 	server.OpenFilter("devices/*")
 	server.Start("localhost:0")
 	return server
@@ -444,7 +468,7 @@ func MultiClusterDevicePivot(t *testing.T) *ooo.Server {
 // MultiClusterNodeDevice creates a node device:
 // - IS node for users/* and policies (syncs from authServerURL) - accessed via custom endpoints
 // - IS node for devices/* (syncs from deviceClusterURL) - accessed via OpenFilter
-func MultiClusterNodeDevice(t *testing.T, authServerURL string, deviceClusterURL string, afterAuthWrite func(key string)) *ooo.Server {
+func MultiClusterNodeDevice(t *testing.T, authServerURL string, deviceClusterURL string, afterAuthWrite func(key string), afterDeviceWrite func(key string)) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -465,11 +489,23 @@ func MultiClusterNodeDevice(t *testing.T, authServerURL string, deviceClusterURL
 			{Path: "policies", Database: authStorage, ClusterURL: authServerURL},
 			{Path: "devices/*"},
 		},
-		NodesKey:   "devices/*",
-		ClusterURL: deviceClusterURL,
+		NodesKey:            "devices/*",
+		ClusterURL:          deviceClusterURL,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
+
+	// Wrap OnStorageEvent to signal WaitGroup for devices/*
+	originalCallback := server.OnStorageEvent
+	server.OnStorageEvent = func(event storage.Event) {
+		if originalCallback != nil {
+			originalCallback(event)
+		}
+		if strings.HasPrefix(event.Key, "devices/") && afterDeviceWrite != nil {
+			afterDeviceWrite(event.Key)
+		}
+	}
 
 	// Attach auth storage with AfterWrite callback
 	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterAuthWrite})
@@ -487,7 +523,8 @@ func MultiClusterNodeDevice(t *testing.T, authServerURL string, deviceClusterURL
 }
 
 func testMultiClusterSync(t *testing.T, useRemote bool) {
-	var authWg, nodeWg sync.WaitGroup // Storage callbacks for auth data (users/policies)
+	var authWg, nodeWg sync.WaitGroup                            // Storage callbacks for auth data (users/policies)
+	var pivotDeviceWg, authDeviceWg, nodeDeviceWg sync.WaitGroup // Storage callbacks for devices/*
 
 	// Auth storage callbacks - only for users/* and policies
 	authAfterWrite := func(key string) {
@@ -506,12 +543,28 @@ func testMultiClusterSync(t *testing.T, useRemote bool) {
 		nodeWg.Done()
 	}
 
+	// Device callbacks for devices/*
+	pivotDeviceAfterWrite := func(key string) {
+		t.Logf("[devicePivot] device write: %s", key)
+		pivotDeviceWg.Done()
+	}
+
+	authDeviceAfterWrite := func(key string) {
+		t.Logf("[auth] device write: %s", key)
+		authDeviceWg.Done()
+	}
+
+	nodeDeviceAfterWrite := func(key string) {
+		t.Logf("[node] device write: %s", key)
+		nodeDeviceWg.Done()
+	}
+
 	// Create device pivot (IS cluster leader for devices/*)
-	devicePivot := MultiClusterDevicePivot(t)
+	devicePivot := MultiClusterDevicePivot(t, pivotDeviceAfterWrite)
 	defer devicePivot.Close(os.Interrupt)
 
 	// Create auth server (IS cluster leader for users/policies, IS node for devices)
-	authServer := MultiClusterAuthServer(t, devicePivot.Address, authAfterWrite)
+	authServer := MultiClusterAuthServer(t, devicePivot.Address, authAfterWrite, authDeviceAfterWrite)
 	defer authServer.Close(os.Interrupt)
 
 	// Add auth server to devicePivot's ExtraNodeURLs - auth receives sync notifications
@@ -528,7 +581,7 @@ func testMultiClusterSync(t *testing.T, useRemote bool) {
 	require.Contains(t, nodes, authServer.Address, "getNodes should include auth from ExtraNodeURLs")
 
 	// Create node device (IS node for users/policies from auth, IS node for devices from devicePivot)
-	nodeDevice := MultiClusterNodeDevice(t, authServer.Address, devicePivot.Address, nodeAfterWrite)
+	nodeDevice := MultiClusterNodeDevice(t, authServer.Address, devicePivot.Address, nodeAfterWrite, nodeDeviceAfterWrite)
 	defer nodeDevice.Close(os.Interrupt)
 
 	ops := &multiClusterTestOps{
@@ -538,36 +591,36 @@ func testMultiClusterSync(t *testing.T, useRemote bool) {
 		nodeDevice:  nodeDevice,
 	}
 	if useRemote {
-		ops.authCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: authServer.Address}
-		ops.devicePivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: devicePivot.Address}
-		ops.nodeCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: nodeDevice.Address}
+		ops.authCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: authServer.Address}
+		ops.devicePivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: devicePivot.Address}
+		ops.nodeCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: nodeDevice.Address}
 	}
 
 	// Register node device in devices/* (nodesKey)
 	nodeIP, nodePort, _ := net.SplitHostPort(nodeDevice.Address)
 	nodePortInt, _ := strconv.Atoi(nodePort)
 	t.Logf("Registering node-device to devicePivot")
-	nodeDeviceID, err := ooo.Push(devicePivot, "devices/*", ClusterDevice{IP: nodeIP, Port: nodePortInt, Name: "node-device"})
+	// pivotDeviceWg: pivot writes, authDeviceWg: auth receives sync, nodeDeviceWg: node may receive sync
+	pivotDeviceWg.Add(1)
+	authDeviceWg.Add(1)
+	nodeDeviceWg.Add(1)
+	_, err := ooo.Push(devicePivot, "devices/*", ClusterDevice{IP: nodeIP, Port: nodePortInt, Name: "node-device"})
 	require.NoError(t, err)
-	// Wait for sync by polling auth
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("auth", nodeDeviceID)
-		return err == nil
-	}, 2*time.Second, 10*time.Millisecond, "node-device should sync to auth")
+	pivotDeviceWg.Wait()
+	authDeviceWg.Wait()
+	nodeDeviceWg.Wait()
 	t.Logf("node-device registered")
 
 	// Push sensor device - now node is registered in nodesKey
 	t.Logf("Pushing sensor1 to devicePivot")
+	// pivotDeviceWg: pivot writes, authDeviceWg: auth receives sync, nodeDeviceWg: node receives sync
+	pivotDeviceWg.Add(1)
+	authDeviceWg.Add(1)
+	nodeDeviceWg.Add(1)
 	deviceID := ops.pushDevice(t, true, ClusterDevice{IP: "10.0.0.100", Port: 9000, Name: "sensor1"})
-	// Wait for sync to all servers by polling
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("auth", deviceID)
-		return err == nil
-	}, 2*time.Second, 10*time.Millisecond, "sensor1 should sync to auth")
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("node", deviceID)
-		return err == nil
-	}, 2*time.Second, 10*time.Millisecond, "sensor1 should sync to node")
+	pivotDeviceWg.Wait()
+	authDeviceWg.Wait()
+	nodeDeviceWg.Wait()
 	t.Logf("sensor1 pushed")
 
 	// Verify device on pivot
@@ -583,16 +636,14 @@ func testMultiClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, "sensor1", nodeDeviceData.Name)
 
 	// === Test 2: Update device on devicePivot ===
+	// pivotDeviceWg: pivot writes, authDeviceWg: auth receives sync, nodeDeviceWg: node receives sync
+	pivotDeviceWg.Add(1)
+	authDeviceWg.Add(1)
+	nodeDeviceWg.Add(1)
 	ops.setDevice(t, true, deviceID, ClusterDevice{IP: "10.0.0.100", Port: 9000, Name: "sensor1-updated"})
-	// Wait for sync by polling
-	require.Eventually(t, func() bool {
-		d, err := ops.getDeviceSafe("auth", deviceID)
-		return err == nil && d.Name == "sensor1-updated"
-	}, 2*time.Second, 10*time.Millisecond, "sensor1-updated should sync to auth")
-	require.Eventually(t, func() bool {
-		d, err := ops.getDeviceSafe("node", deviceID)
-		return err == nil && d.Name == "sensor1-updated"
-	}, 2*time.Second, 10*time.Millisecond, "sensor1-updated should sync to node")
+	pivotDeviceWg.Wait()
+	authDeviceWg.Wait()
+	nodeDeviceWg.Wait()
 
 	pivotDevice = ops.getDevice(t, "devicePivot", deviceID)
 	require.Equal(t, "sensor1-updated", pivotDevice.Name)
@@ -655,29 +706,25 @@ func testMultiClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, 5, nodePolicy.MaxRetries)
 
 	// === Test 7: Delete device on devicePivot ===
+	// pivotDeviceWg: pivot deletes, authDeviceWg: auth receives delete sync, nodeDeviceWg: node receives delete sync
+	pivotDeviceWg.Add(1)
+	authDeviceWg.Add(1)
+	nodeDeviceWg.Add(1)
 	ops.deleteDevice(t, true, deviceID)
-	// Wait for delete sync by polling
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("auth", deviceID)
-		return err != nil
-	}, 2*time.Second, 10*time.Millisecond, "device should be deleted from auth")
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("node", deviceID)
-		return err != nil
-	}, 2*time.Second, 10*time.Millisecond, "device should be deleted from node")
+	pivotDeviceWg.Wait()
+	authDeviceWg.Wait()
+	nodeDeviceWg.Wait()
 	ops.getDeviceExpectError(t, "devicePivot", deviceID, "device should be deleted from devicePivot")
 
 	// === Test 8: Push device from node ===
+	// nodeDeviceWg: node writes, pivotDeviceWg: pivot receives sync, authDeviceWg: auth receives sync
+	nodeDeviceWg.Add(1)
+	pivotDeviceWg.Add(1)
+	authDeviceWg.Add(1)
 	deviceID2 := ops.pushDevice(t, false, ClusterDevice{IP: "10.0.0.2", Port: 9000, Name: "sensor2"})
-	// Wait for sync to pivot and auth by polling
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("devicePivot", deviceID2)
-		return err == nil
-	}, 2*time.Second, 10*time.Millisecond, "sensor2 should sync to pivot")
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("auth", deviceID2)
-		return err == nil
-	}, 2*time.Second, 10*time.Millisecond, "sensor2 should sync to auth")
+	nodeDeviceWg.Wait()
+	pivotDeviceWg.Wait()
+	authDeviceWg.Wait()
 	pivotDevice = ops.getDevice(t, "devicePivot", deviceID2)
 	require.Equal(t, "sensor2", pivotDevice.Name)
 
@@ -702,16 +749,14 @@ func testMultiClusterSync(t *testing.T, useRemote bool) {
 	ops.getPolicyExpectError(t, "node", "policy should be deleted from node")
 
 	// === Test 11: Clean up ===
+	// nodeDeviceWg: node deletes, pivotDeviceWg: pivot receives delete sync, authDeviceWg: auth receives delete sync
+	nodeDeviceWg.Add(1)
+	pivotDeviceWg.Add(1)
+	authDeviceWg.Add(1)
 	ops.deleteDevice(t, false, deviceID2)
-	// Wait for delete sync by polling
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("devicePivot", deviceID2)
-		return err != nil
-	}, 2*time.Second, 10*time.Millisecond, "sensor2 should be deleted from pivot")
-	require.Eventually(t, func() bool {
-		_, err := ops.getDeviceSafe("auth", deviceID2)
-		return err != nil
-	}, 2*time.Second, 10*time.Millisecond, "sensor2 should be deleted from auth")
+	nodeDeviceWg.Wait()
+	pivotDeviceWg.Wait()
+	authDeviceWg.Wait()
 }
 
 func TestMultiClusterSync_Local(t *testing.T) {
@@ -760,10 +805,10 @@ func TestMultiCluster_ValidationPanics(t *testing.T) {
 // TestMultiCluster_RoleDetection tests that GetPivotInfo correctly identifies roles
 func TestMultiCluster_RoleDetection(t *testing.T) {
 	t.Run("Mixed role - auth server", func(t *testing.T) {
-		devicePivot := MultiClusterDevicePivot(t)
+		devicePivot := MultiClusterDevicePivot(t, nil)
 		defer devicePivot.Close(os.Interrupt)
 
-		authServer := MultiClusterAuthServer(t, devicePivot.Address, nil)
+		authServer := MultiClusterAuthServer(t, devicePivot.Address, nil, nil)
 		defer authServer.Close(os.Interrupt)
 
 		info := pivot.GetPivotInfo(authServer)()
@@ -772,7 +817,7 @@ func TestMultiCluster_RoleDetection(t *testing.T) {
 	})
 
 	t.Run("Pure pivot role - device pivot", func(t *testing.T) {
-		devicePivot := MultiClusterDevicePivot(t)
+		devicePivot := MultiClusterDevicePivot(t, nil)
 		defer devicePivot.Close(os.Interrupt)
 
 		info := pivot.GetPivotInfo(devicePivot)()
@@ -781,13 +826,13 @@ func TestMultiCluster_RoleDetection(t *testing.T) {
 	})
 
 	t.Run("Pure node role - node device", func(t *testing.T) {
-		devicePivot := MultiClusterDevicePivot(t)
+		devicePivot := MultiClusterDevicePivot(t, nil)
 		defer devicePivot.Close(os.Interrupt)
 
-		authServer := MultiClusterAuthServer(t, devicePivot.Address, nil)
+		authServer := MultiClusterAuthServer(t, devicePivot.Address, nil, nil)
 		defer authServer.Close(os.Interrupt)
 
-		nodeDevice := MultiClusterNodeDevice(t, authServer.Address, devicePivot.Address, nil)
+		nodeDevice := MultiClusterNodeDevice(t, authServer.Address, devicePivot.Address, nil, nil)
 		defer nodeDevice.Close(os.Interrupt)
 
 		info := pivot.GetPivotInfo(nodeDevice)()

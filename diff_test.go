@@ -9,11 +9,13 @@ import (
 )
 
 func TestGetEntriesNegativeDiff_EmptyLists(t *testing.T) {
+	t.Parallel()
 	result := pivot.GetEntriesNegativeDiff([]meta.Object{}, []meta.Object{})
 	require.Len(t, result, 0)
 }
 
 func TestGetEntriesNegativeDiff_EmptySource(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -25,6 +27,7 @@ func TestGetEntriesNegativeDiff_EmptySource(t *testing.T) {
 }
 
 func TestGetEntriesNegativeDiff_EmptyDestination(t *testing.T) {
+	t.Parallel()
 	src := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -34,6 +37,7 @@ func TestGetEntriesNegativeDiff_EmptyDestination(t *testing.T) {
 }
 
 func TestGetEntriesNegativeDiff_IdenticalLists(t *testing.T) {
+	t.Parallel()
 	objs := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -44,6 +48,7 @@ func TestGetEntriesNegativeDiff_IdenticalLists(t *testing.T) {
 }
 
 func TestGetEntriesNegativeDiff_AllDeleted(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -61,6 +66,7 @@ func TestGetEntriesNegativeDiff_AllDeleted(t *testing.T) {
 }
 
 func TestGetEntriesNegativeDiff_PartialOverlap(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -77,11 +83,13 @@ func TestGetEntriesNegativeDiff_PartialOverlap(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_EmptyLists(t *testing.T) {
+	t.Parallel()
 	result := pivot.GetEntriesPositiveDiff([]meta.Object{}, []meta.Object{})
 	require.Len(t, result, 0)
 }
 
 func TestGetEntriesPositiveDiff_EmptySource(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -91,6 +99,7 @@ func TestGetEntriesPositiveDiff_EmptySource(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_EmptyDestination(t *testing.T) {
+	t.Parallel()
 	src := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -102,6 +111,7 @@ func TestGetEntriesPositiveDiff_EmptyDestination(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_IdenticalLists(t *testing.T) {
+	t.Parallel()
 	objs := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -112,6 +122,7 @@ func TestGetEntriesPositiveDiff_IdenticalLists(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_AllNew(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 	}
@@ -125,6 +136,7 @@ func TestGetEntriesPositiveDiff_AllNew(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_UpdatedEntries(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -142,6 +154,7 @@ func TestGetEntriesPositiveDiff_UpdatedEntries(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_MixedNewAndUpdated(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 1},
 		{Index: "b", Created: 2, Updated: 2},
@@ -165,6 +178,7 @@ func TestGetEntriesPositiveDiff_MixedNewAndUpdated(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_OlderSourceIgnored(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 10},
 		{Index: "b", Created: 2, Updated: 20},
@@ -178,6 +192,7 @@ func TestGetEntriesPositiveDiff_OlderSourceIgnored(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_SameTimestampIgnored(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "a", Created: 1, Updated: 10},
 	}
@@ -189,6 +204,7 @@ func TestGetEntriesPositiveDiff_SameTimestampIgnored(t *testing.T) {
 }
 
 func TestGetEntriesNegativeDiff_LargeList(t *testing.T) {
+	t.Parallel()
 	// Test with larger lists to ensure O(n) performance
 	dst := make([]meta.Object, 1000)
 	src := make([]meta.Object, 500)
@@ -205,6 +221,7 @@ func TestGetEntriesNegativeDiff_LargeList(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_LargeList(t *testing.T) {
+	t.Parallel()
 	// Test with larger lists to ensure O(n) performance
 	dst := make([]meta.Object, 500)
 	src := make([]meta.Object, 1000)
@@ -221,6 +238,7 @@ func TestGetEntriesPositiveDiff_LargeList(t *testing.T) {
 }
 
 func TestGetEntriesNegativeDiff_PreservesOrder(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{
 		{Index: "z", Created: 1, Updated: 1},
 		{Index: "y", Created: 2, Updated: 2},
@@ -237,6 +255,7 @@ func TestGetEntriesNegativeDiff_PreservesOrder(t *testing.T) {
 }
 
 func TestGetEntriesPositiveDiff_PreservesOrder(t *testing.T) {
+	t.Parallel()
 	dst := []meta.Object{}
 	src := []meta.Object{
 		{Index: "z", Created: 1, Updated: 1},

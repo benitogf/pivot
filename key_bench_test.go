@@ -12,7 +12,7 @@ func BenchmarkFindKeyStorage_SingleKey(b *testing.B) {
 		{Path: "users/*", Database: nil},
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		pivot.FindKeyStorage(keys, "users/123")
 	}
 }
@@ -26,7 +26,7 @@ func BenchmarkFindKeyStorage_FiveKeys_FirstMatch(b *testing.B) {
 		{Path: "settings", Database: nil},
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		pivot.FindKeyStorage(keys, "users/123")
 	}
 }
@@ -40,7 +40,7 @@ func BenchmarkFindKeyStorage_FiveKeys_LastMatch(b *testing.B) {
 		{Path: "settings", Database: nil},
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		pivot.FindKeyStorage(keys, "settings")
 	}
 }
@@ -54,7 +54,7 @@ func BenchmarkFindKeyStorage_FiveKeys_NoMatch(b *testing.B) {
 		{Path: "settings", Database: nil},
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		pivot.FindKeyStorage(keys, "unknown/path")
 	}
 }
@@ -65,7 +65,7 @@ func BenchmarkFindKeyStorage_TwentyKeys(b *testing.B) {
 		keys[i] = pivot.Key{Path: fmt.Sprintf("path%d/*", i), Database: nil}
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		pivot.FindKeyStorage(keys, "path15/item")
 	}
 }
@@ -75,7 +75,7 @@ func BenchmarkFindKeyStorage_SingleLevelPath(b *testing.B) {
 		{Path: "data/*", Database: nil},
 	}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		pivot.FindKeyStorage(keys, "data/item123")
 	}
 }
@@ -83,7 +83,7 @@ func BenchmarkFindKeyStorage_SingleLevelPath(b *testing.B) {
 func BenchmarkKey_MatchesIndex(b *testing.B) {
 	key := pivot.Key{Path: "users/*"}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key.MatchesIndex("users/123")
 	}
 }
@@ -91,7 +91,7 @@ func BenchmarkKey_MatchesIndex(b *testing.B) {
 func BenchmarkKey_IsGlobPattern_Glob(b *testing.B) {
 	key := pivot.Key{Path: "users/*"}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key.IsGlobPattern()
 	}
 }
@@ -99,7 +99,7 @@ func BenchmarkKey_IsGlobPattern_Glob(b *testing.B) {
 func BenchmarkKey_IsGlobPattern_Exact(b *testing.B) {
 	key := pivot.Key{Path: "config"}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key.IsGlobPattern()
 	}
 }
@@ -107,7 +107,7 @@ func BenchmarkKey_IsGlobPattern_Exact(b *testing.B) {
 func BenchmarkKey_BasePath_Glob(b *testing.B) {
 	key := pivot.Key{Path: "users/*"}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key.BasePath()
 	}
 }
@@ -115,7 +115,7 @@ func BenchmarkKey_BasePath_Glob(b *testing.B) {
 func BenchmarkKey_BasePath_Exact(b *testing.B) {
 	key := pivot.Key{Path: "config"}
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		key.BasePath()
 	}
 }

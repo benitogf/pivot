@@ -12,12 +12,14 @@ import (
 )
 
 func TestNodeHealth_IsHealthy_UnknownNode(t *testing.T) {
+	t.Parallel()
 	nh := pivot.NewNodeHealth(nil)
 	// Unknown nodes should NOT be healthy (WebSocket-based - must be connected)
 	require.False(t, nh.IsHealthy("unknown-node:8080"))
 }
 
 func TestNodeHealth_MarkHealthy(t *testing.T) {
+	t.Parallel()
 	nh := pivot.NewNodeHealth(nil)
 	node := "192.168.1.1:8080"
 
@@ -31,6 +33,7 @@ func TestNodeHealth_MarkHealthy(t *testing.T) {
 }
 
 func TestNodeHealth_MarkUnhealthy(t *testing.T) {
+	t.Parallel()
 	nh := pivot.NewNodeHealth(nil)
 	node := "192.168.1.1:8080"
 
@@ -44,6 +47,7 @@ func TestNodeHealth_MarkUnhealthy(t *testing.T) {
 }
 
 func TestNodeHealth_GetHealthyNodes(t *testing.T) {
+	t.Parallel()
 	nh := pivot.NewNodeHealth(nil)
 
 	nodes := []string{"node1:8080", "node2:8080", "node3:8080", "node4:8080"}

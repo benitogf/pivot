@@ -136,9 +136,8 @@ func TestHermitCrab(t *testing.T) {
 // When a specific key's ClusterURL changes, only that key's data should be wiped.
 func TestHermitCrabPerKey(t *testing.T) {
 	// Start a pivot server first to initialize the monotonic clock
-	pivotA, _ := startPivotServerWithDevices("")
+	pivotA := startPivotServerWithDevices("")
 	defer pivotA.Close(os.Interrupt)
-	t.Logf("Pivot A started at %s (initializes clock)", pivotA.Address)
 
 	// Create persistent storage for the node
 	nodeStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
@@ -146,39 +145,35 @@ func TestHermitCrabPerKey(t *testing.T) {
 	require.NoError(t, err)
 
 	// Phase 1: Create node with devices/* pointing to pivot-a
-	server1 := startNodeServerPerKey("http://"+pivotA.Address, "http://"+pivotA.Address, nodeStorage)
-	t.Log("Phase 1: Node started with both keys -> pivot-a")
+	server1 := startNodeServerPerKey(pivotA.Address, pivotA.Address, nodeStorage)
 
 	// Write data to both keys
 	_, err = ooo.Push(server1, "things/*", Thing{IP: "192.168.1.1", Port: 0, On: true})
 	require.NoError(t, err)
 	_, err = ooo.Push(server1, "devices/*", Thing{IP: "10.0.0.1", Port: 0, On: false})
 	require.NoError(t, err)
-	t.Log("Data written to both keys")
 
 	// Verify data exists
 	things, err := ooo.GetList[Thing](server1, "things/*")
 	require.NoError(t, err)
 	require.Equal(t, 1, len(things))
-
 	devices, err := ooo.GetList[Thing](server1, "devices/*")
 	require.NoError(t, err)
 	require.Equal(t, 1, len(devices))
-	t.Log("Verified data exists in both keys")
 
 	// Stop server1 (storage persists)
 	server1.Close(os.Interrupt)
-	t.Log("Server1 stopped")
 
 	// Restart storage
 	err = nodeStorage.Start(storage.Options{})
 	require.NoError(t, err)
 
-	// Phase 2: Create new node with devices/* pointing to pivot-b (changed!)
+	// Phase 2: Create new node with devices/* pointing to 127.0.0.1:9999 (changed!)
+	// Use a non-listening IP:port instead of fake hostname to avoid DNS timeout
 	// The global ClusterURL still points to pivot-a
-	server2 := startNodeServerPerKey("http://"+pivotA.Address, "http://pivot-b:8000", nodeStorage)
+	server2 := startNodeServerPerKey(pivotA.Address, "127.0.0.1:9999", nodeStorage)
 	defer server2.Close(os.Interrupt)
-	t.Log("Phase 2: Node started with devices/* -> pivot-b (changed)")
+	t.Log("Phase 2: Node started with devices/* -> 127.0.0.1:9999 (changed)")
 
 	// Verify things/* data still exists (global ClusterURL unchanged)
 	things, err = ooo.GetList[Thing](server2, "things/*")
@@ -203,10 +198,10 @@ func startNodeServerPerKey(globalPivotURL, devicesPivotURL string, nodeStorage s
 	server.Storage = nodeStorage
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -220,8 +215,11 @@ func startNodeServerPerKey(globalPivotURL, devicesPivotURL string, nodeStorage s
 		Keys: []pivot.Key{
 			{Path: "devices/*", ClusterURL: devicesPivotURL},
 		},
-		NodesKey:   "things/*",
-		ClusterURL: globalPivotURL,
+		NodesKey:            "things/*",
+		ClusterURL:          globalPivotURL,
+		Client:              server.Client, // Use same 500ms timeout for sync
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
@@ -232,18 +230,17 @@ func startNodeServerPerKey(globalPivotURL, devicesPivotURL string, nodeStorage s
 }
 
 // startPivotServerWithDevices creates a pivot server that also handles devices/*
-func startPivotServerWithDevices(pivotIP string) (*ooo.Server, *sync.WaitGroup) {
-	var wg sync.WaitGroup
+func startPivotServerWithDevices(pivotIP string) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -258,28 +255,21 @@ func startPivotServerWithDevices(pivotIP string) (*ooo.Server, *sync.WaitGroup) 
 			{Path: "settings"},
 			{Path: "devices/*"},
 		},
-		NodesKey:   "things/*",
-		ClusterURL: pivotIP,
+		NodesKey:            "things/*",
+		ClusterURL:          pivotIP,
+		Client:              server.Client,
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
-
-	originalCallback := server.OnStorageEvent
-	server.OnStorageEvent = func(event storage.Event) {
-		if originalCallback != nil {
-			originalCallback(event)
-		}
-		if strings.HasPrefix(event.Key, "things/") || strings.HasPrefix(event.Key, "devices/") || event.Key == "settings" {
-			wg.Done()
-		}
-	}
 
 	server.OpenFilter("things/*")
 	server.OpenFilter("devices/*")
 	server.OpenFilter("settings")
 
 	server.Start("localhost:0")
-	return server, &wg
+	return server
 }
 
 // startPivotServer creates a pivot server (empty pivotIP = this is the pivot)
@@ -292,10 +282,10 @@ func startPivotServer(pivotIP string) (*ooo.Server, *sync.WaitGroup) {
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -309,8 +299,11 @@ func startPivotServer(pivotIP string) (*ooo.Server, *sync.WaitGroup) {
 		Keys: []pivot.Key{
 			{Path: "settings"},
 		},
-		NodesKey:   "things/*",
-		ClusterURL: pivotIP,
+		NodesKey:            "things/*",
+		ClusterURL:          pivotIP,
+		Client:              server.Client,
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
@@ -344,10 +337,10 @@ func startNodeServer(pivotIP string, nodeStorage storage.Database) (*ooo.Server,
 	server.Storage = nodeStorage
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -361,8 +354,11 @@ func startNodeServer(pivotIP string, nodeStorage storage.Database) (*ooo.Server,
 		Keys: []pivot.Key{
 			{Path: "settings"},
 		},
-		NodesKey:   "things/*",
-		ClusterURL: pivotIP,
+		NodesKey:            "things/*",
+		ClusterURL:          pivotIP,
+		Client:              server.Client,
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)

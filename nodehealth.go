@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,27 +21,50 @@ type NodeHealth struct {
 	lastConnect    map[string]time.Time // node address -> last connection time
 	lastDisconnect map[string]time.Time // node address -> last disconnection time
 	protocol       map[string]string    // node address -> protocol version ("2.0", "unknown")
-	stopChan       chan struct{}
-	wg             sync.WaitGroup // tracks background goroutine
-	callbackWg     sync.WaitGroup // tracks in-flight callbacks
+	ctx            context.Context      // cancellable context for all operations
+	cancel         context.CancelFunc   // cancel function for immediate shutdown
+	wg             sync.WaitGroup       // tracks background goroutine
+	callbackWg     sync.WaitGroup       // tracks in-flight callbacks
 	client         *http.Client
 	onHealthChange func() // callback when health status changes
 	stopped        bool   // true after Stop() is called, prevents callbacks
+	ssl            bool   // Use HTTPS instead of HTTP
 }
 
 // NewNodeHealth creates a new NodeHealth tracker.
 func NewNodeHealth(client *http.Client) *NodeHealth {
-	if client == nil {
-		client = &http.Client{Timeout: 5 * time.Second}
+	return NewNodeHealthWithSSL(client, false)
+}
+
+// NewNodeHealthWithSSL creates a new NodeHealth tracker with SSL support.
+func NewNodeHealthWithSSL(client *http.Client, ssl bool) *NodeHealth {
+	// Use short timeout for health checks to avoid blocking shutdown
+	healthClient := &http.Client{Timeout: 2 * time.Second}
+	if client != nil {
+		// Copy transport if available, but use short timeout
+		if t, ok := client.Transport.(*http.Transport); ok {
+			healthClient.Transport = t.Clone()
+		}
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &NodeHealth{
 		connected:      make(map[string]bool),
 		lastConnect:    make(map[string]time.Time),
 		lastDisconnect: make(map[string]time.Time),
 		protocol:       make(map[string]string),
-		stopChan:       make(chan struct{}),
-		client:         client,
+		ctx:            ctx,
+		cancel:         cancel,
+		client:         healthClient,
+		ssl:            ssl,
 	}
+}
+
+// Scheme returns "https" if SSL is enabled, "http" otherwise.
+func (nh *NodeHealth) Scheme() string {
+	if nh.ssl {
+		return "https"
+	}
+	return "http"
 }
 
 // IsHealthy returns true if the node is connected via WebSocket.
@@ -157,24 +181,23 @@ func (nh *NodeHealth) Stop() {
 	nh.mu.Lock()
 	nh.stopped = true
 	nh.mu.Unlock()
-	if nh.stopChan != nil {
-		close(nh.stopChan)
+	// Cancel context to immediately abort all operations
+	if nh.cancel != nil {
+		nh.cancel()
 	}
 	nh.wg.Wait()
-	nh.callbackWg.Wait() // wait for in-flight callbacks to complete
+	nh.callbackWg.Wait()
 }
 
 // StartBackgroundCheck starts a goroutine that periodically checks node health
 func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, interval time.Duration) {
-	nh.wg.Add(1)
-	go func() {
-		defer nh.wg.Done()
+	nh.wg.Go(func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		// Check if already stopped before initial check
 		select {
-		case <-nh.stopChan:
+		case <-nh.ctx.Done():
 			return
 		default:
 		}
@@ -184,23 +207,29 @@ func (nh *NodeHealth) StartBackgroundCheck(getNodes func() []string, interval ti
 
 		for {
 			select {
-			case <-nh.stopChan:
+			case <-nh.ctx.Done():
 				return
 			case <-ticker.C:
 				nh.checkAllNodes(getNodes())
 			}
 		}
-	}()
+	})
 }
 
-// checkAllNodes pings all nodes and updates their health status
+// checkAllNodes pings all nodes and updates their health status.
+// This function blocks until all pings complete or context is cancelled.
 func (nh *NodeHealth) checkAllNodes(nodes []string) {
+	var wg sync.WaitGroup
+	wg.Add(len(nodes))
 	for _, node := range nodes {
 		go func(n string) {
+			defer wg.Done()
 			healthy := nh.pingNode(n)
+			if nh.ctx.Err() != nil {
+				return
+			}
 			if healthy {
 				nh.MarkHealthy(n)
-				// Check protocol version
 				proto := nh.checkNodeVersion(n)
 				nh.setProtocol(n, proto)
 			} else {
@@ -208,12 +237,22 @@ func (nh *NodeHealth) checkAllNodes(nodes []string) {
 			}
 		}(node)
 	}
+	wg.Wait()
 }
 
 // checkNodeVersion queries the node's version endpoint to determine protocol version
 func (nh *NodeHealth) checkNodeVersion(node string) string {
-	url := "http://" + node + RoutePrefix + "/version"
-	resp, err := nh.client.Get(url)
+	select {
+	case <-nh.ctx.Done():
+		return "unknown"
+	default:
+	}
+	url := nh.Scheme() + "://" + node + RoutePrefix + "/version"
+	req, err := http.NewRequestWithContext(nh.ctx, "GET", url, nil)
+	if err != nil {
+		return "unknown"
+	}
+	resp, err := nh.client.Do(req)
 	if err != nil {
 		return "unknown"
 	}
@@ -278,8 +317,17 @@ func (nh *NodeHealth) IsCompatible(node string) bool {
 
 // pingNode checks if a node is reachable
 func (nh *NodeHealth) pingNode(node string) bool {
-	url := "http://" + node + "/"
-	resp, err := nh.client.Get(url)
+	select {
+	case <-nh.ctx.Done():
+		return false
+	default:
+	}
+	url := nh.Scheme() + "://" + node + "/"
+	req, err := http.NewRequestWithContext(nh.ctx, "GET", url, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := nh.client.Do(req)
 	if err != nil {
 		return false
 	}

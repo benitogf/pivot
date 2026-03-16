@@ -75,6 +75,16 @@ func (i *Instance) SetAfterPull(callback func()) {
 	}
 }
 
+// SetAfterSync sets a callback that fires after each sync-to-pivot operation completes.
+// This is useful for test synchronization to wait for node->pivot sync operations.
+func (i *Instance) SetAfterSync(callback func()) {
+	if i.syncerPool != nil {
+		for _, s := range i.syncerPool.syncers {
+			s.AfterSync = callback
+		}
+	}
+}
+
 // GetInstance returns the pivot Instance for a server configured with Setup.
 // Returns nil if Setup was not called for this server.
 func GetInstance(server *ooo.Server) *Instance {

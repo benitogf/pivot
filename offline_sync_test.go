@@ -1,6 +1,7 @@
 package pivot_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -125,17 +126,22 @@ func TestConflictDetection(t *testing.T) {
 }
 
 // OfflineTestServers holds pivot and node servers for offline sync testing
+// Uses SEPARATE storage for policies with AfterWrite callbacks (like cluster_test.go)
+// This avoids server.Start() overwriting the AfterWrite callback on server.Storage
 type OfflineTestServers struct {
-	Pivot   *ooo.Server
-	Node    *ooo.Server
-	PivotWg *sync.WaitGroup
-	NodeWg  *sync.WaitGroup
+	Pivot         *ooo.Server
+	Node          *ooo.Server
+	PivotPolicies storage.Database
+	NodePolicies  storage.Database
+	PivotWg       *sync.WaitGroup
+	NodeWg        *sync.WaitGroup
 }
 
 func setupOfflineServers(t *testing.T) *OfflineTestServers {
 	pivotWg := &sync.WaitGroup{}
 	nodeWg := &sync.WaitGroup{}
 
+	// AfterWrite callback for pivot policies storage
 	pivotAfterWrite := func(key string) {
 		if strings.HasPrefix(key, "pivot/") {
 			return
@@ -144,6 +150,7 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 		pivotWg.Done()
 	}
 
+	// AfterWrite callback for node policies storage
 	nodeAfterWrite := func(key string) {
 		if strings.HasPrefix(key, "pivot/") {
 			return
@@ -152,6 +159,10 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 		nodeWg.Done()
 	}
 
+	// Create SEPARATE storage for policies (not affected by server.Start)
+	pivotPoliciesStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	nodePoliciesStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+
 	// Create pivot server (leader)
 	pivotServer := &ooo.Server{}
 	pivotServer.Silence = true
@@ -159,10 +170,10 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 	pivotServer.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	pivotServer.Router = mux.NewRouter()
 	pivotServer.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -170,15 +181,47 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 	}
 	pivotServer.Audit = func(r *http.Request) bool { return true }
 
+	// Configure pivot with policies using SEPARATE storage
 	pivotConfig := pivot.Config{
 		Keys: []pivot.Key{
-			{Path: "policies"},
+			{Path: "policies", Database: pivotPoliciesStorage},
 		},
-		ClusterURL: "", // Empty = this is the leader
+		ClusterURL: "",
 	}
 	pivot.Setup(pivotServer, pivotConfig)
-	pivotServer.Storage.Start(storage.Options{AfterWrite: pivotAfterWrite})
-	pivotServer.OpenFilter("policies")
+
+	// Attach policies storage with AfterWrite callback (won't be overwritten by server.Start)
+	err := pivot.GetInstance(pivotServer).Attach(pivotPoliciesStorage, storage.Options{AfterWrite: pivotAfterWrite})
+	if err != nil {
+		t.Fatalf("Failed to attach pivot policies storage: %v", err)
+	}
+
+	// Add HTTP route for policies (like cluster_test.go)
+	pivotServer.Router.HandleFunc("/policies", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			obj, err := pivotPoliciesStorage.Get("policies")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(obj.Data)
+		case http.MethodPost:
+			var data map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			dataBytes, _ := json.Marshal(data)
+			if _, err := pivotPoliciesStorage.Set("policies", dataBytes); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}).Methods(http.MethodGet, http.MethodPost)
+
 	pivotServer.Start("localhost:0")
 
 	// Create node server (follower)
@@ -188,10 +231,10 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 	nodeServer.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	nodeServer.Router = mux.NewRouter()
 	nodeServer.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -199,22 +242,57 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 	}
 	nodeServer.Audit = func(r *http.Request) bool { return true }
 
+	// Configure node with policies using SEPARATE storage
 	nodeConfig := pivot.Config{
 		Keys: []pivot.Key{
-			{Path: "policies"},
+			{Path: "policies", Database: nodePoliciesStorage},
 		},
-		ClusterURL: pivotServer.Address, // Connect to pivot
+		ClusterURL:          pivotServer.Address,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 	pivot.Setup(nodeServer, nodeConfig)
-	nodeServer.Storage.Start(storage.Options{AfterWrite: nodeAfterWrite})
-	nodeServer.OpenFilter("policies")
+
+	// Attach policies storage with AfterWrite callback
+	err = pivot.GetInstance(nodeServer).Attach(nodePoliciesStorage, storage.Options{AfterWrite: nodeAfterWrite})
+	if err != nil {
+		t.Fatalf("Failed to attach node policies storage: %v", err)
+	}
+
+	// Add HTTP route for policies
+	nodeServer.Router.HandleFunc("/policies", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			obj, err := nodePoliciesStorage.Get("policies")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(obj.Data)
+		case http.MethodPost:
+			var data map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			dataBytes, _ := json.Marshal(data)
+			if _, err := nodePoliciesStorage.Set("policies", dataBytes); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}).Methods(http.MethodGet, http.MethodPost)
+
 	nodeServer.Start("localhost:0")
 
 	return &OfflineTestServers{
-		Pivot:   pivotServer,
-		Node:    nodeServer,
-		PivotWg: pivotWg,
-		NodeWg:  nodeWg,
+		Pivot:         pivotServer,
+		Node:          nodeServer,
+		PivotPolicies: pivotPoliciesStorage,
+		NodePolicies:  nodePoliciesStorage,
+		PivotWg:       pivotWg,
+		NodeWg:        nodeWg,
 	}
 }
 
@@ -227,6 +305,10 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	servers := setupOfflineServers(t)
 	defer servers.Close()
 
+	// Verify separate policies storage is active
+	t.Logf("Pivot policies storage active: %v", servers.PivotPolicies.Active())
+	t.Logf("Node policies storage active: %v", servers.NodePolicies.Active())
+
 	// Get instances to access VVManager
 	pivotInstance := pivot.GetInstance(servers.Pivot)
 	nodeInstance := pivot.GetInstance(servers.Node)
@@ -235,41 +317,32 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	require.NotNil(t, pivotInstance.VVManager, "Pivot should have VVManager")
 	require.NotNil(t, nodeInstance.VVManager, "Node should have VVManager")
 
-	// Phase 1: Node writes data locally
-	testData := map[string]string{"value": "from-node"}
-	dataBytes, _ := json.Marshal(testData)
+	// Phase 1: Node writes data via HTTP, syncs to pivot
+	// Expect: 1 node write (local) + 1 pivot write (from sync)
+	servers.NodeWg.Add(1)
+	servers.PivotWg.Add(1)
 
-	_, err := servers.Node.Storage.Set("policies", dataBytes)
+	// Use HTTP POST to trigger proper AfterWrite callback
+	payload := []byte(`{"value": "from-node"}`)
+	resp, err := servers.Node.Client.Post("http://"+servers.Node.Address+"/policies", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Fetch object and manually trigger sync (direct Storage.Set bypasses OnStorageEvent)
-	nodeObj, err := servers.Node.Storage.Get("policies")
-	require.NoError(t, err)
-	nodeInstance.SyncCallback(storage.Event{
-		Key:       "policies",
-		Operation: "set",
-		Object:    &nodeObj,
-	})
-
-	// Poll for sync completion - node VV should be set
-	require.Eventually(t, func() bool {
-		nodeVV := nodeInstance.VVManager.Get("policies")
-		return len(nodeVV) > 0
-	}, 2*time.Second, 10*time.Millisecond, "Node should have VV for policies")
+	// Wait for both writes to complete
+	servers.NodeWg.Wait()
+	servers.PivotWg.Wait()
 
 	nodeVV := nodeInstance.VVManager.Get("policies")
+	require.NotEmpty(t, nodeVV, "Node should have VV for policies")
 	t.Logf("Node VV after write: %v", nodeVV)
 
-	// Poll for pivot to receive data
-	require.Eventually(t, func() bool {
-		pivotObj, err := servers.Pivot.Storage.Get("policies")
-		if err != nil {
-			return false
-		}
-		var pivotData map[string]string
-		json.Unmarshal(pivotObj.Data, &pivotData)
-		return pivotData["value"] == "from-node"
-	}, 2*time.Second, 10*time.Millisecond, "Pivot should have received data from node")
+	// Verify pivot received the data
+	pivotObj, err := servers.PivotPolicies.Get("policies")
+	require.NoError(t, err)
+	var pivotData map[string]string
+	json.Unmarshal(pivotObj.Data, &pivotData)
+	require.Equal(t, "from-node", pivotData["value"], "Pivot should have received data from node")
 
 	// Verify pivot incremented its VV (via Set handler)
 	pivotVV := pivotInstance.VVManager.Get("policies")
@@ -279,32 +352,33 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 
 	t.Log("Phase 1 passed: Node write syncs to pivot with VV tracking")
 
-	// Phase 2: Pivot writes, node should receive
-	pivotUpdate := map[string]string{"value": "from-pivot"}
-	pivotBytes, _ := json.Marshal(pivotUpdate)
+	// Phase 2: Pivot writes via HTTP, then manually trigger node sync
+	// (Pivot doesn't auto-sync to node since node isn't registered in NodesKey)
+	// Expect: 1 pivot write (local) + 1 node write (from manual sync trigger)
+	servers.PivotWg.Add(1)
 
-	_, err = servers.Pivot.Storage.Set("policies", pivotBytes)
+	payload = []byte(`{"value": "from-pivot"}`)
+	resp, err = servers.Pivot.Client.Post("http://"+servers.Pivot.Address+"/policies", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Fetch object and manually trigger sync (direct Storage.Set bypasses OnStorageEvent)
-	pivotObj, err := servers.Pivot.Storage.Get("policies")
+	// Wait for pivot write
+	servers.PivotWg.Wait()
+
+	// Manually trigger node to pull from pivot
+	servers.NodeWg.Add(1)
+	pivot.TriggerNodeSync(servers.Node.Client, servers.Node.Address)
+
+	// Wait for node write to complete
+	servers.NodeWg.Wait()
+
+	// Verify node received the update
+	nodeObj2, err := servers.NodePolicies.Get("policies")
 	require.NoError(t, err)
-	pivotInstance.SyncCallback(storage.Event{
-		Key:       "policies",
-		Operation: "set",
-		Object:    &pivotObj,
-	})
-
-	// Poll for node to receive update
-	require.Eventually(t, func() bool {
-		nodeObj2, err := servers.Node.Storage.Get("policies")
-		if err != nil {
-			return false
-		}
-		var nodeData map[string]string
-		json.Unmarshal(nodeObj2.Data, &nodeData)
-		return nodeData["value"] == "from-pivot"
-	}, 2*time.Second, 10*time.Millisecond, "Node should have received update from pivot")
+	var nodeData map[string]string
+	json.Unmarshal(nodeObj2.Data, &nodeData)
+	require.Equal(t, "from-pivot", nodeData["value"], "Node should have received update from pivot")
 
 	// Check pivot VV incremented again
 	pivotVV2 := pivotInstance.VVManager.Get("policies")
@@ -320,34 +394,28 @@ func TestVersionVectorActivityEndpoint(t *testing.T) {
 	servers := setupOfflineServers(t)
 	defer servers.Close()
 
-	// Write data to trigger VV increment
-	testData := map[string]string{"value": "test"}
-	dataBytes, _ := json.Marshal(testData)
+	// Write data via HTTP to trigger VV increment
+	// Expect: 1 node write (local) + 1 pivot write (from sync)
+	servers.NodeWg.Add(1)
+	servers.PivotWg.Add(1)
 
-	_, err := servers.Node.Storage.Set("policies", dataBytes)
+	payload := []byte(`{"value": "test"}`)
+	resp, err := servers.Node.Client.Post("http://"+servers.Node.Address+"/policies", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Fetch the object for sync event
-	obj, err := servers.Node.Storage.Get("policies")
-	require.NoError(t, err)
+	// Wait for both writes to complete
+	servers.NodeWg.Wait()
+	servers.PivotWg.Wait()
 
-	// Manually trigger sync (direct Storage.Set bypasses OnStorageEvent)
-	nodeInstance := pivot.GetInstance(servers.Node)
-	nodeInstance.SyncCallback(storage.Event{
-		Key:       "policies",
-		Operation: "set",
-		Object:    &obj,
-	})
-
-	// Poll for sync completion
+	// Verify pivot has VV
 	pivotInstance := pivot.GetInstance(servers.Pivot)
-	require.Eventually(t, func() bool {
-		pivotVV := pivotInstance.VVManager.Get("policies")
-		return pivotVV["leader"] > 0
-	}, 2*time.Second, 10*time.Millisecond, "Pivot should have VV")
+	pivotVV := pivotInstance.VVManager.Get("policies")
+	require.Greater(t, pivotVV["leader"], int64(0), "Pivot should have VV")
 
 	// Check activity endpoint on pivot includes VV
-	resp, err := servers.Pivot.Client.Get("http://" + servers.Pivot.Address + "/_pivot/activity/policies")
+	resp, err = servers.Pivot.Client.Get("http://" + servers.Pivot.Address + "/_pivot/activity/policies")
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
@@ -390,12 +458,17 @@ func TestClockDriftScenario(t *testing.T) {
 	futureData := map[string]string{"value": "written-with-future-clock", "phase": "1"}
 	futureBytes, _ := json.Marshal(futureData)
 
-	// Directly set in storage
-	_, err := servers.Node.Storage.Set("policies", futureBytes)
+	// Directly set in separate policies storage
+	// This triggers: nodeAfterWrite + automatic sync to pivot (pivotAfterWrite)
+	servers.NodeWg.Add(1)
+	servers.PivotWg.Add(1)
+	_, err := servers.NodePolicies.Set("policies", futureBytes)
 	require.NoError(t, err)
+	servers.NodeWg.Wait()
+	servers.PivotWg.Wait()
 
 	// Get the object and manipulate its timestamp to be 6 hours in the future
-	futureObj, err := servers.Node.Storage.Get("policies")
+	futureObj, err := servers.NodePolicies.Get("policies")
 	require.NoError(t, err)
 	futureTimestamp := now + sixHours
 	futureObj.Created = futureTimestamp
@@ -403,22 +476,24 @@ func TestClockDriftScenario(t *testing.T) {
 	t.Logf("Future timestamp: %d (6 hours ahead of now: %d)", futureObj.Updated, now)
 
 	// Trigger sync to pivot with future-timestamped data
+	// Expect: 1 pivot write (from sync)
+	servers.PivotWg.Add(1)
+
 	nodeInstance.SyncCallback(storage.Event{
 		Key:       "policies",
 		Operation: "set",
 		Object:    &futureObj,
 	})
 
-	// Wait for pivot to receive the future-timestamped data
-	require.Eventually(t, func() bool {
-		obj, err := servers.Pivot.Storage.Get("policies")
-		if err != nil {
-			return false
-		}
-		var data map[string]string
-		json.Unmarshal(obj.Data, &data)
-		return data["phase"] == "1"
-	}, 2*time.Second, 10*time.Millisecond, "Pivot should receive future-timestamped data")
+	// Wait for pivot write to complete
+	servers.PivotWg.Wait()
+
+	// Verify pivot received phase 1 data
+	phase1Obj, err := servers.PivotPolicies.Get("policies")
+	require.NoError(t, err)
+	var phase1Data map[string]string
+	json.Unmarshal(phase1Obj.Data, &phase1Data)
+	require.Equal(t, "1", phase1Data["phase"], "Pivot should receive future-timestamped data")
 
 	// Record VV state after phase 1
 	pivotVV1 := pivotInstance.VVManager.Get("policies")
@@ -432,11 +507,16 @@ func TestClockDriftScenario(t *testing.T) {
 	currentData := map[string]string{"value": "written-with-correct-clock", "phase": "2"}
 	currentBytes, _ := json.Marshal(currentData)
 
-	_, err = servers.Node.Storage.Set("policies", currentBytes)
+	// Direct Set triggers: nodeAfterWrite + automatic sync to pivot (pivotAfterWrite)
+	servers.NodeWg.Add(1)
+	servers.PivotWg.Add(1)
+	_, err = servers.NodePolicies.Set("policies", currentBytes)
 	require.NoError(t, err)
+	servers.NodeWg.Wait()
+	servers.PivotWg.Wait()
 
 	// Get the object - it has normal timestamp (which is "in the past" compared to phase 1)
-	currentObj, err := servers.Node.Storage.Get("policies")
+	currentObj, err := servers.NodePolicies.Get("policies")
 	require.NoError(t, err)
 	t.Logf("Current timestamp: %d (normal time, appears 'older' than future: %d)", currentObj.Updated, futureTimestamp)
 
@@ -445,6 +525,9 @@ func TestClockDriftScenario(t *testing.T) {
 		"Current timestamp should be less than future timestamp")
 
 	// Trigger sync with current-timestamped data
+	// Expect: 1 pivot write (from sync)
+	servers.PivotWg.Add(1)
+
 	nodeInstance.SyncCallback(storage.Event{
 		Key:       "policies",
 		Operation: "set",
@@ -454,19 +537,11 @@ func TestClockDriftScenario(t *testing.T) {
 	// === Phase 3: Verify VV prevents the "future" data from winning ===
 	t.Log("Phase 3: Verifying Version Vector prevents future-timestamp overwrite")
 
-	// Wait for pivot to receive the update
-	require.Eventually(t, func() bool {
-		obj, err := servers.Pivot.Storage.Get("policies")
-		if err != nil {
-			return false
-		}
-		var data map[string]string
-		json.Unmarshal(obj.Data, &data)
-		return data["phase"] == "2"
-	}, 2*time.Second, 10*time.Millisecond, "Pivot should have phase 2 data (VV wins over timestamp)")
+	// Wait for pivot write to complete
+	servers.PivotWg.Wait()
 
 	// Verify the correct data is on pivot
-	pivotObj, err := servers.Pivot.Storage.Get("policies")
+	pivotObj, err := servers.PivotPolicies.Get("policies")
 	require.NoError(t, err)
 	var pivotData map[string]string
 	json.Unmarshal(pivotObj.Data, &pivotData)
@@ -484,32 +559,25 @@ func TestClockDriftScenario(t *testing.T) {
 	// === Phase 4: Simulate reverse sync (pivot -> node) to ensure no regression ===
 	t.Log("Phase 4: Verify pivot -> node sync also respects VV")
 
-	// Write on pivot
-	pivotUpdate := map[string]string{"value": "pivot-update-after-drift", "phase": "3"}
-	pivotBytes, _ := json.Marshal(pivotUpdate)
-	_, err = servers.Pivot.Storage.Set("policies", pivotBytes)
+	// Write on pivot via HTTP, then manually trigger node sync
+	// (Pivot doesn't auto-sync to node since node isn't registered)
+	servers.PivotWg.Add(1)
+
+	payload := []byte(`{"value": "pivot-update-after-drift", "phase": "3"}`)
+	resp, err := servers.Pivot.Client.Post("http://"+servers.Pivot.Address+"/policies", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	pivotObj2, err := servers.Pivot.Storage.Get("policies")
-	require.NoError(t, err)
-	pivotInstance.SyncCallback(storage.Event{
-		Key:       "policies",
-		Operation: "set",
-		Object:    &pivotObj2,
-	})
+	// Wait for pivot write
+	servers.PivotWg.Wait()
 
-	// Wait for node to receive
-	require.Eventually(t, func() bool {
-		obj, err := servers.Node.Storage.Get("policies")
-		if err != nil {
-			return false
-		}
-		var data map[string]string
-		json.Unmarshal(obj.Data, &data)
-		return data["phase"] == "3"
-	}, 2*time.Second, 10*time.Millisecond, "Node should receive pivot update")
+	// Manually trigger node to pull from pivot
+	servers.NodeWg.Add(1)
+	pivot.TriggerNodeSync(servers.Node.Client, servers.Node.Address)
+	servers.NodeWg.Wait()
 
-	nodeObj, err := servers.Node.Storage.Get("policies")
+	nodeObj, err := servers.NodePolicies.Get("policies")
 	require.NoError(t, err)
 	var nodeData map[string]string
 	json.Unmarshal(nodeObj.Data, &nodeData)

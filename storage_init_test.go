@@ -1,8 +1,10 @@
 package pivot_test
 
 import (
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/benitogf/ko"
 	"github.com/benitogf/ooo"
@@ -13,14 +15,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// testDBPath returns a unique path in the test folder for parallel-safe test databases
+func testDBPath(name string) string {
+	return fmt.Sprintf("test/%s_%d", name, time.Now().UnixNano())
+}
+
+func init() {
+	// Ensure test folder exists
+	os.MkdirAll("test", 0755)
+}
+
 // TestStorageInitBeforeOnStart verifies that storage is fully initialized
 // before OnStart callback is invoked, especially when using embedded storage.
 // This reproduces a production issue where pivot.SyncAll() in OnStart
 // panicked because the embedded leveldb wasn't started yet.
 func TestStorageInitBeforeOnStart(t *testing.T) {
-	// Clean up test database
-	dbPath := "test_storage_init_db"
-	defer os.RemoveAll(dbPath)
+	t.Parallel()
+	dbPath := testDBPath("storage_init")
 
 	// Create embedded storage (like production code does)
 	embedded := &ko.EmbeddedStorage{Path: dbPath}
@@ -43,9 +54,11 @@ func TestStorageInitBeforeOnStart(t *testing.T) {
 		Keys: []pivot.Key{
 			{Path: "items/*"},
 		},
-		NodesKey:        "devices/*",
-		ClusterURL:      "127.0.0.1:19999", // Non-empty = node server
-		AutoSyncOnStart: true,
+		NodesKey:            "devices/*",
+		ClusterURL:          "127.0.0.1:19999", // Non-empty = node server
+		AutoSyncOnStart:     true,
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	})
 
 	// Start server - this should:
@@ -65,11 +78,9 @@ func TestStorageInitBeforeOnStart(t *testing.T) {
 // where there are TWO separate storages: authStorage (started manually)
 // and dataStorage (started by server.Start).
 func TestStorageInitMultipleStorages(t *testing.T) {
-	// Clean up test databases
-	authDbPath := "test_auth_db"
-	dataDbPath := "test_data_db"
-	defer os.RemoveAll(authDbPath)
-	defer os.RemoveAll(dataDbPath)
+	t.Parallel()
+	authDbPath := testDBPath("multi_auth")
+	dataDbPath := testDBPath("multi_data")
 
 	// Auth storage - created and started BEFORE pivot.Setup (like bundle does)
 	authEmbedded := &ko.EmbeddedStorage{Path: authDbPath}
@@ -102,9 +113,11 @@ func TestStorageInitMultipleStorages(t *testing.T) {
 			{Path: "tables/*"}, // Uses server.Storage (not started yet)
 			{Path: "users/*", Database: authStorage, ClusterURL: "127.0.0.1:19998"}, // Uses authStorage (started)
 		},
-		NodesKey:        "devices/*", // Uses server.Storage
-		ClusterURL:      "127.0.0.1:19999",
-		AutoSyncOnStart: true,
+		NodesKey:            "devices/*", // Uses server.Storage
+		ClusterURL:          "127.0.0.1:19999",
+		AutoSyncOnStart:     true,
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	})
 
 	// Start server
@@ -124,13 +137,11 @@ func TestStorageInitMultipleStorages(t *testing.T) {
 // 2. pivot.GetInstance(server).Attach(authStorage) called Start() again
 // 3. The double-start corrupted the leveldb handle causing nil pointer panic
 func TestAttachAlreadyStartedStorage(t *testing.T) {
+	t.Parallel()
 	monotonic.Init()
 
-	// Clean up test databases
-	authDbPath := "test_attach_auth_db"
-	dataDbPath := "test_attach_data_db"
-	defer os.RemoveAll(authDbPath)
-	defer os.RemoveAll(dataDbPath)
+	authDbPath := testDBPath("attach_auth")
+	dataDbPath := testDBPath("attach_data")
 
 	// Auth storage - created and started BEFORE pivot.Setup (like bundle does)
 	authEmbedded := &ko.EmbeddedStorage{Path: authDbPath}
@@ -167,9 +178,11 @@ func TestAttachAlreadyStartedStorage(t *testing.T) {
 		Keys: []pivot.Key{
 			{Path: "tables/*"},
 		},
-		NodesKey:        "devices/*",
-		ClusterURL:      "127.0.0.1:19999",
-		AutoSyncOnStart: true,
+		NodesKey:            "devices/*",
+		ClusterURL:          "127.0.0.1:19999",
+		AutoSyncOnStart:     true,
+		HealthCheckInterval: 500 * time.Millisecond,
+		SyncRetryInterval:   50 * time.Millisecond,
 	})
 
 	// Start server
