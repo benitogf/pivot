@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 
 	"github.com/benitogf/ooo/key"
 	"github.com/benitogf/ooo/meta"
@@ -58,7 +57,7 @@ func checkActivity(_key Key) (ActivityEntry, error) {
 	baseKey := _key
 
 	if key.LastIndex(_key.Path) == "*" {
-		_baseKey := strings.Replace(_key.Path, "/*", "", 1)
+		_baseKey := baseKeyFromPath(_key.Path)
 		objs, err := _key.Database.GetList(_key.Path)
 		if err != nil {
 			return activity, nil
@@ -80,15 +79,19 @@ func checkActivity(_key Key) (ActivityEntry, error) {
 }
 
 func checkPivotActivity(client *http.Client, pivot string, key string) (ActivityEntry, error) {
+	return checkLeaderActivity(ClientOpts{Client: client, Leader: pivot}, key)
+}
+
+func checkLeaderActivity(opts ClientOpts, key string) (ActivityEntry, error) {
 	var activity ActivityEntry
-	resp, err := client.Get("http://" + pivot + RoutePrefix + "/activity/" + key)
+	resp, err := opts.Client.Get(opts.URL(RoutePrefix + "/activity/" + key))
 	if err != nil {
 		return activity, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return activity, errors.New("failed to get activity on " + key + " from pivot at " + pivot)
+		return activity, errors.New("failed to get activity on " + key + " from leader at " + opts.Leader)
 	}
 
 	decoder := json.NewDecoder(resp.Body)

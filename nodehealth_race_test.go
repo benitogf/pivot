@@ -193,9 +193,7 @@ func TestRace_ConcurrentHealthAccess(t *testing.T) {
 
 	// Concurrent readers
 	for range 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-done:
@@ -206,7 +204,7 @@ func TestRace_ConcurrentHealthAccess(t *testing.T) {
 					nh.GetStatus()
 				}
 			}
-		}()
+		})
 	}
 
 	// Concurrent writers

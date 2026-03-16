@@ -3,7 +3,7 @@ package pivot
 import (
 	"encoding/json"
 	"log"
-	"strings"
+	"maps"
 	"sync"
 	"sync/atomic"
 
@@ -26,9 +26,7 @@ func (vv VersionVector) Clone() VersionVector {
 		return nil
 	}
 	clone := make(VersionVector, len(vv))
-	for k, v := range vv {
-		clone[k] = v
-	}
+	maps.Copy(clone, vv)
 	return clone
 }
 
@@ -146,7 +144,7 @@ func NewVVManager(db storage.Database, nodeID string) *VVManager {
 // normalizeKeyPath converts a key path to its base form for VV tracking.
 // "things/*" becomes "things", "things/123" stays "things/123"
 func normalizeKeyPath(keyPath string) string {
-	return strings.Replace(keyPath, "/*", "", 1)
+	return baseKeyFromPath(keyPath)
 }
 
 // Get returns the current version vector for a key.

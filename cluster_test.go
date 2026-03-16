@@ -16,6 +16,7 @@ import (
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/client"
 	ooio "github.com/benitogf/ooo/io"
+	"github.com/benitogf/ooo/key"
 	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/pivot"
 	"github.com/goccy/go-json"
@@ -38,15 +39,20 @@ type Policies struct {
 	Allowed    []string `json:"allowed"`
 }
 
+type Item struct {
+	Name  string `json:"name"`
+	Value int    `json:"value"`
+}
+
 func RegisterUser(t *testing.T, server *ooo.Server, account string) string {
 	var c auth.Credentials
-	payload := []byte(fmt.Sprintf(`{
+	payload := fmt.Appendf(nil, `{
         "name": "%s",
         "account":"%s",
         "password": "000",
         "email": "%s@test.cc",
         "phone": "555"
-    }`, account, account, account))
+    }`, account, account, account)
 	// Use real HTTP request to ensure sync callbacks work properly
 	resp, err := server.Client.Post("http://"+server.Address+"/register", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
@@ -61,10 +67,10 @@ func RegisterUser(t *testing.T, server *ooo.Server, account string) string {
 
 func Authorize(t *testing.T, server *ooo.Server, account string) string {
 	var c auth.Credentials
-	payload := []byte(fmt.Sprintf(`{
+	payload := fmt.Appendf(nil, `{
         "account":"%s",
         "password": "000"
-    }`, account))
+    }`, account)
 	// Use real HTTP request to ensure sync-on-read works properly
 	resp, err := server.Client.Post("http://"+server.Address+"/authorize", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
@@ -95,10 +101,10 @@ func FakeServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) 
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: 500 * time.Millisecond,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
-				Timeout: 5 * time.Second,
+				Timeout: 500 * time.Millisecond,
 			}).Dial,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
@@ -122,23 +128,24 @@ func FakeServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) 
 			{Path: "users/*", Database: authStorage},
 			{Path: "policies", Database: authStorage},
 			{Path: "settings"},
+			{Path: "items/*/*/*"},
 		},
-		NodesKey:   "things/*",
-		ClusterURL: clusterURL,
+		NodesKey:            "things/*",
+		ClusterURL:          clusterURL,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 
 	// Setup pivot - modifies server (routes, OnStorageEvent, BeforeRead)
 	pivot.Setup(server, config)
 
 	// Use Attach for simplified external storage setup with AfterWrite callback
+	// Only authStorage needs AfterWrite - things/* uses server.Storage which is started by server.Start()
 	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterWrite})
 	require.NoError(t, err)
 
-	// Start main storage with AfterWrite callback
-	server.Storage.Start(storage.Options{AfterWrite: afterWrite})
-
 	server.OpenFilter("things/*")
 	server.OpenFilter("settings")
+	server.OpenFilter("items/*/*/*")
 
 	_auth.Routes(server)
 
@@ -414,10 +421,69 @@ func (ops *syncTestOps) deletePolicies(t *testing.T, fromPivot bool) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+func (ops *syncTestOps) pushItem(t *testing.T, toPivot bool, path string, item Item) string {
+	basePath := strings.TrimSuffix(path, "/*")
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if toPivot {
+			cfg = ops.pivotCfg
+		}
+		resp, err := ooio.RemotePushWithResponse(cfg, path, item)
+		require.NoError(t, err)
+		require.NotEmpty(t, resp.Index)
+		return basePath + "/" + resp.Index
+	}
+	server := ops.nodeServer
+	if toPivot {
+		server = ops.pivotServer
+	}
+	id, err := ooo.Push(server, path, item)
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+	return basePath + "/" + id
+}
+
+func (ops *syncTestOps) setItem(t *testing.T, toPivot bool, key string, item Item) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if toPivot {
+			cfg = ops.pivotCfg
+		}
+		err := ooio.RemoteSet(cfg, key, item)
+		require.NoError(t, err)
+		return
+	}
+	server := ops.nodeServer
+	if toPivot {
+		server = ops.pivotServer
+	}
+	err := ooo.Set(server, key, item)
+	require.NoError(t, err)
+}
+
+func (ops *syncTestOps) deleteItem(t *testing.T, fromPivot bool, key string) {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		err := ooio.RemoteDelete(cfg, key)
+		require.NoError(t, err)
+		return
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	err := ooo.Delete(server, key)
+	require.NoError(t, err)
+}
+
 func testClusterSync(t *testing.T, useRemote bool) {
 	var wsWg sync.WaitGroup
 	var pivotThings, nodeThings []client.Meta[Thing]
 	var pivotSettings, nodeSettings []client.Meta[Settings]
+	var pivotItems, nodeItems []client.Meta[Item]
 	var mu sync.Mutex
 
 	pivotServer, pivotWg := FakeServer(t, "")
@@ -433,8 +499,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 		nodeWg:      nodeWg,
 	}
 	if useRemote {
-		ops.pivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: pivotServer.Address}
-		ops.nodeCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 5 * time.Second}, Host: nodeServer.Address}
+		ops.pivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: pivotServer.Address}
+		ops.nodeCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: nodeServer.Address}
 	}
 
 	// Register and authorize users
@@ -456,9 +522,9 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 
 	ctx := t.Context()
-	wsWg.Add(4)
+	wsWg.Add(6)
 
-	// Subscribe to things and settings on both servers
+	// Subscribe to things, settings, and items on both servers
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
 		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
@@ -499,6 +565,28 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		pivotSettings = []client.Meta[Settings]{data}
+		mu.Unlock()
+		wsWg.Done()
+	}})
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
+		mu.Lock()
+		pivotItems = data
+		mu.Unlock()
+		wsWg.Done()
+	}})
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
+		mu.Lock()
+		nodeItems = data
 		mu.Unlock()
 		wsWg.Done()
 	}})
@@ -716,6 +804,97 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	// Verify policies deleted from both
 	ops.getPoliciesExpectError(t, false, "policies should be deleted from node")
 	ops.getPoliciesExpectError(t, true, "policies should be deleted from pivot after sync")
+
+	// === Multi-glob sync tests (items/*/*/*) ===
+
+	// Push item to pivot - expect 2 ws events (pivot + node via TriggerNodeSync)
+	wsWg.Add(2)
+	itemID := ops.pushItem(t, true, "items/cat/sub/*", Item{Name: "p1", Value: 1})
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 1, len(pivotItems), "pivot should have 1 item")
+	require.Equal(t, "p1", pivotItems[0].Data.Name)
+	require.Equal(t, 1, len(nodeItems), "node should have 1 item")
+	require.Equal(t, "p1", nodeItems[0].Data.Name)
+	mu.Unlock()
+
+	// Push item from node - expect 2 ws events (node + pivot via node→pivot sync)
+	wsWg.Add(2)
+	itemID2 := ops.pushItem(t, false, "items/cat/sub/*", Item{Name: "p2", Value: 2})
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 2, len(pivotItems), "pivot should have 2 items after node push")
+	require.Equal(t, 2, len(nodeItems), "node should have 2 items after node push")
+	mu.Unlock()
+
+	// Update item on pivot - expect 2 ws events (pivot + node)
+	wsWg.Add(2)
+	ops.setItem(t, true, itemID, Item{Name: "p1-updated", Value: 10})
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 2, len(pivotItems), "pivot should still have 2 items after update")
+	require.Equal(t, 2, len(nodeItems), "node should still have 2 items after update")
+	// Find the updated item
+	for _, item := range pivotItems {
+		if item.Index == key.LastIndex(itemID) {
+			require.Equal(t, "p1-updated", item.Data.Name)
+			require.Equal(t, 10, item.Data.Value)
+		}
+	}
+	for _, item := range nodeItems {
+		if item.Index == key.LastIndex(itemID) {
+			require.Equal(t, "p1-updated", item.Data.Name)
+			require.Equal(t, 10, item.Data.Value)
+		}
+	}
+	mu.Unlock()
+
+	// Update item from node - expect 2 ws events (node + pivot)
+	wsWg.Add(2)
+	ops.setItem(t, false, itemID2, Item{Name: "p2-updated", Value: 20})
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 2, len(pivotItems), "pivot should still have 2 items after node update")
+	require.Equal(t, 2, len(nodeItems), "node should still have 2 items after node update")
+	for _, item := range pivotItems {
+		if item.Index == key.LastIndex(itemID2) {
+			require.Equal(t, "p2-updated", item.Data.Name)
+			require.Equal(t, 20, item.Data.Value)
+		}
+	}
+	for _, item := range nodeItems {
+		if item.Index == key.LastIndex(itemID2) {
+			require.Equal(t, "p2-updated", item.Data.Name)
+			require.Equal(t, 20, item.Data.Value)
+		}
+	}
+	mu.Unlock()
+
+	// Delete item from pivot - expect 2 ws events
+	wsWg.Add(2)
+	ops.deleteItem(t, true, itemID)
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 1, len(pivotItems), "pivot should have 1 item after delete")
+	require.Equal(t, "p2-updated", pivotItems[0].Data.Name)
+	require.Equal(t, 1, len(nodeItems), "node should have 1 item after delete")
+	require.Equal(t, "p2-updated", nodeItems[0].Data.Name)
+	mu.Unlock()
+
+	// Delete item from node - expect 2 ws events
+	wsWg.Add(2)
+	ops.deleteItem(t, false, itemID2)
+	wsWg.Wait()
+
+	mu.Lock()
+	require.Equal(t, 0, len(pivotItems), "pivot should have 0 items after node delete")
+	require.Equal(t, 0, len(nodeItems), "node should have 0 items after node delete")
+	mu.Unlock()
 }
 
 func TestClusterSyncLocal(t *testing.T) {
@@ -759,9 +938,10 @@ func TestOnStartSync(t *testing.T) {
 	nodeServer.OpenFilter("settings")
 
 	nodeConfig := pivot.Config{
-		Keys:       []pivot.Key{{Path: "things/*"}, {Path: "settings"}},
-		NodesKey:   "things/*",
-		ClusterURL: pivotServer.Address, // This is a node
+		Keys:                []pivot.Key{{Path: "things/*"}, {Path: "settings"}},
+		NodesKey:            "things/*",
+		ClusterURL:          pivotServer.Address, // This is a node
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 	pivot.Setup(nodeServer, nodeConfig)
 	nodeServer.Start("localhost:0")
@@ -808,9 +988,10 @@ func TestOnStartComposition(t *testing.T) {
 	}
 
 	nodeConfig := pivot.Config{
-		Keys:       []pivot.Key{{Path: "things/*"}},
-		NodesKey:   "things/*",
-		ClusterURL: pivotServer.Address,
+		Keys:                []pivot.Key{{Path: "things/*"}},
+		NodesKey:            "things/*",
+		ClusterURL:          pivotServer.Address,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 	pivot.Setup(nodeServer, nodeConfig)
 	nodeServer.Start("localhost:0")

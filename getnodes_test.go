@@ -15,6 +15,7 @@ import (
 )
 
 func TestGetClusterLeaderInfoWithNodes(t *testing.T) {
+	t.Parallel()
 	// Create a server with storage
 	server := &ooo.Server{
 		Router:  mux.NewRouter(),
@@ -50,6 +51,7 @@ func TestGetClusterLeaderInfoWithNodes(t *testing.T) {
 }
 
 func TestGetClusterLeaderInfoWithMultipleNodes(t *testing.T) {
+	t.Parallel()
 	server := &ooo.Server{
 		Router:  mux.NewRouter(),
 		Silence: true,
@@ -81,6 +83,7 @@ func TestGetClusterLeaderInfoWithMultipleNodes(t *testing.T) {
 }
 
 func TestGetClusterLeaderInfoViaHTTPAPI(t *testing.T) {
+	t.Parallel()
 	// This test simulates how data would be written through the HTTP API
 	server := &ooo.Server{
 		Router:  mux.NewRouter(),

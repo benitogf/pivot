@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -28,47 +27,39 @@ type VersionItem struct {
 	Value int    `json:"value"`
 }
 
-func VersionTestServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) {
-	wg := &sync.WaitGroup{}
-
-	afterWrite := func(key string) {
-		if strings.HasPrefix(key, "pivot/") {
-			return
-		}
-		wg.Done()
-	}
-
+func VersionTestServer(t *testing.T, clusterURL string) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
-	server.Client = &http.Client{Timeout: 5 * time.Second}
+	server.Client = &http.Client{Timeout: 500 * time.Millisecond}
 	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
-		Keys:       []pivot.Key{{Path: "items/*"}},
-		NodesKey:   "nodes/*",
-		ClusterURL: clusterURL,
+		Keys:                []pivot.Key{{Path: "items/*"}},
+		NodesKey:            "nodes/*",
+		ClusterURL:          clusterURL,
+		HealthCheckInterval: 500 * time.Millisecond,
 	}
 
 	pivot.Setup(server, config)
-	server.Storage.Start(storage.Options{AfterWrite: afterWrite})
 	server.OpenFilter("items/*")
 	server.OpenFilter("nodes/*")
 	server.Start("localhost:0")
 
-	return server, wg
+	return server
 }
 
 func TestE2E_VersionSync_CompatibleServers(t *testing.T) {
+	t.Parallel()
 	// This test verifies that compatible servers can detect each other's version
 	// Full bidirectional sync is tested in cluster_test.go (testClusterSync)
 
-	pivotServer, _ := VersionTestServer(t, "")
+	pivotServer := VersionTestServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
-	nodeServer, _ := VersionTestServer(t, "http://"+pivotServer.Address)
+	nodeServer := VersionTestServer(t, "http://"+pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
 	nodeHost, nodePortStr, _ := net.SplitHostPort(nodeServer.Address)
@@ -95,6 +86,7 @@ func TestE2E_VersionSync_CompatibleServers(t *testing.T) {
 }
 
 func TestE2E_VersionSync_PivotBlocksIncompatibleNode(t *testing.T) {
+	t.Parallel()
 	var syncAttempts int32
 
 	mockNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +112,7 @@ func TestE2E_VersionSync_PivotBlocksIncompatibleNode(t *testing.T) {
 	var pivotItems []client.Meta[VersionItem]
 	var mu sync.Mutex
 
-	pivotServer, _ := VersionTestServer(t, "")
+	pivotServer := VersionTestServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
 	ctx := t.Context()
@@ -177,6 +169,7 @@ func TestE2E_VersionSync_PivotBlocksIncompatibleNode(t *testing.T) {
 }
 
 func TestE2E_VersionSync_NodeBlocksIncompatiblePivot(t *testing.T) {
+	t.Parallel()
 	var syncAttempts int32
 
 	mockPivot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +196,7 @@ func TestE2E_VersionSync_NodeBlocksIncompatiblePivot(t *testing.T) {
 	var nodeItems []client.Meta[VersionItem]
 	var mu sync.Mutex
 
-	nodeServer, _ := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
+	nodeServer := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
 	defer nodeServer.Close(os.Interrupt)
 
 	ctx := t.Context()
@@ -247,10 +240,11 @@ func TestE2E_VersionSync_NodeBlocksIncompatiblePivot(t *testing.T) {
 }
 
 func TestE2E_VersionSync_NodeDetectsPivotProtocol(t *testing.T) {
-	pivotServer, _ := VersionTestServer(t, "")
+	t.Parallel()
+	pivotServer := VersionTestServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
-	nodeServer, _ := VersionTestServer(t, "http://"+pivotServer.Address)
+	nodeServer := VersionTestServer(t, "http://"+pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
 	// Poll until health check detects pivot protocol (initial check runs async)
@@ -273,6 +267,7 @@ func TestE2E_VersionSync_NodeDetectsPivotProtocol(t *testing.T) {
 }
 
 func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
+	t.Parallel()
 	mockPivot := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == pivot.RoutePrefix+"/version" {
 			w.Header().Set("Content-Type", "application/json")
@@ -287,7 +282,7 @@ func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
 	}))
 	defer mockPivot.Close()
 
-	nodeServer, _ := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
+	nodeServer := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
 	defer nodeServer.Close(os.Interrupt)
 
 	// Poll until health check detects pivot protocol
@@ -309,6 +304,7 @@ func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
 }
 
 func TestE2E_VersionSync_OldNodeWithoutVersionEndpoint(t *testing.T) {
+	t.Parallel()
 	var syncAttempts int32
 
 	oldNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -329,7 +325,7 @@ func TestE2E_VersionSync_OldNodeWithoutVersionEndpoint(t *testing.T) {
 	var pivotItems []client.Meta[VersionItem]
 	var mu sync.Mutex
 
-	pivotServer, _ := VersionTestServer(t, "")
+	pivotServer := VersionTestServer(t, "")
 	defer pivotServer.Close(os.Interrupt)
 
 	ctx := t.Context()

@@ -86,7 +86,7 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker,
 			return
 		}
 		index := mux.Vars(r)["index"]
-		itemKey := path + "/" + decoded.Index
+		itemKey := path + "/" + index
 		if index == "" {
 			itemKey = path
 		}
