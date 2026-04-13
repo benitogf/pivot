@@ -5,9 +5,9 @@ go 1.25
 require (
 	github.com/benitogf/auth v0.0.0-20260109062751-db0dd7187682
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec
+	github.com/benitogf/go-json v0.0.0-20260410172501-727f5690408b
 	github.com/benitogf/ko v0.0.0-20260211072652-d48fcf4f8988
 	github.com/benitogf/ooo v0.0.0-20260309052559-6cec57597a78
-	github.com/goccy/go-json v0.10.6
 	github.com/gorilla/mux v1.8.1
 	github.com/stretchr/testify v1.11.1
 )
@@ -18,6 +18,7 @@ require (
 	github.com/benitogf/jsonpatch v0.0.0-20260109052650-eec54232a9a2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/gorilla/handlers v1.5.2 // indirect

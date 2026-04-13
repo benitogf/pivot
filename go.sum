@@ -4,6 +4,8 @@ github.com/benitogf/auth v0.0.0-20260109062751-db0dd7187682 h1:iq6BqPKQNzJPerTcD
 github.com/benitogf/auth v0.0.0-20260109062751-db0dd7187682/go.mod h1:9iCBYIgZAExAYSTe7ZhMIlrxuyd4W58iESBijw02j6Q=
 github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec h1:I2p/9YsiAMB+J2DrC+e7OvEWZCmpwolMQ23ejoEMFEE=
 github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec/go.mod h1:hl/Xd8DKuMgC/ClZ2dPZz6mvXaxdkjrt0mr0+jF4UkQ=
+github.com/benitogf/go-json v0.0.0-20260410172501-727f5690408b h1:EXDsF3gMYyR8ipJsGuyHB4d3+XovPT8d4UM6cfBII14=
+github.com/benitogf/go-json v0.0.0-20260410172501-727f5690408b/go.mod h1:bv78ZxbWzHLAwEcSgQNjDUVgl3F4nOuYln98xHfUyjw=
 github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 h1:0ERndS9JkEvEq/yXjiZq41lMb3QfmQWUIXycjkRbWOc=
 github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559/go.mod h1:gg2qmcNCGq/FXh5kQpsaEIf6GebYe2JMKrDSqZkuImc=
 github.com/benitogf/jsonpatch v0.0.0-20260109052650-eec54232a9a2 h1:OC5ZiOG0sQ5Qmp5XOA3iIBBjhDjze010jHicNTD27kU=
@@ -21,8 +23,8 @@ github.com/getlantern/httptest v0.0.0-20161025015934-4b40f4c7e590 h1:OhyiFx+yBN3
 github.com/getlantern/httptest v0.0.0-20161025015934-4b40f4c7e590/go.mod h1:rE/jidqqHHG9sjSxC24Gd5YCfZ1AT91C2wjJ28TAOfA=
 github.com/getlantern/mockconn v0.0.0-20200818071412-cb30d065a848 h1:2MhMMVBTnaHrst6HyWFDhwQCaJ05PZuOv1bE2gN8WFY=
 github.com/getlantern/mockconn v0.0.0-20200818071412-cb30d065a848/go.mod h1:+F5GJ7qGpQ03DBtcOEyQpM30ix4BLswdaojecFtsdy8=
-github.com/goccy/go-json v0.10.6 h1:p8HrPJzOakx/mn/bQtjgNjdTcN+/S6FcG2CTtQOrHVU=
-github.com/goccy/go-json v0.10.6/go.mod h1:oq7eo15ShAhp70Anwd5lgX2pLfOS3QCiwU/PULtXL6M=
+github.com/goccy/go-json v0.10.5 h1:Fq85nIqj+gXn/S5ahsiTlK3TmC85qgirsdTP/+DeaC4=
+github.com/goccy/go-json v0.10.5/go.mod h1:oq7eo15ShAhp70Anwd5lgX2pLfOS3QCiwU/PULtXL6M=
 github.com/golang-jwt/jwt v3.2.2+incompatible h1:IfV12K8xAKAnZqdXVzCZ+TOjboZ2keLg81eXfW3O+oY=
 github.com/golang-jwt/jwt v3.2.2+incompatible/go.mod h1:8pz2t5EyA70fFQQSrl6XZXzqecmYZeUEB8OUGHkxJ+I=
 github.com/golang/protobuf v1.2.0/go.mod h1:6lQm79b+lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=

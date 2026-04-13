@@ -9,7 +9,7 @@ import (
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/pivot"
-	"github.com/goccy/go-json"
+	"github.com/benitogf/go-json"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/require"
 )
