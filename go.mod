@@ -7,18 +7,17 @@ require (
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec
 	github.com/benitogf/go-json v0.0.0-20260410172501-727f5690408b
 	github.com/benitogf/ko v0.0.0-20260211072652-d48fcf4f8988
-	github.com/benitogf/ooo v0.0.0-20260309052559-6cec57597a78
+	github.com/benitogf/ooo v0.0.0-20260413100910-30cc1357838d
 	github.com/gorilla/mux v1.8.1
 	github.com/stretchr/testify v1.11.1
 )
 
 require (
 	github.com/bclicn/color v0.0.0-20180711051946-108f2023dc84 // indirect
-	github.com/benitogf/jsondiff v0.0.0-20220926080659-c3db9b84b559 // indirect
-	github.com/benitogf/jsonpatch v0.0.0-20260109052650-eec54232a9a2 // indirect
+	github.com/benitogf/jsondiff v0.0.0-20260413094925-a4be838c278b // indirect
+	github.com/benitogf/jsonpatch v0.0.0-20260413094158-a4a6cc1a3382 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
-	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/golang-jwt/jwt v3.2.2+incompatible // indirect
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/gorilla/handlers v1.5.2 // indirect
