@@ -163,15 +163,23 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 			objsLocal = []meta.Object{}
 		}
 
-		objsLeader, err := getEntriesFromLeader(clientOpts, _key.Path)
+		objsLeader, headerActivity, hasActivity, err := getEntriesAndActivityFromLeader(clientOpts, _key.Path)
 		if err != nil {
 			return err
 		}
 
-		// Re-fetch leader activity to get the latest value (including any recent deletes)
-		latestActivity, err := checkLeaderActivity(clientOpts, baseKey)
-		if err == nil && latestActivity.LastEntry > leaderActivity {
-			leaderActivity = latestActivity.LastEntry
+		// Pick up the latest leader activity (including any recent delete tombstones)
+		// so we don't resurrect items the leader just deleted. New leaders piggyback
+		// it as a response header on GetList; older leaders need a separate call.
+		if hasActivity {
+			if headerActivity > leaderActivity {
+				leaderActivity = headerActivity
+			}
+		} else {
+			latestActivity, actErr := checkLeaderActivity(clientOpts, baseKey)
+			if actErr == nil && latestActivity.LastEntry > leaderActivity {
+				leaderActivity = latestActivity.LastEntry
+			}
 		}
 
 		// Build map of local entries for O(1) lookup

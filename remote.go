@@ -35,6 +35,12 @@ func (c ClientOpts) URL(path string) string {
 // OriginatorHeader is the HTTP header used to identify the node that originated a change
 const OriginatorHeader = "X-Pivot-Originator"
 
+// ActivityHeader is the response header used by the leader's GetList endpoint to
+// piggyback the activity timestamp (matching /activity's LastEntry), so a node
+// pushing changes up doesn't need a second HTTP round-trip just to learn it.
+// Old leaders don't emit it; new clients fall back to checkLeaderActivity.
+const ActivityHeader = "X-Pivot-Activity"
+
 // TriggerNodeSync will call pivot on a node server
 func TriggerNodeSync(client *http.Client, node string) {
 	TriggerNodeSyncWithHealth(ClientOpts{Client: client}, node, "")
@@ -90,6 +96,36 @@ func getEntriesFromLeader(opts ClientOpts, key string) ([]meta.Object, error) {
 	}
 
 	return objs, nil
+}
+
+// getEntriesAndActivityFromLeader fetches list entries and, if the leader emits
+// the X-Pivot-Activity header, the activity timestamp in the same round-trip.
+// hasActivity is false against older leaders that don't emit the header — the
+// caller is expected to fall back to checkLeaderActivity in that case.
+func getEntriesAndActivityFromLeader(opts ClientOpts, key string) (objs []meta.Object, activity int64, hasActivity bool, err error) {
+	resp, err := opts.Client.Get(opts.URL(RoutePrefix + "/pivot/" + key))
+	if err != nil {
+		return nil, 0, false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, 0, false, errors.New("failed to get " + key + " from leader " + resp.Status)
+	}
+
+	if v := resp.Header.Get(ActivityHeader); v != "" {
+		if parsed, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+			activity = parsed
+			hasActivity = true
+		}
+	}
+
+	objs, err = meta.DecodeListFromReader(resp.Body)
+	if err != nil {
+		return nil, activity, hasActivity, err
+	}
+
+	return objs, activity, hasActivity, nil
 }
 
 func getEntryFromLeader(opts ClientOpts, key string) (meta.Object, error) {

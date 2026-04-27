@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/benitogf/ooo/meta"
 	"github.com/benitogf/ooo/storage"
@@ -47,6 +48,7 @@ func SynchronizeNodeHandler(pivot string, pool *syncerPool) func(w http.Response
 }
 
 func GetList(db storage.Database, path string) func(w http.ResponseWriter, r *http.Request) {
+	baseKey := baseKeyFromPath(path)
 	return func(w http.ResponseWriter, r *http.Request) {
 		objs, err := db.GetList(path)
 		if err != nil {
@@ -54,7 +56,12 @@ func GetList(db storage.Database, path string) func(w http.ResponseWriter, r *ht
 			fmt.Fprint(w, err.Error())
 			return
 		}
-
+		// Piggyback the activity timestamp so a node syncing up doesn't need a
+		// separate /activity round-trip. Older clients ignore the header; new
+		// clients use it to skip checkLeaderActivity. The value matches what
+		// /activity returns: max(latestUpdated, deleteTombstone).
+		activity := checkLastDelete(db, lastActivity(objs), baseKey)
+		w.Header().Set(ActivityHeader, strconv.FormatInt(activity, 10))
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(objs)
 	}
