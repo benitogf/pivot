@@ -34,6 +34,7 @@ type Instance struct {
 	ExtraNodeURLs  []string                      // Additional node URLs (can be modified after Setup)
 	VVManager      *VVManager                    // Version vector manager (for both pivot and node servers)
 	syncerPool     *syncerPool                   // Internal syncer pool for node servers (for testing hooks)
+	nodesCache     *nodesCache                   // Cache for NodesKey address list, invalidated by storage events
 	healthMu       sync.RWMutex                  // Protects PivotHealth map
 	extraNodeURLMu sync.RWMutex                  // Protects ExtraNodeURLs
 	shutdown       int32                         // Atomic flag to prevent access during shutdown

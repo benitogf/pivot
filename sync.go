@@ -958,6 +958,7 @@ type StorageSyncConfig struct {
 	Client            *http.Client
 	ConfigClusterURL  string
 	Keys              []Key
+	NodesKey          string
 	GetNodes          getNodes
 	Pool              *syncerPool
 	NodeHealth        *NodeHealth
@@ -987,6 +988,12 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 
 		if !found || matchedDB == nil {
 			return
+		}
+
+		// Keep the nodes-address cache in sync with NodesKey writes. Settings-only
+		// changes (ip/port unchanged) are a no-op inside update().
+		if cfg.NodesKey != "" && matchedKeyConfig.Path == cfg.NodesKey && cfg.Instance != nil {
+			cfg.Instance.nodesCache.update(event)
 		}
 
 		// Determine if this server is pivot or node for this specific key
