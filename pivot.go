@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,6 +109,159 @@ type getNodes func() []string
 // GetNodes is the exported type for node discovery functions (backward compatibility)
 type GetNodes func() []string
 
+// parseNodeAddr extracts "ip:port" from a node entry's JSON data.
+// Returns "" if either field is missing or invalid. Accepts lower/upper case
+// keys and int/float64/string port encodings.
+func parseNodeAddr(data []byte) string {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	var ip string
+	if v, ok := raw["ip"].(string); ok {
+		ip = v
+	} else if v, ok := raw["IP"].(string); ok {
+		ip = v
+	}
+	var port int
+	for _, k := range [2]string{"port", "Port"} {
+		switch v := raw[k].(type) {
+		case float64:
+			port = int(v)
+		case int:
+			port = v
+		case string:
+			port, _ = strconv.Atoi(v)
+		}
+		if port > 0 {
+			break
+		}
+	}
+	if ip == "" || port <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", ip, port)
+}
+
+// nodesCache caches the resolved "ip:port" list from NodesKey so that
+// GetNodes does not rescan and re-unmarshal every node entry on each call.
+// Invalidation is driven by storage events via update(): settings-only
+// changes to an entry (where ip/port don't change) are intentionally ignored,
+// since they are common but irrelevant to the node-address list.
+type nodesCache struct {
+	server     *ooo.Server
+	nodesKey   string
+	isShutdown func() bool
+
+	mu      sync.RWMutex
+	loaded  bool
+	entries map[string]string // obj.Index -> "ip:port"
+	slice   []string          // immutable after rebuild; callers must not mutate
+}
+
+func newNodesCache(server *ooo.Server, nodesKey string, isShutdown func() bool) *nodesCache {
+	return &nodesCache{
+		server:     server,
+		nodesKey:   nodesKey,
+		isShutdown: isShutdown,
+	}
+}
+
+// get returns the current list of node addresses. The returned slice is
+// shared — callers must not mutate it.
+func (c *nodesCache) get() []string {
+	if c == nil || c.isShutdown() {
+		return nil
+	}
+	c.mu.RLock()
+	if c.loaded {
+		s := c.slice
+		c.mu.RUnlock()
+		return s
+	}
+	c.mu.RUnlock()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.loaded {
+		c.loadLocked()
+	}
+	return c.slice
+}
+
+// loadLocked does a full rebuild from storage. Caller must hold c.mu.
+func (c *nodesCache) loadLocked() {
+	c.entries = make(map[string]string)
+	c.loaded = true
+	if c.nodesKey == "" || c.server.Storage == nil || !c.server.Storage.Active() {
+		c.slice = nil
+		return
+	}
+	objs, err := c.server.Storage.GetList(c.nodesKey)
+	if err != nil {
+		c.slice = nil
+		return
+	}
+	for _, obj := range objs {
+		if addr := parseNodeAddr(obj.Data); addr != "" {
+			c.entries[obj.Index] = addr
+		}
+	}
+	c.rebuildSliceLocked()
+}
+
+// update processes a NodesKey storage event. Fast path when ip/port didn't
+// change is ~1 json.Unmarshal + 1 string compare, no slice rebuild.
+func (c *nodesCache) update(event storage.Event) {
+	if c == nil || event.Object == nil || event.Object.Index == "" {
+		return
+	}
+	idx := event.Object.Index
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.loaded {
+		// No cache yet — the next get() will do a full load.
+		return
+	}
+
+	switch event.Operation {
+	case "del":
+		if _, had := c.entries[idx]; !had {
+			return
+		}
+		delete(c.entries, idx)
+		c.rebuildSliceLocked()
+	case "set":
+		newAddr := parseNodeAddr(event.Object.Data)
+		prev, had := c.entries[idx]
+		if had && newAddr == prev {
+			// Settings-only change — ip:port unchanged, nothing to do.
+			return
+		}
+		if newAddr == "" {
+			if !had {
+				return
+			}
+			delete(c.entries, idx)
+		} else {
+			c.entries[idx] = newAddr
+		}
+		c.rebuildSliceLocked()
+	}
+}
+
+// rebuildSliceLocked produces a new sorted slice from the current entries.
+// Copy-on-write: callers still holding the old slice remain correct.
+func (c *nodesCache) rebuildSliceLocked() {
+	s := make([]string, 0, len(c.entries))
+	for _, addr := range c.entries {
+		s = append(s, addr)
+	}
+	sort.Strings(s)
+	c.slice = s
+}
+
 // buildKeys constructs the full keys list from config.
 // Keys with nil Database are filled with server.Storage.
 // NodesKey is appended if not already present.
@@ -139,69 +293,62 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 	return keys
 }
 
-// makeGetNodes creates a function that returns node addresses from the NodesKey path
-// plus any extra node URLs from the Instance (can be added dynamically after Setup).
-// Only returns entries with a non-zero port - these are actual node servers.
+// makeGetNodes returns a function that resolves the full node list fresh from
+// storage on every call. This preserves synchronous read-after-write semantics
+// for external consumers (e.g., the UI, GetPivotInfo) who expect a node that
+// was just registered to appear immediately.
 func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNodes {
 	return func() []string {
-		// Check shutdown flag to avoid race with server.Close()
 		if instance.IsShutdown() {
 			return nil
 		}
-		// Start with extra node URLs (e.g., auth servers not in nodesKey)
-		extraURLs := instance.GetExtraNodeURLs()
-		result := make([]string, 0, len(extraURLs))
-		result = append(result, extraURLs...)
-
-		if nodesKey == "" {
-			return result
-		}
-		if server.Storage == nil {
-			return result
-		}
-		if !server.Storage.Active() {
-			return result
+		extras := instance.GetExtraNodeURLs()
+		if nodesKey == "" || server.Storage == nil || !server.Storage.Active() {
+			if len(extras) == 0 {
+				return nil
+			}
+			return extras
 		}
 		objs, err := server.Storage.GetList(nodesKey)
 		if err != nil {
-			return result
+			if len(extras) == 0 {
+				return nil
+			}
+			return extras
 		}
+		result := make([]string, 0, len(extras)+len(objs))
+		result = append(result, extras...)
 		for _, obj := range objs {
-			// Try to parse as a map first to be more flexible with field names
-			var rawData map[string]any
-			if err := json.Unmarshal(obj.Data, &rawData); err != nil {
-				continue
-			}
-
-			// Look for ip/IP field
-			var ip string
-			if v, ok := rawData["ip"].(string); ok {
-				ip = v
-			} else if v, ok := rawData["IP"].(string); ok {
-				ip = v
-			}
-
-			// Look for port/Port field - handle int, float64, and string
-			var port int
-			if v, ok := rawData["port"].(float64); ok {
-				port = int(v)
-			} else if v, ok := rawData["Port"].(float64); ok {
-				port = int(v)
-			} else if v, ok := rawData["port"].(int); ok {
-				port = v
-			} else if v, ok := rawData["Port"].(int); ok {
-				port = v
-			} else if v, ok := rawData["port"].(string); ok {
-				port, _ = strconv.Atoi(v)
-			} else if v, ok := rawData["Port"].(string); ok {
-				port, _ = strconv.Atoi(v)
-			}
-
-			// Only include entries with both ip and port
-			if ip != "" && port > 0 {
-				result = append(result, fmt.Sprintf("%s:%d", ip, port))
+			if addr := parseNodeAddr(obj.Data); addr != "" {
+				result = append(result, addr)
 			}
 		}
+		return result
+	}
+}
+
+// makeGetNodesCached returns a function backed by instance.nodesCache.
+// Used on the event-driven hot path (makeStorageSync), where update()
+// has already reconciled the cache with the current event before
+// GetNodes is called — so cache and storage are consistent at read time.
+// Settings-only changes to node entries are a no-op inside update(),
+// which is the whole point of caching here.
+func makeGetNodesCached(instance *Instance) getNodes {
+	return func() []string {
+		if instance.IsShutdown() {
+			return nil
+		}
+		extras := instance.GetExtraNodeURLs()
+		cached := instance.nodesCache.get()
+		if len(extras) == 0 {
+			return cached
+		}
+		if len(cached) == 0 {
+			return extras
+		}
+		result := make([]string, 0, len(extras)+len(cached))
+		result = append(result, extras...)
+		result = append(result, cached...)
 		return result
 	}
 }
@@ -347,8 +494,10 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		SyncedKeys:    keyPaths,
 		ExtraNodeURLs: config.ExtraNodeURLs,
 	}
+	instance.nodesCache = newNodesCache(server, config.NodesKey, instance.IsShutdown)
 
 	getNodes := makeGetNodes(server, config.NodesKey, instance)
+	getNodesCached := makeGetNodesCached(instance)
 
 	// Create syncer pool for keys that need outbound sync
 	// Keys with Local=true or where server IS pivot won't have syncers
@@ -447,7 +596,8 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		Client:            client,
 		ConfigClusterURL:  pivotURL,
 		Keys:              keys,
-		GetNodes:          getNodes,
+		NodesKey:          config.NodesKey,
+		GetNodes:          getNodesCached,
 		Pool:              pool,
 		NodeHealth:        nodeHealth,
 		OriginatorTracker: originatorTracker,
