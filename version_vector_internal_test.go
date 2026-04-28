@@ -13,6 +13,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// BenchmarkVVManagerIncrement measures the per-event cost of the storage-event
+// hot path's only mandatory operation. The number that matters most is ns/op
+// (~1µs target on modern hardware). Allocations should be near zero — every
+// extra alloc is paid for every storage event in a busy cluster.
+func BenchmarkVVManagerIncrement(b *testing.B) {
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	if err := db.Start(storage.Options{}); err != nil {
+		b.Fatal(err)
+	}
+	storage.WatchWithCallback(db, func(storage.Event) {})
+	b.Cleanup(func() { db.Close() })
+	m := NewVVManager(db, "leader")
+
+	keys := []string{"items", "things", "settings", "events", "metrics"}
+	// Prime the per-key entries so we measure steady-state cost, not first-load.
+	for _, k := range keys {
+		m.increment(k)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		m.increment(keys[i%len(keys)])
+	}
+}
+
 func TestVVManagerBasic(t *testing.T) {
 	monotonic.Init()
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
