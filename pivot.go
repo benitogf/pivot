@@ -23,32 +23,8 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// Node is the expected structure for entries in the NodesKey path.
-// User data stored at NodesKey must include "ip" and "port" fields.
-// Accepts both lowercase and uppercase field names for flexibility.
-type Node struct {
-	IP   string `json:"ip"`
-	Port int    `json:"port"`
-	// Alternative field names (uppercase)
-	IPAlt   string `json:"IP"`
-	PortAlt int    `json:"Port"`
-}
-
-// GetIP returns the IP from either field
-func (n Node) GetIP() string {
-	if n.IP != "" {
-		return n.IP
-	}
-	return n.IPAlt
-}
-
-// GetPort returns the port from either field
-func (n Node) GetPort() int {
-	if n.Port > 0 {
-		return n.Port
-	}
-	return n.PortAlt
-}
+// Entries written to NodesKey must include "ip" and "port" fields (lower or
+// upper case accepted) — this is the wire contract for parseNodeAddr.
 
 const (
 	// RoutePrefix is the HTTP route prefix for all pivot endpoints
@@ -63,7 +39,7 @@ type Config struct {
 	NodesKey            string        // Path for nodes - automatically synced via server.Storage, entries must have "ip" field
 	ExtraNodeURLs       []string      // Additional node URLs to sync with (not stored in NodesKey, e.g. auth servers)
 	ClusterURL          string        // Address of the cluster leader. Empty string means this server IS the leader.
-	Client              *http.Client  // Optional HTTP client for sync requests. If nil, DefaultClient() is used.
+	Client              *http.Client  // Optional HTTP client for sync requests. If nil, an internal default is used.
 	AutoSyncOnStart     bool          // If true, perform full bidirectional sync with cluster leader when node starts. Default false.
 	SSL                 bool          // If true, use HTTPS instead of HTTP for all requests. Default false.
 	HealthCheckInterval time.Duration // Interval for health checks. Default 3s.
@@ -78,16 +54,10 @@ func (c Config) Scheme() string {
 	return "http"
 }
 
-// BuildURL constructs a URL with the appropriate scheme.
-func (c Config) BuildURL(host, path string) string {
-	return c.Scheme() + "://" + host + path
-}
-
-// DefaultClient returns an HTTP client optimized for pivot synchronization.
-// - Short dial timeout (500ms) to quickly detect unreachable nodes
-// - Longer response timeout (30s) to handle large data transfers
-// - Connection pooling for efficiency
-func DefaultClient() *http.Client {
+// defaultClient returns an HTTP client tuned for pivot synchronization:
+// short dial timeout to detect unreachable nodes quickly, longer response
+// timeout for bulk data, and connection pooling.
+func defaultClient() *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
@@ -473,10 +443,10 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		}
 	}
 
-	// Use config.Client if provided, otherwise use DefaultClient()
+	// Use config.Client if provided, otherwise the internal default.
 	client := config.Client
 	if client == nil {
-		client = DefaultClient()
+		client = defaultClient()
 	}
 
 	// Check if pivot IP changed since last run - wipe data if so

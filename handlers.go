@@ -103,7 +103,7 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker,
 		}
 		// Increment version vector on pivot before storage write
 		if vvManager != nil {
-			vvManager.Increment(itemKey)
+			vvManager.increment(itemKey)
 		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
@@ -135,7 +135,7 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		}
 		// Increment version vector on pivot before storage write
 		if vvManager != nil {
-			vvManager.Increment(itemKey)
+			vvManager.increment(itemKey)
 		}
 		err := db.Del(itemKey)
 		db.Set(StoragePrefix+path, json.RawMessage(time))

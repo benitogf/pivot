@@ -27,11 +27,6 @@ func (k Key) EffectiveClusterURL(fallback string) string {
 	return fallback
 }
 
-// IsClusterLeaderFor returns true if this server IS the cluster leader for this key.
-func (k Key) IsClusterLeaderFor(configClusterURL string) bool {
-	return k.EffectiveClusterURL(configClusterURL) == ""
-}
-
 // FindKeyStorage finds the storage database for a given index by matching against the key paths.
 // Returns an error if no matching key is found.
 func FindKeyStorage(keys []Key, index string) (storage.Database, error) {
