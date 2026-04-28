@@ -119,7 +119,7 @@ func TestSyncOnRead(t *testing.T) {
 	require.NoError(t, err)
 
 	// Node should NOT have the data yet (no sync was triggered)
-	// But when we READ from node, BeforeRead triggers TryPull from pivot
+	// But when we READ from node, BeforeRead triggers TryPullKey from pivot
 	nodeSettings, err := ooo.Get[Settings](nodeServer, "settings")
 	require.NoError(t, err)
 	require.Equal(t, 42, nodeSettings.Data.DayEpoch, "node should have pulled settings from pivot on read")
