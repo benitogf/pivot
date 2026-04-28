@@ -115,9 +115,17 @@ func (vv VersionVector) Merge(other VersionVector) VersionVector {
 
 // encodeVV produces the JSON-compatible byte representation of a VersionVector
 // without going through encoding/json's reflection path. Keys are sorted
-// alphabetically so the output is byte-identical to json.Marshal of a
-// map[string]int64 — existing on-disk data and any consumers that compare bytes
-// continue to work unchanged. Decoding still uses json.Unmarshal.
+// alphabetically and escaped to match encoding/json's default output (HTMLEscape
+// on, \u00XX for control chars, shortcuts for \b\f\n\r\t and the standard
+// \" \\ pair). The result is byte-identical to json.Marshal of a
+// map[string]int64 for any input, with the single documented divergence that
+// the line-separator runes U+2028 and U+2029 — which json.Marshal escapes — are
+// passed through. They cannot appear in the IDs we use as VV keys ("leader" or
+// host:port produced by parseNodeAddr).
+//
+// Existing on-disk data continues to parse via the json.Unmarshal in
+// loadFromStorage, and any consumer comparing bytes continues to see the same
+// representation as before.
 func encodeVV(vv VersionVector) []byte {
 	if vv == nil {
 		return []byte("null")
@@ -139,11 +147,66 @@ func encodeVV(vv VersionVector) []byte {
 		if i > 0 {
 			buf = append(buf, ',')
 		}
-		buf = strconv.AppendQuote(buf, k)
+		buf = appendJSONString(buf, k)
 		buf = append(buf, ':')
 		buf = strconv.AppendInt(buf, vv[k], 10)
 	}
 	buf = append(buf, '}')
+	return buf
+}
+
+// jsonHex is the lowercase hex digit table used for \u00XX escapes (matching
+// encoding/json's output exactly).
+const jsonHex = "0123456789abcdef"
+
+// appendJSONString writes s into buf as a JSON string literal, matching
+// encoding/json's default Marshal behavior (HTMLEscape on). The known
+// divergence is U+2028 / U+2029 — see encodeVV's doc comment.
+func appendJSONString(buf []byte, s string) []byte {
+	buf = append(buf, '"')
+	start := 0
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		// Pass through ASCII printable characters that don't need escaping.
+		// json.Marshal's default HTMLEscape=true also escapes <, >, & to keep
+		// JSON safely embeddable in HTML — match that here.
+		if b >= 0x20 && b != '"' && b != '\\' && b != '<' && b != '>' && b != '&' && b < 0x7f {
+			continue
+		}
+		// Flush any pending safe run.
+		if start < i {
+			buf = append(buf, s[start:i]...)
+		}
+		switch b {
+		case '"', '\\':
+			buf = append(buf, '\\', b)
+		case '\b':
+			buf = append(buf, '\\', 'b')
+		case '\f':
+			buf = append(buf, '\\', 'f')
+		case '\n':
+			buf = append(buf, '\\', 'n')
+		case '\r':
+			buf = append(buf, '\\', 'r')
+		case '\t':
+			buf = append(buf, '\\', 't')
+		default:
+			// Other control characters and the HTML-unsafe set get \u00XX.
+			// High bit (b >= 0x7f) bytes are part of multi-byte UTF-8 sequences;
+			// passing them through preserves the rune. The U+2028/U+2029
+			// special-case in encoding/json is the only divergence.
+			if b < 0x20 || b == '<' || b == '>' || b == '&' {
+				buf = append(buf, '\\', 'u', '0', '0', jsonHex[b>>4], jsonHex[b&0xf])
+			} else {
+				buf = append(buf, b)
+			}
+		}
+		start = i + 1
+	}
+	if start < len(s) {
+		buf = append(buf, s[start:]...)
+	}
+	buf = append(buf, '"')
 	return buf
 }
 
