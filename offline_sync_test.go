@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/benitogf/ooo"
-	"github.com/benitogf/ooo/monotonic"
 	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/pivot"
 	"github.com/gorilla/mux"
@@ -52,63 +51,6 @@ func TestVersionVectorMerge(t *testing.T) {
 	require.Equal(t, int64(2), merged["leader"])
 	require.Equal(t, int64(3), merged["nodeA"])
 	require.Equal(t, int64(1), merged["nodeB"])
-}
-
-func TestVersionVectorIncrement(t *testing.T) {
-	vv := pivot.VersionVector{"leader": 1}
-	vv2 := vv.Increment("nodeA")
-
-	// Original unchanged
-	require.Equal(t, int64(0), vv["nodeA"])
-	// New has increment
-	require.Equal(t, int64(1), vv2["nodeA"])
-	require.Equal(t, int64(1), vv2["leader"])
-}
-
-func TestVVManagerBasic(t *testing.T) {
-	monotonic.Init()
-	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
-	db.Start(storage.Options{})
-	defer db.Close()
-
-	manager := pivot.NewVVManager(db, "leader")
-
-	// Get non-existent key returns empty VV
-	vv := manager.Get("testkey")
-	require.Empty(t, vv)
-
-	// Increment creates entry
-	vv = manager.Increment("testkey")
-	require.Equal(t, int64(1), vv["leader"])
-
-	// Increment again
-	vv = manager.Increment("testkey")
-	require.Equal(t, int64(2), vv["leader"])
-
-	// Set from remote
-	remoteVV := pivot.VersionVector{"leader": 2, "nodeA": 5}
-	manager.Set("testkey", remoteVV)
-
-	vv = manager.Get("testkey")
-	require.Equal(t, int64(2), vv["leader"])
-	require.Equal(t, int64(5), vv["nodeA"])
-}
-
-func TestVVManagerPersistence(t *testing.T) {
-	monotonic.Init()
-	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
-	db.Start(storage.Options{})
-	defer db.Close()
-
-	// Create manager and set some data
-	manager1 := pivot.NewVVManager(db, "leader")
-	manager1.Increment("testkey")
-	manager1.Increment("testkey")
-
-	// Create new manager with same storage - should load persisted data
-	manager2 := pivot.NewVVManager(db, "leader")
-	vv := manager2.Get("testkey")
-	require.Equal(t, int64(2), vv["leader"])
 }
 
 func TestConflictDetection(t *testing.T) {

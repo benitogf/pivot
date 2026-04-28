@@ -396,17 +396,15 @@ type pendingOp struct {
 // It ensures only one sync runs at a time and tracks pulled keys.
 // Uses a per-key queue to ensure operations aren't lost during contention.
 type syncer struct {
-	mu        sync.Mutex
-	tracker   *pullTracker
-	client    *http.Client
-	pivot     string
-	keys      []Key
-	nodeAddr  string // This node's address (for originator tracking)
-	ssl       bool   // Use HTTPS instead of HTTP
-	queueMu   sync.Mutex
-	queue     []pendingOp // Per-key operations queued during Pull
-	AfterPull func()      // Optional callback after Pull completes (for testing)
-	AfterSync func()      // Optional callback after sync to pivot completes (for testing)
+	mu       sync.Mutex
+	tracker  *pullTracker
+	client   *http.Client
+	pivot    string
+	keys     []Key
+	nodeAddr string // This node's address (for originator tracking)
+	ssl      bool   // Use HTTPS instead of HTTP
+	queueMu  sync.Mutex
+	queue    []pendingOp // Per-key operations queued during Pull
 
 	// Version vector cache: tracks last synced pivot VV per key.
 	// This is the primary sync indicator, independent of system clocks.
@@ -491,47 +489,6 @@ func (p *syncerPool) SetNodeAddr(addr string) {
 	}
 }
 
-// GetSyncer returns the syncer for a given key path, or nil if key is in pivot mode
-func (p *syncerPool) GetSyncer(keyPath string) *syncer {
-	pivotURL, ok := p.keyMap[keyPath]
-	if !ok {
-		return nil
-	}
-	return p.syncers[pivotURL]
-}
-
-// GetSyncerForKey returns the syncer for a key that matches the given index
-func (p *syncerPool) GetSyncerForKey(index string, keys []Key, configClusterURL string) *syncer {
-	for _, k := range keys {
-		if key.Match(k.Path, index) {
-			effectiveURL := k.EffectiveClusterURL(configClusterURL)
-			if effectiveURL == "" {
-				return nil // pivot mode
-			}
-			return p.syncers[effectiveURL]
-		}
-	}
-	return nil
-}
-
-// AllSyncers returns all syncers in the pool
-func (p *syncerPool) AllSyncers() []*syncer {
-	result := make([]*syncer, 0, len(p.syncers))
-	for _, s := range p.syncers {
-		result = append(result, s)
-	}
-	return result
-}
-
-// ClusterURLs returns all unique pivot URLs in the pool
-func (p *syncerPool) ClusterURLs() []string {
-	result := make([]string, 0, len(p.syncers))
-	for url := range p.syncers {
-		result = append(result, url)
-	}
-	return result
-}
-
 // PullAll triggers Pull on all syncers
 func (p *syncerPool) PullAll() {
 	for _, s := range p.syncers {
@@ -582,32 +539,6 @@ func (s *syncer) Pull() error {
 	// Process any queued per-key operations
 	s.processQueue()
 
-	// Call AfterPull callback if set (for test synchronization)
-	if s.AfterPull != nil {
-		s.AfterPull()
-	}
-	return err
-}
-
-// TryPull attempts to sync FROM leader, skipping if already in progress
-func (s *syncer) TryPull() error {
-	if !s.mu.TryLock() {
-		return nil
-	}
-	opts := SyncOptions{
-		OnDelete: s.tracker.trackDelete,
-		OnSet:    s.tracker.trackSet,
-	}
-	err := pullFromLeaderWithTracking(s.ClientOpts(), opts, s.keys)
-	s.mu.Unlock()
-
-	// Process any queued per-key operations
-	s.processQueue()
-
-	// Call AfterPull callback if set (for test synchronization)
-	if s.AfterPull != nil {
-		s.AfterPull()
-	}
 	return err
 }
 
@@ -655,10 +586,6 @@ func (s *syncer) TryPullKey(keyPath string) error {
 	// Process any queued per-key operations
 	s.processQueue()
 
-	// Call AfterPull callback if set (for test synchronization)
-	if s.AfterPull != nil {
-		s.AfterPull()
-	}
 	return err
 }
 
@@ -690,7 +617,7 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 				needSync = true
 			case VVConcurrent:
 				// Conflict detected - log and sync (last-sync-wins)
-				LogConflict(baseKey, localVV, activityPivot.VV, "last-sync-wins: accepting pivot data")
+				logConflict(baseKey, localVV, activityPivot.VV, "last-sync-wins: accepting pivot data")
 				needSync = true
 			}
 			// VVEqual or VVGreater means no sync needed
@@ -733,28 +660,6 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 	return errors.New("nothing to synchronize")
 }
 
-// InvalidateCache clears the VV and activity cache for a key, forcing next read to check pivot.
-// Called when we know pivot has new data (e.g., TriggerNodeSync received).
-func (s *syncer) InvalidateCache(keyPath string) {
-	baseKey := baseKeyFromPath(keyPath)
-	s.vvMu.Lock()
-	delete(s.lastSyncedVV, baseKey)
-	s.vvMu.Unlock()
-	s.activityMu.Lock()
-	delete(s.lastSyncedActivity, baseKey)
-	s.activityMu.Unlock()
-}
-
-// InvalidateAllCache clears all cached VV and activity, forcing next reads to check pivot.
-func (s *syncer) InvalidateAllCache() {
-	s.vvMu.Lock()
-	s.lastSyncedVV = make(map[string]VersionVector)
-	s.vvMu.Unlock()
-	s.activityMu.Lock()
-	s.lastSyncedActivity = make(map[string]int64)
-	s.activityMu.Unlock()
-}
-
 // PullKey syncs a specific key FROM pivot (blocking - waits for lock)
 // This is called by TriggerNodeSync when pivot has new data.
 func (s *syncer) PullKey(keyPath string) error {
@@ -787,10 +692,6 @@ func (s *syncer) PullKey(keyPath string) error {
 	// Process any queued per-key operations
 	s.processQueue()
 
-	// Call AfterPull callback if set (for test synchronization)
-	if s.AfterPull != nil {
-		s.AfterPull()
-	}
 	return err
 }
 
@@ -843,9 +744,6 @@ func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 	if s.mu.TryLock() {
 		sendToLeader(s.ClientOpts(), key, obj, s.nodeAddr)
 		s.mu.Unlock()
-		if s.AfterSync != nil {
-			s.AfterSync()
-		}
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
 		s.queueMu.Lock()
@@ -855,9 +753,6 @@ func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 		s.mu.Lock()
 		s.processQueueLocked()
 		s.mu.Unlock()
-		if s.AfterSync != nil {
-			s.AfterSync()
-		}
 	}
 }
 
@@ -866,9 +761,6 @@ func (s *syncer) QueueOrSendDelete(key string, ts int64) {
 	if s.mu.TryLock() {
 		sendDeleteToLeader(s.ClientOpts(), key, ts, s.nodeAddr)
 		s.mu.Unlock()
-		if s.AfterSync != nil {
-			s.AfterSync()
-		}
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
 		s.queueMu.Lock()
@@ -878,32 +770,12 @@ func (s *syncer) QueueOrSendDelete(key string, ts int64) {
 		s.mu.Lock()
 		s.processQueueLocked()
 		s.mu.Unlock()
-		if s.AfterSync != nil {
-			s.AfterSync()
-		}
 	}
 }
 
 // Sync performs bidirectional synchronization with tracking
 func (s *syncer) Sync() error {
 	s.mu.Lock()
-	opts := SyncOptions{
-		Originator:     s.nodeAddr,
-		IsRecentDelete: s.tracker.pulledDelete,
-		OnDelete:       s.tracker.trackDelete,
-		OnSet:          s.tracker.trackSet,
-	}
-	err := synchronizeKeysWithTracking(s.ClientOpts(), opts, s.keys)
-	s.mu.Unlock()
-	return err
-}
-
-// TrySync attempts sync but skips if already in progress
-// Uses tracking to prevent storage events from triggering redundant syncs
-func (s *syncer) TrySync() error {
-	if !s.mu.TryLock() {
-		return nil
-	}
 	opts := SyncOptions{
 		Originator:     s.nodeAddr,
 		IsRecentDelete: s.tracker.pulledDelete,
@@ -1032,7 +904,7 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 		if isPivotForKey {
 			// This server IS pivot for this key - increment VV and notify all nodes asynchronously
 			if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-				cfg.Instance.VVManager.Increment(event.Key)
+				cfg.Instance.VVManager.increment(event.Key)
 			}
 			// Get and clear the originator for this key (set by handler before storage write)
 			var originator string
@@ -1067,7 +939,7 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 		} else {
 			// This server is node for this key - increment local VV and sync to pivot
 			if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-				cfg.Instance.VVManager.Increment(event.Key)
+				cfg.Instance.VVManager.increment(event.Key)
 			}
 			if cfg.Pool != nil {
 				s := cfg.Pool.syncers[effectiveClusterURL]
