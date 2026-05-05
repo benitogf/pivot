@@ -358,10 +358,13 @@ func (nh *NodeHealth) MarkHealthy(node string) {
 	}
 	nh.mu.Unlock()
 
-	// Notify if status changed
+	// Notify if status changed. Wrap in a closure with deferred Done so a
+	// panicking user callback can't leak the wait-group counter and hang Stop().
 	if !wasHealthy && callback != nil {
-		callback()
-		nh.callbackWg.Done()
+		func() {
+			defer nh.callbackWg.Done()
+			callback()
+		}()
 	}
 }
 
@@ -381,9 +384,12 @@ func (nh *NodeHealth) MarkUnhealthy(node string) {
 	}
 	nh.mu.Unlock()
 
-	// Notify if status changed
+	// Notify if status changed. Wrap in a closure with deferred Done so a
+	// panicking user callback can't leak the wait-group counter and hang Stop().
 	if wasHealthy && callback != nil {
-		callback()
-		nh.callbackWg.Done()
+		func() {
+			defer nh.callbackWg.Done()
+			callback()
+		}()
 	}
 }

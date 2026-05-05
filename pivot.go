@@ -95,11 +95,11 @@ func parseNodeAddr(data []byte) string {
 	}
 	var port int
 	for _, k := range [2]string{"port", "Port"} {
+		// encoding/json decodes JSON numbers into float64 for map[string]any.
+		// String fallback covers values written as quoted numbers.
 		switch v := raw[k].(type) {
 		case float64:
 			port = int(v)
-		case int:
-			port = v
 		case string:
 			port, _ = strconv.Atoi(v)
 		}
@@ -554,12 +554,14 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	}
 	instance.VVManager = vvManager
 
-	// Shutdown instance and VVManager before storage closes to prevent race conditions
+	// Shutdown instance and VVManager before storage closes to prevent race conditions.
+	// removeInstance drops the registry entry so re-creating the server doesn't leak.
 	server.RegisterPreClose(func() {
 		instance.Shutdown()
 		if vvManager != nil {
 			vvManager.Shutdown()
 		}
+		removeInstance(server)
 	})
 
 	syncCallback := makeStorageSync(StorageSyncConfig{
