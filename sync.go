@@ -300,38 +300,6 @@ func synchronizeKeysWithTracking(clientOpts ClientOpts, opts SyncOptions, keys [
 	return errors.New("nothing to synchronize")
 }
 
-// pullFromLeaderWithTracking syncs FROM leader and tracks synced keys.
-// Uses timestamp-based comparison.
-// onDelete is called for each key deleted locally, onSet is called for each key set locally.
-// skipSet is called before setting a key - if it returns true, the set is skipped.
-func pullFromLeaderWithTracking(clientOpts ClientOpts, opts SyncOptions, keys []Key) error {
-	update := false
-	for _, k := range keys {
-		baseKey := baseKeyFromPath(k.Path)
-		activityLeader, err := checkLeaderActivity(clientOpts, baseKey)
-		if err != nil {
-			continue
-		}
-		activityLocal, err := checkActivity(k)
-		if err != nil {
-			continue
-		}
-		// Only sync if leader has newer data
-		if activityLeader.LastEntry > activityLocal.LastEntry {
-			keyOpts := opts
-			keyOpts.Key = k
-			keyOpts.LastEntry = activityLeader.LastEntry
-			if err := syncLocalEntriesWithTracking(clientOpts, keyOpts); err == nil {
-				update = true
-			}
-		}
-	}
-	if update {
-		return nil
-	}
-	return errors.New("nothing to synchronize")
-}
-
 // pullTracker tracks keys that are being modified during sync operations.
 // Keys are tracked before storage operations and consumed (removed) when checked.
 // This ensures each storage event is only skipped once.

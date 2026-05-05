@@ -240,3 +240,12 @@ func storeInstance(server *ooo.Server, instance *Instance) {
 	instances[server] = instance
 	instancesMu.Unlock()
 }
+
+// removeInstance drops the entry from the registry. Called on shutdown so a
+// process that recreates servers (tests, supervised in-process restarts)
+// doesn't leak one map entry per server for the rest of the process's life.
+func removeInstance(server *ooo.Server) {
+	instancesMu.Lock()
+	delete(instances, server)
+	instancesMu.Unlock()
+}
