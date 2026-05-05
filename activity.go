@@ -3,7 +3,6 @@ package pivot
 import (
 	"encoding/json"
 	"errors"
-	"net/http"
 	"strconv"
 
 	"github.com/benitogf/ooo/key"
@@ -78,8 +77,11 @@ func checkActivity(_key Key) (ActivityEntry, error) {
 	return activity, nil
 }
 
-func checkPivotActivity(client *http.Client, pivot string, key string) (ActivityEntry, error) {
-	return checkLeaderActivity(ClientOpts{Client: client, Leader: pivot}, key)
+// checkPivotActivity is the syncer-side activity poll. It MUST take the full
+// ClientOpts (not just client + leader) so the SSL flag is forwarded — without
+// it, an `ssl=true` syncer would silently downgrade activity URLs to http://.
+func checkPivotActivity(opts ClientOpts, key string) (ActivityEntry, error) {
+	return checkLeaderActivity(opts, key)
 }
 
 func checkLeaderActivity(opts ClientOpts, key string) (ActivityEntry, error) {
