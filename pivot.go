@@ -554,12 +554,22 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	}
 	instance.VVManager = vvManager
 
+	// Per-node trigger coalescer — replaces the goroutine-per-event-per-node
+	// fan-out from the broadcast loop. Only pivot servers broadcast, so we
+	// only spin one up when this server has pivot-role keys.
+	if hasPivotKeys {
+		instance.triggers = newTriggerCoalescer(client, pool, nodeHealth)
+	}
+
 	// Shutdown instance and VVManager before storage closes to prevent race conditions.
 	// removeInstance drops the registry entry so re-creating the server doesn't leak.
 	server.RegisterPreClose(func() {
 		instance.Shutdown()
 		if vvManager != nil {
 			vvManager.Shutdown()
+		}
+		if instance.triggers != nil {
+			instance.triggers.Shutdown()
 		}
 		removeInstance(server)
 	})

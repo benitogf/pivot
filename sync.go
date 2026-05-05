@@ -889,20 +889,11 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 				if cfg.NodeHealth != nil && !cfg.NodeHealth.IsCompatible(node) {
 					continue
 				}
-				go func(n string, keyPath string) {
-					ssl := false
-					if cfg.Pool != nil {
-						ssl = cfg.Pool.ssl
-					}
-					ok := TriggerNodeSyncWithHealth(ClientOpts{Client: cfg.Client, SSL: ssl}, n, keyPath)
-					if cfg.NodeHealth != nil {
-						if ok {
-							cfg.NodeHealth.MarkHealthy(n)
-						} else {
-							cfg.NodeHealth.MarkUnhealthy(n)
-						}
-					}
-				}(node, matchedKeyConfig.Path)
+				// The coalescer collapses bursts of triggers for the same node into a
+				// single in-flight HTTP call (drainer goroutine per node, 1-buffered
+				// notify, no timer). Setup always wires it on pivot servers, which
+				// is the only path that reaches this branch.
+				cfg.Instance.triggers.Trigger(node, matchedKeyConfig.Path)
 			}
 		} else {
 			// This server is node for this key - increment local VV and sync to pivot
