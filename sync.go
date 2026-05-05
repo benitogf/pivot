@@ -597,7 +597,7 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 	update := false
 	for _, _key := range keys {
 		baseKey := baseKeyFromPath(_key.Path)
-		activityPivot, err := checkPivotActivity(s.client, s.pivot, baseKey)
+		activityPivot, err := checkPivotActivity(s.ClientOpts(), baseKey)
 		if err != nil {
 			continue
 		}
