@@ -120,13 +120,12 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
-			// Layered.Set returns errors only for input validation
-			// (ErrInvalidPath / ErrInvalidStorageData) — those paths suppress
-			// the event entirely, so our Mark would never be Consumed and
-			// would accumulate. Wrapper-level rejections (failingItemStorage
-			// in tests, custom Database wrappers in real use) also short-
-			// circuit before Layered runs and don't fire the event. Either
-			// way, Unmark on error prevents a leak.
+			// Contract: a non-nil error from the storage layer means no
+			// event was fired (verified for Layered: every error path
+			// returns before sendEvent; wrapper Databases short-circuit
+			// before Layered runs at all). The Mark would never be
+			// Consumed without this Unmark, so without it pending counts
+			// would accumulate on every storage failure.
 			if handlerTracker != nil {
 				handlerTracker.Unmark(itemKey)
 			}

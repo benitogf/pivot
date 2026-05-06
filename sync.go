@@ -861,15 +861,6 @@ func (t *HandlerWriteTracker) Consume(key string) bool {
 	return true
 }
 
-// Len returns the number of keys with non-zero pending counts. Intended
-// for tests that need to wait for the watch goroutine to drain all
-// outstanding events without sleeping.
-func (t *HandlerWriteTracker) Len() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.pending)
-}
-
 // applyPivotFanout triggers a sync on every healthy peer node except the
 // originating one. Shared between the Set/Delete handlers (called
 // synchronously after the local VV bump) and the storage event callback

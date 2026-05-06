@@ -16,6 +16,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// pendingLen exposes the tracker's pending count for tests that need to
+// wait for the watch goroutine to drain. Lives in the test file so it
+// doesn't leak into the production API surface — production code has no
+// legitimate need to introspect the tracker.
+func (t *HandlerWriteTracker) pendingLen() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.pending)
+}
+
 // failingTombstoneStorage forces Set on the pivot tombstone prefix to fail.
 // VV writes (StoragePrefix+"vv/") are also under StoragePrefix, but the
 // Delete handler's tombstone target is "pivot/<basekey>" exactly, so the
@@ -231,8 +241,8 @@ func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
 	}
 
 	// Wait deterministically for the watch goroutine to drain every event;
-	// when tracker.Len() hits zero, every Mark has been Consumed.
-	require.Eventually(t, func() bool { return tracker.Len() == 0 }, 2*time.Second, 5*time.Millisecond,
+	// when tracker.pendingLen() hits zero, every Mark has been Consumed.
+	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, 2*time.Second, 5*time.Millisecond,
 		"watch goroutine never drained all %d events", burst)
 
 	got := vvm.Get("things/abc")["leader"]
@@ -265,7 +275,10 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 	}))
 
 	// Seed a few items so each Delete actually has something to remove.
-	for _, idx := range []string{"a", "b", "c"} {
+	// Seeding goes through db.SetWithMeta directly (no Mark), so each event
+	// flows through the callback's empty-tracker branch and bumps VV.
+	indices := []string{"a", "b", "c"}
+	for _, idx := range indices {
 		nowUnix := time.Now().UTC().UnixNano()
 		obj := meta.Object{Created: nowUnix, Updated: nowUnix, Index: idx, Path: "things/" + idx, Data: []byte(`{"v":1}`)}
 		body, err := json.Marshal(obj)
@@ -273,8 +286,17 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 		_, err = db.SetWithMeta("things/"+idx, body, nowUnix, nowUnix)
 		require.NoError(t, err)
 	}
-	// Wait for the seeding events to drain so they don't influence the assertion.
-	require.Eventually(t, func() bool { return tracker.Len() == 0 }, 2*time.Second, 5*time.Millisecond)
+	// Wait until the seed VV bumps actually landed via the callback. Without
+	// this, a Delete fired before its seed event drained could observe an
+	// in-flight VV state and racy interactions could mask a regression.
+	require.Eventually(t, func() bool {
+		for _, idx := range indices {
+			if vvm.Get("things/" + idx)["leader"] != 1 {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 5*time.Millisecond, "seed VV bumps never landed")
 
 	handler := Delete(db, "things", tracker, vvm, nil)
 	for _, idx := range []string{"a", "b", "c"} {
@@ -286,8 +308,8 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 		require.Equal(t, 200, w.Code)
 	}
 
-	require.Eventually(t, func() bool { return tracker.Len() == 0 }, 2*time.Second, 5*time.Millisecond,
-		"tracker leaked entries after Deletes drained: Len=%d", tracker.Len())
+	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, 2*time.Second, 5*time.Millisecond,
+		"tracker leaked entries after Deletes drained: Len=%d", tracker.pendingLen())
 }
 
 // TestSetPostWriteSeesBumpedVV pins the in-handler ordering: the post-write
