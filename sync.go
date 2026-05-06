@@ -800,69 +800,65 @@ func (s *syncer) PulledSet(key string) bool {
 // StorageSyncCallback is the callback type for storage sync events
 type StorageSyncCallback func(event storage.Event)
 
-// OriginatorTracker tracks which node originated a storage change.
-// Set serves two roles:
-//  1. Trigger fanout: when the originator is a peer node address, the
-//     storage callback skips re-triggering that peer (echo prevention).
-//  2. VV-bump dedup: presence of any entry signals "the handler will
-//     drive the VV bump after storage success" — the storage callback
-//     skips its own VV bump when an entry is present, so handler-driven
-//     writes bump exactly once. Direct (non-handler) storage writes
-//     leave the tracker empty and the callback bumps VV as before.
+// HandlerWriteTracker counts in-flight handler-driven writes per key.
+// The Set/Delete handlers Mark before the storage write and the storage
+// event callback Consumes when the event lands; while the count for a
+// key is > 0, the callback knows a handler will own the post-write work
+// (VV bump + fanout/push) and skips its own. A counter — not a single
+// last-writer-wins entry — is required because two rapid handler writes
+// to the same key would otherwise have one tracker entry but produce
+// two storage events; the second event would find an empty tracker and
+// the callback would double-do the work.
 //
-// Empty incoming originators (handler called with no OriginatorHeader)
-// are stored under a sentinel value so role 2 still fires; the sentinel
-// can't match any real node address, so role 1 acts as a no-op.
-type OriginatorTracker struct {
-	mu          sync.Mutex
-	originators map[string]string // key -> originator address
+// Direct (non-handler) storage writes never call Mark, so Consume returns
+// false and the callback runs its full path — that's how the callback
+// remains the source of truth for direct writes.
+type HandlerWriteTracker struct {
+	mu      sync.Mutex
+	pending map[string]int
 }
 
-// originatorSelfMarker is the sentinel stored when a handler runs without
-// an OriginatorHeader. It must not collide with any real node address —
-// node addresses are host:port strings, which can't contain a literal
-// colon-prefixed sentinel like this one.
-const originatorSelfMarker = ":handler-self"
-
-// NewOriginatorTracker creates a new originator tracker
-func NewOriginatorTracker() *OriginatorTracker {
-	return &OriginatorTracker{
-		originators: make(map[string]string),
-	}
+// NewHandlerWriteTracker creates an empty tracker.
+func NewHandlerWriteTracker() *HandlerWriteTracker {
+	return &HandlerWriteTracker{pending: make(map[string]int)}
 }
 
-// Set records the originator for a key (call before storage write).
-// Empty originators are stored as a sentinel so the callback can still
-// see "this event was handler-driven" and skip its own VV bump.
-func (t *OriginatorTracker) Set(key, originator string) {
-	if originator == "" {
-		originator = originatorSelfMarker
-	}
+// Mark records that a handler is about to drive a write for the given key.
+// Must be called before the storage write so the dedup signal is in place
+// by the time the watch goroutine processes the event.
+func (t *HandlerWriteTracker) Mark(key string) {
 	t.mu.Lock()
-	t.originators[key] = originator
+	t.pending[key]++
 	t.mu.Unlock()
 }
 
-// Take returns and clears the originator for a key — call from the storage
-// callback (read-and-consume) or from a handler error path (drop a stale
-// entry). Returns "" if no entry was present.
-func (t *OriginatorTracker) Take(key string) string {
+// Unmark drops a previously-recorded mark — call from the handler's error
+// path when the storage write didn't fire an event.
+func (t *HandlerWriteTracker) Unmark(key string) {
 	t.mu.Lock()
-	originator := t.originators[key]
-	delete(t.originators, key)
+	if t.pending[key] > 0 {
+		t.pending[key]--
+		if t.pending[key] == 0 {
+			delete(t.pending, key)
+		}
+	}
 	t.mu.Unlock()
-	return originator
 }
 
-// peerOriginator returns the originator only if it represents a real peer
-// (i.e. not the self-marker). Used by the trigger fanout to skip echoing
-// back to the originating peer; the self-marker translates to "no real
-// peer" so fanout reaches every node.
-func peerOriginator(o string) string {
-	if o == originatorSelfMarker {
-		return ""
+// Consume returns true and decrements the pending count if a mark is
+// present for the key (i.e. this event is handler-driven). Returns false
+// otherwise (i.e. this event is from a direct storage write).
+func (t *HandlerWriteTracker) Consume(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pending[key] == 0 {
+		return false
 	}
-	return o
+	t.pending[key]--
+	if t.pending[key] == 0 {
+		delete(t.pending, key)
+	}
+	return true
 }
 
 // applyPivotFanout triggers a sync on every healthy peer node except the
@@ -909,15 +905,15 @@ func applyNodePush(pool *syncerPool, db storage.Database, effectiveURL, op, item
 
 // StorageSyncConfig holds configuration for storage sync callback creation.
 type StorageSyncConfig struct {
-	Client            *http.Client
-	ConfigClusterURL  string
-	Keys              []Key
-	NodesKey          string
-	GetNodes          getNodes
-	Pool              *syncerPool
-	NodeHealth        *NodeHealth
-	OriginatorTracker *OriginatorTracker
-	Instance          *Instance
+	Client           *http.Client
+	ConfigClusterURL string
+	Keys             []Key
+	NodesKey         string
+	GetNodes         getNodes
+	Pool             *syncerPool
+	NodeHealth       *NodeHealth
+	HandlerTracker   *HandlerWriteTracker
+	Instance         *Instance
 }
 
 // makeStorageSync creates a callback that triggers synchronization on storage events.
@@ -976,19 +972,15 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 		}
 
 		// Get and clear the originator for this key. A non-empty entry
-		// (including the self-marker) signals "a handler is driving this
-		// write and owns both the VV bump and the post-write fanout/push";
-		// we skip BOTH here so the handler can sequence them: bump first,
-		// then trigger peers. That ordering guarantee matters because a
-		// peer woken by the trigger immediately reads /activity to compare
-		// VVs, and seeing a pre-bump VV would make it skip the pull.
-		// An empty entry means a direct (non-handler) storage write — the
-		// callback is then the only place that can bump and propagate.
-		var originator string
-		if cfg.OriginatorTracker != nil {
-			originator = cfg.OriginatorTracker.Take(event.Key)
-		}
-		if originator != "" {
+		// Handler-driven writes Mark before db.Set, so a Consume hit means
+		// "a handler will own both the VV bump and the post-write fanout/push";
+		// skip BOTH here so the handler can sequence them: bump first, then
+		// trigger peers. That ordering guarantee matters because a peer woken
+		// by the trigger immediately reads /activity to compare VVs, and a
+		// pre-bump VV would make it skip the pull. A miss means a direct
+		// (non-handler) storage write — the callback is then the only place
+		// that can bump and propagate.
+		if cfg.HandlerTracker != nil && cfg.HandlerTracker.Consume(event.Key) {
 			return
 		}
 		if cfg.Instance != nil && cfg.Instance.VVManager != nil {

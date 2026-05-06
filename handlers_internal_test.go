@@ -115,18 +115,18 @@ func TestSetVVIncrementsExactlyOnce(t *testing.T) {
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
 
-	originator := NewOriginatorTracker()
+	tracker := NewHandlerWriteTracker()
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
 	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
-		Keys:              keys,
-		GetNodes:          func() []string { return nil },
-		OriginatorTracker: originator,
-		Instance:          instance,
+		Keys:           keys,
+		GetNodes:       func() []string { return nil },
+		HandlerTracker: tracker,
+		Instance:       instance,
 	}))
 
-	handler := Set(db, "things", originator, vvm, nil)
+	handler := Set(db, "things", tracker, vvm, nil)
 
 	doSet := func(idx string) {
 		body := strings.NewReader(`{"created":0,"updated":0,"index":"` + idx + `","path":"things/` + idx + `","data":"e30="}`)
@@ -161,20 +161,20 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
 
-	originator := NewOriginatorTracker()
+	tracker := NewHandlerWriteTracker()
 	vvm := NewVVManager(db, "127.0.0.1:9999") // node-style nodeID
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
 	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
-		Keys:              keys,
-		ConfigClusterURL:  "127.0.0.1:8000", // non-empty -> node mode
-		GetNodes:          func() []string { return nil },
-		OriginatorTracker: originator,
-		Instance:          instance,
+		Keys:             keys,
+		ConfigClusterURL: "127.0.0.1:8000", // non-empty -> node mode
+		GetNodes:         func() []string { return nil },
+		HandlerTracker:   tracker,
+		Instance:         instance,
 	}))
 
-	handler := Set(db, "things", originator, vvm, nil)
+	handler := Set(db, "things", tracker, vvm, nil)
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
 	req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
 	req = mux.SetURLVars(req, map[string]string{"index": "abc"})
@@ -189,15 +189,68 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 		"node-role HTTP Set must bump local counter exactly once; got %d", got["127.0.0.1:9999"])
 }
 
-// TestSetPostWriteSeesBumpedVV pins the trigger-after-bump invariant. With
-// the post-write fanout running synchronously after the VV bump (not from
-// the async storage event callback), a peer woken by the trigger reads a
-// fresh VV every time. We assert this by hooking the post-write callback
-// and reading the VV inside it — the bump must already be visible.
+// TestSetVVIncrementsExactlyOnceUnderBurst pins the invariant that even
+// when N rapid handler-driven Sets to the same key fire before the watch
+// goroutine can drain any of them, the VV bumps exactly N times — not
+// N + (number-of-events-the-callback-double-bumps-for).
 //
-// Pre-fix this test would fail because the trigger fanout fired from the
-// storage callback running on the watch goroutine, which could race the
-// handler's own increment call.
+// Pre-fix the tracker stored a single per-key entry (last-writer-wins),
+// so K back-to-back handler Sets would collapse into one entry; the
+// callback would Take it on the first event and then find the tracker
+// empty for the remaining K-1 events and bump again. The fix uses a
+// per-key counter so each handler's Mark is matched by exactly one
+// Consume.
+func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, db.Start(storage.Options{}))
+	defer db.Close()
+
+	tracker := NewHandlerWriteTracker()
+	vvm := NewVVManager(db, "leader")
+	keys := []Key{{Path: "things/*", Database: db}}
+	instance := &Instance{VVManager: vvm}
+	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+		Keys:           keys,
+		GetNodes:       func() []string { return nil },
+		HandlerTracker: tracker,
+		Instance:       instance,
+	}))
+
+	handler := Set(db, "things", tracker, vvm, nil)
+
+	const burst = 10
+	for range burst {
+		body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
+		req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
+		req = mux.SetURLVars(req, map[string]string{"index": "abc"})
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler(w, req)
+		require.Equal(t, 200, w.Code)
+	}
+
+	// Generous settle: every event must drain through the watch goroutine
+	// before we assert. If the callback double-bumped on any event, we'll
+	// see a counter > burst here.
+	time.Sleep(300 * time.Millisecond)
+
+	got := vvm.Get("things/abc")["leader"]
+	require.Equal(t, int64(burst), got,
+		"%d back-to-back HTTP Sets must bump leader counter exactly %d times; got %d means the per-key dedup collapsed under burst",
+		burst, burst, got)
+}
+
+// TestSetPostWriteSeesBumpedVV pins the in-handler ordering: the post-write
+// hook runs after vvManager.increment, on the same goroutine. That's what
+// makes the trigger fanout fire AFTER the bump, so a peer woken by the
+// trigger reads a fresh VV.
+//
+// Note: this only pins the local sequence inside the handler. The actual
+// cross-process race (peer GET /activity racing our increment) is closed
+// by that local sequence — verifying it end-to-end would require two
+// httptest servers and intercepting the trigger HTTP call, which the
+// existing integration tests in cluster_test.go cover at a higher level.
 func TestSetPostWriteSeesBumpedVV(t *testing.T) {
 	monotonic.Init()
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
@@ -205,7 +258,7 @@ func TestSetPostWriteSeesBumpedVV(t *testing.T) {
 	defer db.Close()
 	storage.WatchWithCallback(db, func(storage.Event) {})
 
-	originator := NewOriginatorTracker()
+	tracker := NewHandlerWriteTracker()
 	vvm := NewVVManager(db, "leader")
 
 	var observedAt int64
@@ -213,7 +266,7 @@ func TestSetPostWriteSeesBumpedVV(t *testing.T) {
 		observedAt = vvm.Get(itemKey)["leader"]
 	}
 
-	handler := Set(db, "things", originator, vvm, postWrite)
+	handler := Set(db, "things", tracker, vvm, postWrite)
 
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
 	req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
@@ -245,9 +298,9 @@ func TestSetVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	}
 
 	vvm := NewVVManager(failing, "leader")
-	originator := NewOriginatorTracker()
+	tracker := NewHandlerWriteTracker()
 
-	handler := Set(failing, "things", originator, vvm, nil)
+	handler := Set(failing, "things", tracker, vvm, nil)
 
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
 	req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
@@ -303,9 +356,9 @@ func TestDeleteVVDoesNotBumpOnStorageFailure(t *testing.T) {
 		err:          errors.New("simulated tombstone rejection"),
 	}
 	vvm := NewVVManager(failing, "leader")
-	originator := NewOriginatorTracker()
+	tracker := NewHandlerWriteTracker()
 
-	handler := Delete(failing, "things", originator, vvm, nil)
+	handler := Delete(failing, "things", tracker, vvm, nil)
 	deleteTS := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	req := httptest.NewRequest("DELETE", "/_pivot/pivot/things/abc/"+deleteTS, nil)
 	req = mux.SetURLVars(req, map[string]string{"index": "abc", "time": deleteTS})

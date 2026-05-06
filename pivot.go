@@ -572,13 +572,12 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		}, nil
 	})
 
-	// Originator tracker is created on every server. On pivots it serves the
-	// trigger-fanout role (skip echoing back to the peer that just wrote);
-	// on both pivots and nodes it serves as the "handler is driving this VV
-	// bump" dedup signal so the storage event callback doesn't double-bump.
+	// Handler-write tracker is created on every server. The Set/Delete
+	// handlers Mark before each storage write so the async storage event
+	// callback knows to skip its own bump+fanout for handler-driven events.
 	// Create version vector manager for all servers (pivot uses LeaderID,
 	// nodes use their address).
-	originatorTracker := NewOriginatorTracker()
+	handlerTracker := NewHandlerWriteTracker()
 	var vvManager *VVManager
 	if pivotURL == "" {
 		vvManager = NewVVManager(server.Storage, LeaderID)
@@ -617,7 +616,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		GetNodes:          getNodesCached,
 		Pool:              pool,
 		NodeHealth:        nodeHealth,
-		OriginatorTracker: originatorTracker,
+		HandlerTracker: handlerTracker,
 		Instance:          instance,
 	})
 
@@ -652,11 +651,11 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		}
 		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k, vvManager)).Methods("GET")
 		if baseKey != k.Path {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, originatorTracker, vvManager, postWrite)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker, vvManager, postWrite)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
 		} else {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, originatorTracker, vvManager, postWrite)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, originatorTracker, vvManager, postWrite)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
 		}
 		// Expose GET routes for all synced keys
 		if baseKey != k.Path {
