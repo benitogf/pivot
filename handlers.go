@@ -83,10 +83,20 @@ func GetSingle(db storage.Database, path string) func(w http.ResponseWriter, r *
 	}
 }
 
+// PostWriteFunc is called by Set/Delete handlers after a successful local
+// write to propagate the change. On pivot servers it triggers the matched
+// peer nodes (skipping the originating peer); on node servers it pushes
+// the change to the pivot leader. Running this synchronously after the
+// VV bump (rather than from the async storage event callback) means a
+// peer woken by the trigger sees the bumped VV, not a stale one.
+type PostWriteFunc func(itemKey, op, originatorPeer string)
+
 // Set set data on the pivot instance
 // originatorTracker is used to track which node originated the change (for pivot servers)
 // vvManager is the version vector manager for pivot servers (nil for nodes)
-func Set(db storage.Database, path string, originatorTracker *OriginatorTracker, vvManager *VVManager) func(w http.ResponseWriter, r *http.Request) {
+// postWrite, if non-nil, runs synchronously after a successful VV bump to
+// fan out the change to peers. May be nil in tests that don't need fanout.
+func Set(db storage.Database, path string, originatorTracker *OriginatorTracker, vvManager *VVManager, postWrite PostWriteFunc) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		decoded, err := meta.DecodeFromReader(r.Body)
 		if err != nil {
@@ -98,25 +108,33 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker,
 		if index == "" {
 			itemKey = path
 		}
-		// Track originator before storage write so callback can exclude it from TriggerNodeSync
+		// Track originator before storage write so the storage callback's
+		// dedup signal is in place by the time the watch goroutine processes
+		// the event. The header value is also kept locally so the post-write
+		// fanout can skip the originating peer.
+		originatorPeer := r.Header.Get(OriginatorHeader)
 		if originatorTracker != nil {
-			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
+			originatorTracker.Set(itemKey, originatorPeer)
 		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
 			// Drop the originator entry so it doesn't leak across requests.
 			if originatorTracker != nil {
-				originatorTracker.Get(itemKey)
+				originatorTracker.Take(itemKey)
 			}
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		// VV bump happens after a successful storage write so the on-disk VV
-		// can never advance past data that wasn't written. The bump is the
-		// sole source of truth for VV — the storage event callback used to
-		// also bump here, which produced a 2× counter on every HTTP write.
+		// VV bump after a successful storage write so the on-disk VV can
+		// never advance past data that wasn't written. The bump must
+		// complete BEFORE we trigger peers — otherwise a peer woken by the
+		// trigger could read /activity and see the pre-bump VV, conclude
+		// it's up to date, and skip the pull.
 		if vvManager != nil {
 			vvManager.increment(itemKey)
+		}
+		if postWrite != nil {
+			postWrite(itemKey, "set", originatorPeer)
 		}
 		w.WriteHeader(http.StatusOK)
 	}
@@ -125,7 +143,8 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker,
 // Delete delete data on the pivot instance
 // originatorTracker is used to track which node originated the change (for pivot servers)
 // vvManager is the version vector manager for pivot servers (nil for nodes)
-func Delete(db storage.Database, path string, originatorTracker *OriginatorTracker, vvManager *VVManager) func(w http.ResponseWriter, r *http.Request) {
+// postWrite mirrors Set's parameter — runs after VV bump to fan out the change.
+func Delete(db storage.Database, path string, originatorTracker *OriginatorTracker, vvManager *VVManager, postWrite PostWriteFunc) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		index := mux.Vars(r)["index"]
 		time := mux.Vars(r)["time"]
@@ -137,9 +156,9 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 			// Glob pattern delete (e.g., "things/123")
 			itemKey = path + "/" + index
 		}
-		// Track originator before storage write so callback can exclude it from TriggerNodeSync
+		originatorPeer := r.Header.Get(OriginatorHeader)
 		if originatorTracker != nil {
-			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
+			originatorTracker.Set(itemKey, originatorPeer)
 		}
 		// Tombstone first, then Del. The reverse order leaves a window where
 		// the item is physically gone but no tombstone records the delete; a
@@ -149,7 +168,7 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		// the worst case is an orphan tombstone, which sync resolves correctly.
 		if _, err := db.Set(StoragePrefix+path, json.RawMessage(time)); err != nil {
 			if originatorTracker != nil {
-				originatorTracker.Get(itemKey)
+				originatorTracker.Take(itemKey)
 			}
 			log.Printf("[pivot] Delete tombstone write failed for %q: %v", path, err)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -157,16 +176,18 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		}
 		if err := db.Del(itemKey); err != nil {
 			if originatorTracker != nil {
-				originatorTracker.Get(itemKey)
+				originatorTracker.Take(itemKey)
 			}
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		// VV bump after both storage writes succeeded — the on-disk VV can
-		// never advance past data that wasn't written. Single source of truth;
-		// the storage callback no longer increments here.
+		// VV bump after both storage writes succeeded; bump must precede the
+		// post-write trigger so a peer woken by the trigger reads a fresh VV.
 		if vvManager != nil {
 			vvManager.increment(itemKey)
+		}
+		if postWrite != nil {
+			postWrite(itemKey, "del", originatorPeer)
 		}
 		w.WriteHeader(http.StatusOK)
 	}

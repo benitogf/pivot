@@ -74,7 +74,7 @@ func TestDeleteTombstoneAtomicity(t *testing.T) {
 		err:          errors.New("simulated tombstone write rejection"),
 	}
 
-	handler := Delete(failing, "things", nil, nil)
+	handler := Delete(failing, "things", nil, nil, nil)
 
 	deleteTS := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	req := httptest.NewRequest("DELETE", "/_pivot/pivot/things/abc/"+deleteTS, nil)
@@ -126,7 +126,7 @@ func TestSetVVIncrementsExactlyOnce(t *testing.T) {
 		Instance:          instance,
 	}))
 
-	handler := Set(db, "things", originator, vvm)
+	handler := Set(db, "things", originator, vvm, nil)
 
 	doSet := func(idx string) {
 		body := strings.NewReader(`{"created":0,"updated":0,"index":"` + idx + `","path":"things/` + idx + `","data":"e30="}`)
@@ -174,7 +174,7 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 		Instance:          instance,
 	}))
 
-	handler := Set(db, "things", originator, vvm)
+	handler := Set(db, "things", originator, vvm, nil)
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
 	req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
 	req = mux.SetURLVars(req, map[string]string{"index": "abc"})
@@ -187,6 +187,44 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 	got := vvm.Get("things/abc")
 	require.Equal(t, int64(1), got["127.0.0.1:9999"],
 		"node-role HTTP Set must bump local counter exactly once; got %d", got["127.0.0.1:9999"])
+}
+
+// TestSetPostWriteSeesBumpedVV pins the trigger-after-bump invariant. With
+// the post-write fanout running synchronously after the VV bump (not from
+// the async storage event callback), a peer woken by the trigger reads a
+// fresh VV every time. We assert this by hooking the post-write callback
+// and reading the VV inside it — the bump must already be visible.
+//
+// Pre-fix this test would fail because the trigger fanout fired from the
+// storage callback running on the watch goroutine, which could race the
+// handler's own increment call.
+func TestSetPostWriteSeesBumpedVV(t *testing.T) {
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, db.Start(storage.Options{}))
+	defer db.Close()
+	storage.WatchWithCallback(db, func(storage.Event) {})
+
+	originator := NewOriginatorTracker()
+	vvm := NewVVManager(db, "leader")
+
+	var observedAt int64
+	postWrite := func(itemKey, op, originatorPeer string) {
+		observedAt = vvm.Get(itemKey)["leader"]
+	}
+
+	handler := Set(db, "things", originator, vvm, postWrite)
+
+	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
+	req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
+	req = mux.SetURLVars(req, map[string]string{"index": "abc"})
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+	require.Equal(t, 200, w.Code)
+
+	require.Equal(t, int64(1), observedAt,
+		"post-write callback must see the bumped VV; got %d means the trigger fired before the bump", observedAt)
 }
 
 // TestSetVVDoesNotBumpOnStorageFailure pins the rollback invariant: if the
@@ -209,7 +247,7 @@ func TestSetVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	vvm := NewVVManager(failing, "leader")
 	originator := NewOriginatorTracker()
 
-	handler := Set(failing, "things", originator, vvm)
+	handler := Set(failing, "things", originator, vvm, nil)
 
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
 	req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
@@ -267,7 +305,7 @@ func TestDeleteVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	vvm := NewVVManager(failing, "leader")
 	originator := NewOriginatorTracker()
 
-	handler := Delete(failing, "things", originator, vvm)
+	handler := Delete(failing, "things", originator, vvm, nil)
 	deleteTS := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	req := httptest.NewRequest("DELETE", "/_pivot/pivot/things/abc/"+deleteTS, nil)
 	req = mux.SetURLVars(req, map[string]string{"index": "abc", "time": deleteTS})
@@ -300,7 +338,7 @@ func TestDeleteHappyPathStillCommitsBoth(t *testing.T) {
 	_, err = db.SetWithMeta(itemKey, body, nowUnix, nowUnix)
 	require.NoError(t, err)
 
-	handler := Delete(db, "things", nil, nil)
+	handler := Delete(db, "things", nil, nil, nil)
 	deleteTS := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 	req := httptest.NewRequest("DELETE", "/_pivot/pivot/things/abc/"+deleteTS, nil)
 	req = mux.SetURLVars(req, map[string]string{"index": "abc", "time": deleteTS})

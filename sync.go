@@ -843,9 +843,10 @@ func (t *OriginatorTracker) Set(key, originator string) {
 	t.mu.Unlock()
 }
 
-// Get returns and clears the originator for a key (call in storage callback).
-// Returns "" if no entry was present.
-func (t *OriginatorTracker) Get(key string) string {
+// Take returns and clears the originator for a key — call from the storage
+// callback (read-and-consume) or from a handler error path (drop a stale
+// entry). Returns "" if no entry was present.
+func (t *OriginatorTracker) Take(key string) string {
 	t.mu.Lock()
 	originator := t.originators[key]
 	delete(t.originators, key)
@@ -854,14 +855,56 @@ func (t *OriginatorTracker) Get(key string) string {
 }
 
 // peerOriginator returns the originator only if it represents a real peer
-// (i.e. not the self-marker). Used by the callback's trigger fanout to
-// skip echoing back to the originating peer; the self-marker translates
-// to "no real peer" so fanout reaches every node.
+// (i.e. not the self-marker). Used by the trigger fanout to skip echoing
+// back to the originating peer; the self-marker translates to "no real
+// peer" so fanout reaches every node.
 func peerOriginator(o string) string {
 	if o == originatorSelfMarker {
 		return ""
 	}
 	return o
+}
+
+// applyPivotFanout triggers a sync on every healthy peer node except the
+// originating one. Shared between the Set/Delete handlers (called
+// synchronously after the local VV bump) and the storage event callback
+// (called only for direct, non-handler writes).
+func applyPivotFanout(instance *Instance, getNodes getNodes, nodeHealth *NodeHealth, keyPath, originatorPeer string) {
+	if instance == nil || instance.triggers == nil || getNodes == nil {
+		return
+	}
+	for _, node := range getNodes() {
+		// Self-marker is collapsed by peerOriginator before this is called,
+		// so an originatorPeer of "" means "no peer to skip".
+		if node == originatorPeer && originatorPeer != "" {
+			continue
+		}
+		if nodeHealth != nil && !nodeHealth.IsCompatible(node) {
+			continue
+		}
+		instance.triggers.Trigger(node, keyPath)
+	}
+}
+
+// applyNodePush queues a Set or Delete to push to the pivot leader for the
+// node-role key. Shared between handler post-write and the storage event
+// callback's direct-write path.
+func applyNodePush(pool *syncerPool, db storage.Database, effectiveURL, op, itemKey string) {
+	if pool == nil {
+		return
+	}
+	s := pool.syncers[effectiveURL]
+	if s == nil {
+		return
+	}
+	if op == "del" {
+		s.QueueOrSendDelete(itemKey, time.Now().UnixNano())
+		return
+	}
+	obj, err := db.Get(itemKey)
+	if err == nil {
+		s.QueueOrSendSet(itemKey, obj)
+	}
 }
 
 // StorageSyncConfig holds configuration for storage sync callback creation.
@@ -932,66 +975,29 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 			matchedDB.Del(StoragePrefix + matchedKey)
 		}
 
+		// Get and clear the originator for this key. A non-empty entry
+		// (including the self-marker) signals "a handler is driving this
+		// write and owns both the VV bump and the post-write fanout/push";
+		// we skip BOTH here so the handler can sequence them: bump first,
+		// then trigger peers. That ordering guarantee matters because a
+		// peer woken by the trigger immediately reads /activity to compare
+		// VVs, and seeing a pre-bump VV would make it skip the pull.
+		// An empty entry means a direct (non-handler) storage write — the
+		// callback is then the only place that can bump and propagate.
+		var originator string
+		if cfg.OriginatorTracker != nil {
+			originator = cfg.OriginatorTracker.Take(event.Key)
+		}
+		if originator != "" {
+			return
+		}
+		if cfg.Instance != nil && cfg.Instance.VVManager != nil {
+			cfg.Instance.VVManager.increment(event.Key)
+		}
 		if isPivotForKey {
-			// Get and clear the originator for this key (set by handler before storage write).
-			// A non-empty entry — including the self-marker — means a handler is
-			// driving this write and will bump VV after the storage write returns;
-			// we skip our own bump to avoid double-counting. An empty entry means
-			// some other code path wrote directly to storage, in which case we are
-			// the only chance to bump VV for that write.
-			var originator string
-			if cfg.OriginatorTracker != nil {
-				originator = cfg.OriginatorTracker.Get(event.Key)
-			}
-			if originator == "" {
-				if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-					cfg.Instance.VVManager.increment(event.Key)
-				}
-			}
-			peer := peerOriginator(originator)
-			nodes := cfg.GetNodes()
-			for _, node := range nodes {
-				// Skip the originating peer to prevent echo-back race condition.
-				// Self-marker collapses to "no peer", so fanout reaches all nodes.
-				if node == peer && peer != "" {
-					continue
-				}
-				// Skip incompatible nodes - don't sync to nodes with different protocol version
-				if cfg.NodeHealth != nil && !cfg.NodeHealth.IsCompatible(node) {
-					continue
-				}
-				// The coalescer collapses bursts of triggers for the same node into a
-				// single in-flight HTTP call (drainer goroutine per node, 1-buffered
-				// notify, no timer). Setup always wires it on pivot servers, which
-				// is the only path that reaches this branch.
-				cfg.Instance.triggers.Trigger(node, matchedKeyConfig.Path)
-			}
+			applyPivotFanout(cfg.Instance, cfg.GetNodes, cfg.NodeHealth, matchedKeyConfig.Path, "")
 		} else {
-			// Node-side: same dedup story as the pivot branch — handler-driven
-			// writes leave a tracker entry and bump VV themselves; direct writes
-			// don't, so the callback bumps for them.
-			var originator string
-			if cfg.OriginatorTracker != nil {
-				originator = cfg.OriginatorTracker.Get(event.Key)
-			}
-			if originator == "" {
-				if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-					cfg.Instance.VVManager.increment(event.Key)
-				}
-			}
-			if cfg.Pool != nil {
-				s := cfg.Pool.syncers[effectiveClusterURL]
-				if s != nil {
-					if event.Operation == "del" {
-						s.QueueOrSendDelete(event.Key, time.Now().UnixNano())
-					} else {
-						obj, err := matchedDB.Get(event.Key)
-						if err == nil {
-							s.QueueOrSendSet(event.Key, obj)
-						}
-					}
-				}
-			}
+			applyNodePush(cfg.Pool, matchedDB, effectiveClusterURL, event.Operation, event.Key)
 		}
 	}
 }
