@@ -345,12 +345,9 @@ func checkClusterURLChange(server *ooo.Server, config Config, configClusterURL s
 		baseKey := baseKeyFromPath(k.Path)
 		storageKey := pivotURLKeyPrefix + baseKey
 
-		// Read stored pivot URL for this key
-		obj, err := server.Storage.Get(storageKey)
-		storedURL := ""
-		if err == nil {
-			storedURL = string(obj.Data)
-		}
+		// Read stored pivot URL for this key. Persisted as a JSON-quoted
+		// string so the storage layer's json.RawMessage round-trip succeeds.
+		storedURL := readURLFingerprint(server.Storage, storageKey)
 
 		if storedURL != "" && storedURL != effectiveURL {
 			log.Printf("WARNING: Pivot URL for key %q changed from %q to %q - wiping data", k.Path, storedURL, effectiveURL)
@@ -362,8 +359,17 @@ func checkClusterURLChange(server *ooo.Server, config Config, configClusterURL s
 			wiped = true
 		}
 
-		// Store/update the effective pivot URL for this key
-		server.Storage.Set(storageKey, []byte(effectiveURL))
+		// Store/update the effective pivot URL for this key. The value goes
+		// through the storage layer's json.RawMessage round-trip, so it must
+		// be valid JSON — store as a quoted JSON string, not as raw bytes.
+		encoded, err := json.Marshal(effectiveURL)
+		if err != nil {
+			log.Printf("[pivot] failed to encode URL fingerprint for %q: %v", k.Path, err)
+			continue
+		}
+		if _, err := server.Storage.Set(storageKey, encoded); err != nil {
+			log.Printf("[pivot] failed to persist URL fingerprint for %q: %v", k.Path, err)
+		}
 	}
 
 	// Also check NodesKey (always uses configClusterURL)
@@ -371,11 +377,7 @@ func checkClusterURLChange(server *ooo.Server, config Config, configClusterURL s
 		// Use base key (without wildcard) for storage key
 		baseKey := baseKeyFromPath(config.NodesKey)
 		storageKey := pivotURLKeyPrefix + baseKey
-		obj, err := server.Storage.Get(storageKey)
-		storedURL := ""
-		if err == nil {
-			storedURL = string(obj.Data)
-		}
+		storedURL := readURLFingerprint(server.Storage, storageKey)
 
 		if storedURL != "" && storedURL != configClusterURL {
 			log.Printf("WARNING: Pivot URL for NodesKey %q changed from %q to %q - wiping data", config.NodesKey, storedURL, configClusterURL)
@@ -383,10 +385,34 @@ func checkClusterURLChange(server *ooo.Server, config Config, configClusterURL s
 			wiped = true
 		}
 
-		server.Storage.Set(storageKey, []byte(configClusterURL))
+		encoded, err := json.Marshal(configClusterURL)
+		if err != nil {
+			log.Printf("[pivot] failed to encode URL fingerprint for NodesKey %q: %v", config.NodesKey, err)
+		} else if _, err := server.Storage.Set(storageKey, encoded); err != nil {
+			log.Printf("[pivot] failed to persist URL fingerprint for NodesKey %q: %v", config.NodesKey, err)
+		}
 	}
 
 	return wiped
+}
+
+// readURLFingerprint reads a persisted pivot URL fingerprint. The on-disk
+// format is a JSON-quoted string (so it survives the storage layer's
+// json.RawMessage round-trip); a missing or unparseable entry yields the
+// empty string, which the caller treats as "no prior fingerprint".
+func readURLFingerprint(db storage.Database, storageKey string) string {
+	obj, err := db.Get(storageKey)
+	if err != nil {
+		return ""
+	}
+	var url string
+	if err := json.Unmarshal(obj.Data, &url); err != nil {
+		// Pre-existing data written with the broken raw-bytes format will
+		// fail to decode; treat as no fingerprint, the next write replaces
+		// it with the correct format.
+		return ""
+	}
+	return url
 }
 
 // wipeStorage deletes all entries matching the given path pattern
@@ -449,7 +475,13 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		client = defaultClient()
 	}
 
-	// Check if pivot IP changed since last run - wipe data if so
+	// Run the wipe-on-cluster-URL-change check immediately when storage is
+	// already active (e.g. user pre-started embedded storage before calling
+	// Setup). Doing it here lets the wipe's storage events run before the
+	// user has had a chance to wrap server.OnStorageEvent post-Setup, so
+	// downstream test/observer code only sees events for *intentional*
+	// writes. The OnStart wrapper below covers the deferred case where
+	// storage activates inside server.Start.
 	checkClusterURLChange(server, config, pivotURL)
 
 	keys := buildKeys(server, config)
@@ -698,6 +730,20 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 					server.Console.Log("pivot: initial sync completed successfully")
 				}
 			}
+		}
+	}
+
+	// Run the wipe-on-cluster-URL-change check from OnStart so it executes
+	// once storage is guaranteed active (memory-backed storages activate
+	// inside server.Start, not before). Wraps the outermost OnStart so the
+	// wipe runs before SetNodeAddr / SetNodeID / AutoSyncOnStart from the
+	// node-startup wrapper above. Idempotent across restarts: a second
+	// invocation reads the URL it just persisted and is a no-op.
+	clusterURLCheckExisting := server.OnStart
+	server.OnStart = func() {
+		checkClusterURLChange(server, config, pivotURL)
+		if clusterURLCheckExisting != nil {
+			clusterURLCheckExisting()
 		}
 	}
 
