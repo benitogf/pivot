@@ -120,10 +120,13 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
-			// Drop the mark so it doesn't survive across requests — Layered.Set
-			// fires the event even on inner-layer rejection, so the callback
-			// will see and consume our mark; if it doesn't (wrapper rejection
-			// before Layered, like in failingItemStorage), Unmark prevents leak.
+			// Layered.Set returns errors only for input validation
+			// (ErrInvalidPath / ErrInvalidStorageData) — those paths suppress
+			// the event entirely, so our Mark would never be Consumed and
+			// would accumulate. Wrapper-level rejections (failingItemStorage
+			// in tests, custom Database wrappers in real use) also short-
+			// circuit before Layered runs and don't fire the event. Either
+			// way, Unmark on error prevents a leak.
 			if handlerTracker != nil {
 				handlerTracker.Unmark(itemKey)
 			}
@@ -148,10 +151,11 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 // Delete delete data on the pivot instance
 // handlerTracker / vvManager / postWrite mirror Set's parameters.
 //
-// This handler issues TWO storage writes (tombstone + Del), each of which
-// fires its own storage event. We Mark twice so the callback consumes
-// once per event and skips both, then Unmark on any failure path so
-// stale marks don't leak.
+// Only the itemKey storage event needs Mark/Consume dedup. The tombstone
+// Set fires an event for StoragePrefix+path (e.g. "pivot/things") which
+// doesn't match any configured Key.Path glob (e.g. "things/*"), so
+// makeStorageSync returns early at !found before reaching Consume —
+// Marking it would just accumulate forever.
 func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracker, vvManager *VVManager, postWrite PostWriteFunc) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		index := mux.Vars(r)["index"]
@@ -165,10 +169,7 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 			itemKey = path + "/" + index
 		}
 		originatorPeer := r.Header.Get(OriginatorHeader)
-		// One mark per storage event we'll fire below.
-		tombstoneKey := StoragePrefix + path
 		if handlerTracker != nil {
-			handlerTracker.Mark(tombstoneKey)
 			handlerTracker.Mark(itemKey)
 		}
 		// Tombstone first, then Del. The reverse order leaves a window where
@@ -177,9 +178,8 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 		// sync round re-fetch the item from a node that hasn't observed the
 		// delete and silently resurrect it. Writing the tombstone first means
 		// the worst case is an orphan tombstone, which sync resolves correctly.
-		if _, err := db.Set(tombstoneKey, json.RawMessage(time)); err != nil {
+		if _, err := db.Set(StoragePrefix+path, json.RawMessage(time)); err != nil {
 			if handlerTracker != nil {
-				handlerTracker.Unmark(tombstoneKey)
 				handlerTracker.Unmark(itemKey)
 			}
 			log.Printf("[pivot] Delete tombstone write failed for %q: %v", path, err)
@@ -187,8 +187,6 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 			return
 		}
 		if err := db.Del(itemKey); err != nil {
-			// tombstone Mark was already consumed by the tombstone-Set event;
-			// only itemKey's mark is still pending.
 			if handlerTracker != nil {
 				handlerTracker.Unmark(itemKey)
 			}

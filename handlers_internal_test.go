@@ -230,15 +230,64 @@ func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
 		require.Equal(t, 200, w.Code)
 	}
 
-	// Generous settle: every event must drain through the watch goroutine
-	// before we assert. If the callback double-bumped on any event, we'll
-	// see a counter > burst here.
-	time.Sleep(300 * time.Millisecond)
+	// Wait deterministically for the watch goroutine to drain every event;
+	// when tracker.Len() hits zero, every Mark has been Consumed.
+	require.Eventually(t, func() bool { return tracker.Len() == 0 }, 2*time.Second, 5*time.Millisecond,
+		"watch goroutine never drained all %d events", burst)
 
 	got := vvm.Get("things/abc")["leader"]
 	require.Equal(t, int64(burst), got,
 		"%d back-to-back HTTP Sets must bump leader counter exactly %d times; got %d means the per-key dedup collapsed under burst",
 		burst, burst, got)
+}
+
+// TestDeleteDoesNotLeakHandlerMarks pins the invariant that a handler-
+// driven Delete leaves the tracker empty after both storage events drain.
+// Pre-fix the handler Marked the tombstone key (StoragePrefix+path) too,
+// but the tombstone event doesn't match any configured Key.Path glob so
+// the storage callback returned at !found before reaching Consume — the
+// tombstone Mark accumulated forever.
+func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, db.Start(storage.Options{}))
+	defer db.Close()
+
+	tracker := NewHandlerWriteTracker()
+	vvm := NewVVManager(db, "leader")
+	keys := []Key{{Path: "things/*", Database: db}}
+	instance := &Instance{VVManager: vvm}
+	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+		Keys:           keys,
+		GetNodes:       func() []string { return nil },
+		HandlerTracker: tracker,
+		Instance:       instance,
+	}))
+
+	// Seed a few items so each Delete actually has something to remove.
+	for _, idx := range []string{"a", "b", "c"} {
+		nowUnix := time.Now().UTC().UnixNano()
+		obj := meta.Object{Created: nowUnix, Updated: nowUnix, Index: idx, Path: "things/" + idx, Data: []byte(`{"v":1}`)}
+		body, err := json.Marshal(obj)
+		require.NoError(t, err)
+		_, err = db.SetWithMeta("things/"+idx, body, nowUnix, nowUnix)
+		require.NoError(t, err)
+	}
+	// Wait for the seeding events to drain so they don't influence the assertion.
+	require.Eventually(t, func() bool { return tracker.Len() == 0 }, 2*time.Second, 5*time.Millisecond)
+
+	handler := Delete(db, "things", tracker, vvm, nil)
+	for _, idx := range []string{"a", "b", "c"} {
+		ts := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
+		req := httptest.NewRequest("DELETE", "/_pivot/pivot/things/"+idx+"/"+ts, nil)
+		req = mux.SetURLVars(req, map[string]string{"index": idx, "time": ts})
+		w := httptest.NewRecorder()
+		handler(w, req)
+		require.Equal(t, 200, w.Code)
+	}
+
+	require.Eventually(t, func() bool { return tracker.Len() == 0 }, 2*time.Second, 5*time.Millisecond,
+		"tracker leaked entries after Deletes drained: Len=%d", tracker.Len())
 }
 
 // TestSetPostWriteSeesBumpedVV pins the in-handler ordering: the post-write

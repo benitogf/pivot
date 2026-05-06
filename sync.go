@@ -861,6 +861,15 @@ func (t *HandlerWriteTracker) Consume(key string) bool {
 	return true
 }
 
+// Len returns the number of keys with non-zero pending counts. Intended
+// for tests that need to wait for the watch goroutine to drain all
+// outstanding events without sleeping.
+func (t *HandlerWriteTracker) Len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.pending)
+}
+
 // applyPivotFanout triggers a sync on every healthy peer node except the
 // originating one. Shared between the Set/Delete handlers (called
 // synchronously after the local VV bump) and the storage event callback
@@ -980,6 +989,15 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 		// pre-bump VV would make it skip the pull. A miss means a direct
 		// (non-handler) storage write — the callback is then the only place
 		// that can bump and propagate.
+		//
+		// Caveat: a direct write that lands BETWEEN a handler's Mark and the
+		// watch goroutine processing the handler's event would Consume the
+		// handler's mark; the direct write would then get no bump/fanout
+		// here, and the handler's later event would find no mark and bump
+		// again. Closed-network deployment assumes a single writer per key
+		// path, so this race is unreachable in practice. If that assumption
+		// ever weakens, swap the per-key counter for an originator-tagged
+		// event id matched 1:1 to a handler write.
 		if cfg.HandlerTracker != nil && cfg.HandlerTracker.Consume(event.Key) {
 			return
 		}
