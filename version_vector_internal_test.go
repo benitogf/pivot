@@ -6,12 +6,32 @@ package pivot
 // the same path.
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"log"
+	"strings"
 	"testing"
 
 	"github.com/benitogf/ooo/monotonic"
 	"github.com/benitogf/ooo/storage"
 	"github.com/stretchr/testify/require"
 )
+
+// failingVVStorage wraps a real storage.Database and returns an error from
+// Set when the key targets the VV prefix. Lets tests force the saveToStorage
+// failure path without having to build a full mock.
+type failingVVStorage struct {
+	storage.Database
+	err error
+}
+
+func (f *failingVVStorage) Set(key string, data json.RawMessage) (string, error) {
+	if strings.HasPrefix(key, VVKeyPrefix) {
+		return key, f.err
+	}
+	return f.Database.Set(key, data)
+}
 
 // BenchmarkVVManagerIncrement measures the per-event cost of the storage-event
 // hot path's only mandatory operation. The number that matters most is ns/op
@@ -116,6 +136,35 @@ func TestVVManagerIncrementResumesAfterSetNodeID(t *testing.T) {
 	require.Equal(t, int64(2), vv["127.0.0.1:9000"], "increments after SetNodeID must land on the real node ID")
 	_, hasEmpty := vv[""]
 	require.False(t, hasEmpty, "VV must not carry phantom '' counter after SetNodeID")
+}
+
+// TestVVManagerSaveErrorIsLogged pins the invariant that storage write
+// failures from saveToStorage surface as a log line rather than being
+// silently dropped. Without this, a transient or persistent storage error
+// (disk full, permission revoked, embedded layer rejection) would leave the
+// in-memory VV diverged from on-disk; on restart the VV reseeds from the
+// stale on-disk value and version-vector ordering effectively resets.
+func TestVVManagerSaveErrorIsLogged(t *testing.T) {
+	monotonic.Init()
+	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, real.Start(storage.Options{}))
+	defer real.Close()
+
+	failing := &failingVVStorage{Database: real, err: errors.New("simulated storage rejection")}
+
+	var buf bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(oldOutput)
+
+	m := NewVVManager(failing, "leader")
+	m.increment("things")
+
+	logged := buf.String()
+	require.Contains(t, logged, "simulated storage rejection",
+		"saveToStorage error must surface in logs (full output: %q)", logged)
+	require.Contains(t, logged, "things",
+		"log line must identify which key failed (full output: %q)", logged)
 }
 
 func TestVVManagerPersistence(t *testing.T) {

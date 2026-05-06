@@ -283,7 +283,13 @@ func (m *VVManager) saveToStorage(baseKey string) {
 	// Manual encoder skips encoding/json's reflection path. On-disk bytes are
 	// identical to json.Marshal output (keys sorted), so existing data parses
 	// unchanged via the json.Unmarshal in loadFromStorage.
-	m.storage.Set(VVKeyPrefix+baseKey, encodeVV(m.vectors[baseKey]))
+	if _, err := m.storage.Set(VVKeyPrefix+baseKey, encodeVV(m.vectors[baseKey])); err != nil {
+		// Surface the failure: a silent drop here would leave the in-memory
+		// VV diverged from on-disk, and a later restart would reseed from
+		// the stale persisted value, effectively resetting version-vector
+		// ordering for this key.
+		log.Printf("[pivot] VVManager.saveToStorage failed for %q: %v", baseKey, err)
+	}
 }
 
 // Shutdown marks the manager as shutting down to prevent storage writes.
