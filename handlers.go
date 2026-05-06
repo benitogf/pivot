@@ -102,14 +102,21 @@ func Set(db storage.Database, path string, originatorTracker *OriginatorTracker,
 		if originatorTracker != nil {
 			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
 		}
-		// Increment version vector on pivot before storage write
-		if vvManager != nil {
-			vvManager.increment(itemKey)
-		}
 		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
 		if err != nil {
+			// Drop the originator entry so it doesn't leak across requests.
+			if originatorTracker != nil {
+				originatorTracker.Get(itemKey)
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			return
+		}
+		// VV bump happens after a successful storage write so the on-disk VV
+		// can never advance past data that wasn't written. The bump is the
+		// sole source of truth for VV — the storage event callback used to
+		// also bump here, which produced a 2× counter on every HTTP write.
+		if vvManager != nil {
+			vvManager.increment(itemKey)
 		}
 		w.WriteHeader(http.StatusOK)
 	}
@@ -134,10 +141,6 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		if originatorTracker != nil {
 			originatorTracker.Set(itemKey, r.Header.Get(OriginatorHeader))
 		}
-		// Increment version vector on pivot before storage write
-		if vvManager != nil {
-			vvManager.increment(itemKey)
-		}
 		// Tombstone first, then Del. The reverse order leaves a window where
 		// the item is physically gone but no tombstone records the delete; a
 		// crash, context-cancel, or storage error in that window lets the next
@@ -145,13 +148,25 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		// delete and silently resurrect it. Writing the tombstone first means
 		// the worst case is an orphan tombstone, which sync resolves correctly.
 		if _, err := db.Set(StoragePrefix+path, json.RawMessage(time)); err != nil {
+			if originatorTracker != nil {
+				originatorTracker.Get(itemKey)
+			}
 			log.Printf("[pivot] Delete tombstone write failed for %q: %v", path, err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		if err := db.Del(itemKey); err != nil {
+			if originatorTracker != nil {
+				originatorTracker.Get(itemKey)
+			}
 			w.WriteHeader(http.StatusInternalServerError)
 			return
+		}
+		// VV bump after both storage writes succeeded — the on-disk VV can
+		// never advance past data that wasn't written. Single source of truth;
+		// the storage callback no longer increments here.
+		if vvManager != nil {
+			vvManager.increment(itemKey)
 		}
 		w.WriteHeader(http.StatusOK)
 	}

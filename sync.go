@@ -801,11 +801,28 @@ func (s *syncer) PulledSet(key string) bool {
 type StorageSyncCallback func(event storage.Event)
 
 // OriginatorTracker tracks which node originated a storage change.
-// This allows pivot to skip TriggerNodeSync back to the originating node.
+// Set serves two roles:
+//  1. Trigger fanout: when the originator is a peer node address, the
+//     storage callback skips re-triggering that peer (echo prevention).
+//  2. VV-bump dedup: presence of any entry signals "the handler will
+//     drive the VV bump after storage success" — the storage callback
+//     skips its own VV bump when an entry is present, so handler-driven
+//     writes bump exactly once. Direct (non-handler) storage writes
+//     leave the tracker empty and the callback bumps VV as before.
+//
+// Empty incoming originators (handler called with no OriginatorHeader)
+// are stored under a sentinel value so role 2 still fires; the sentinel
+// can't match any real node address, so role 1 acts as a no-op.
 type OriginatorTracker struct {
 	mu          sync.Mutex
 	originators map[string]string // key -> originator address
 }
+
+// originatorSelfMarker is the sentinel stored when a handler runs without
+// an OriginatorHeader. It must not collide with any real node address —
+// node addresses are host:port strings, which can't contain a literal
+// colon-prefixed sentinel like this one.
+const originatorSelfMarker = ":handler-self"
 
 // NewOriginatorTracker creates a new originator tracker
 func NewOriginatorTracker() *OriginatorTracker {
@@ -814,23 +831,37 @@ func NewOriginatorTracker() *OriginatorTracker {
 	}
 }
 
-// Set records the originator for a key (call before storage write)
+// Set records the originator for a key (call before storage write).
+// Empty originators are stored as a sentinel so the callback can still
+// see "this event was handler-driven" and skip its own VV bump.
 func (t *OriginatorTracker) Set(key, originator string) {
 	if originator == "" {
-		return
+		originator = originatorSelfMarker
 	}
 	t.mu.Lock()
 	t.originators[key] = originator
 	t.mu.Unlock()
 }
 
-// Get returns and clears the originator for a key (call in storage callback)
+// Get returns and clears the originator for a key (call in storage callback).
+// Returns "" if no entry was present.
 func (t *OriginatorTracker) Get(key string) string {
 	t.mu.Lock()
 	originator := t.originators[key]
 	delete(t.originators, key)
 	t.mu.Unlock()
 	return originator
+}
+
+// peerOriginator returns the originator only if it represents a real peer
+// (i.e. not the self-marker). Used by the callback's trigger fanout to
+// skip echoing back to the originating peer; the self-marker translates
+// to "no real peer" so fanout reaches every node.
+func peerOriginator(o string) string {
+	if o == originatorSelfMarker {
+		return ""
+	}
+	return o
 }
 
 // StorageSyncConfig holds configuration for storage sync callback creation.
@@ -902,19 +933,27 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 		}
 
 		if isPivotForKey {
-			// This server IS pivot for this key - increment VV and notify all nodes asynchronously
-			if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-				cfg.Instance.VVManager.increment(event.Key)
-			}
-			// Get and clear the originator for this key (set by handler before storage write)
+			// Get and clear the originator for this key (set by handler before storage write).
+			// A non-empty entry — including the self-marker — means a handler is
+			// driving this write and will bump VV after the storage write returns;
+			// we skip our own bump to avoid double-counting. An empty entry means
+			// some other code path wrote directly to storage, in which case we are
+			// the only chance to bump VV for that write.
 			var originator string
 			if cfg.OriginatorTracker != nil {
 				originator = cfg.OriginatorTracker.Get(event.Key)
 			}
+			if originator == "" {
+				if cfg.Instance != nil && cfg.Instance.VVManager != nil {
+					cfg.Instance.VVManager.increment(event.Key)
+				}
+			}
+			peer := peerOriginator(originator)
 			nodes := cfg.GetNodes()
 			for _, node := range nodes {
-				// Skip the originating node to prevent echo-back race condition
-				if node == originator {
+				// Skip the originating peer to prevent echo-back race condition.
+				// Self-marker collapses to "no peer", so fanout reaches all nodes.
+				if node == peer && peer != "" {
 					continue
 				}
 				// Skip incompatible nodes - don't sync to nodes with different protocol version
@@ -928,9 +967,17 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 				cfg.Instance.triggers.Trigger(node, matchedKeyConfig.Path)
 			}
 		} else {
-			// This server is node for this key - increment local VV and sync to pivot
-			if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-				cfg.Instance.VVManager.increment(event.Key)
+			// Node-side: same dedup story as the pivot branch — handler-driven
+			// writes leave a tracker entry and bump VV themselves; direct writes
+			// don't, so the callback bumps for them.
+			var originator string
+			if cfg.OriginatorTracker != nil {
+				originator = cfg.OriginatorTracker.Get(event.Key)
+			}
+			if originator == "" {
+				if cfg.Instance != nil && cfg.Instance.VVManager != nil {
+					cfg.Instance.VVManager.increment(event.Key)
+				}
 			}
 			if cfg.Pool != nil {
 				s := cfg.Pool.syncers[effectiveClusterURL]

@@ -572,12 +572,15 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		}, nil
 	})
 
-	// Create originator tracker for pivot servers to skip TriggerNodeSync back to originating node
-	// Create version vector manager for all servers (pivot uses LeaderID, nodes use their address)
-	var originatorTracker *OriginatorTracker
+	// Originator tracker is created on every server. On pivots it serves the
+	// trigger-fanout role (skip echoing back to the peer that just wrote);
+	// on both pivots and nodes it serves as the "handler is driving this VV
+	// bump" dedup signal so the storage event callback doesn't double-bump.
+	// Create version vector manager for all servers (pivot uses LeaderID,
+	// nodes use their address).
+	originatorTracker := NewOriginatorTracker()
 	var vvManager *VVManager
 	if pivotURL == "" {
-		originatorTracker = NewOriginatorTracker()
 		vvManager = NewVVManager(server.Storage, LeaderID)
 	} else {
 		// Node servers: VVManager will be initialized with node address once server starts
