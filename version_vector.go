@@ -208,6 +208,17 @@ func (m *VVManager) increment(keyPath string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Node servers create their VVManager with nodeID="" during Setup and only
+	// call SetNodeID once server.Address is known (inside OnStart). The TCP
+	// listener is up before OnStart fires, so storage events can reach this
+	// path with an empty nodeID. Persisting "" would gain a counter no peer
+	// ever increments and live in storage forever. Skip and log loudly so the
+	// regression surfaces if a caller starts incrementing pre-SetNodeID.
+	if m.nodeID == "" {
+		log.Printf("[pivot] VVManager.increment skipped for %q: nodeID not set yet", keyPath)
+		return
+	}
+
 	if _, exists := m.vectors[baseKey]; !exists {
 		m.loadFromStorage(baseKey)
 	}
