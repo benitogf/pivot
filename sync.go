@@ -449,7 +449,8 @@ func newSyncerPool(client *http.Client, keys []Key, configClusterURL string, ssl
 	return pool
 }
 
-// SetNodeAddr sets the node address on all syncers
+// SetNodeAddr sets the node address on all syncers and drains anything that
+// was queued while the address was unset (the pre-OnStart startup window).
 func (p *syncerPool) SetNodeAddr(addr string) {
 	p.nodeAddr = addr
 	for _, s := range p.syncers {
@@ -482,9 +483,15 @@ func (p *syncerPool) SyncAll() error {
 	return lastErr
 }
 
-// SetNodeAddr sets the node's address (called after server starts)
+// SetNodeAddr sets the node's address (called after server starts) and drains
+// any operations that were queued while nodeAddr was empty (the pre-OnStart
+// startup window). Drained ops are sent with the correct originator so the
+// leader can identify and skip this node when fanning the change out.
 func (s *syncer) SetNodeAddr(addr string) {
+	s.queueMu.Lock()
 	s.nodeAddr = addr
+	s.queueMu.Unlock()
+	s.drainQueue()
 }
 
 // Pull syncs FROM pivot only (used when pivot notifies node of changes)
@@ -663,54 +670,57 @@ func (s *syncer) PullKey(keyPath string) error {
 	return err
 }
 
-// processQueue sends all queued per-key operations to leader
-func (s *syncer) processQueue() {
+// drainQueue snapshots the pending queue and the current nodeAddr under
+// queueMu, then sends each op outside the lock. Returns immediately if
+// nodeAddr is unset (we're still in the pre-OnStart startup window) so the
+// queued ops wait for SetNodeAddr to drain them with the correct originator.
+func (s *syncer) drainQueue() {
 	s.queueMu.Lock()
-	if len(s.queue) == 0 {
+	if s.nodeAddr == "" || len(s.queue) == 0 {
 		s.queueMu.Unlock()
 		return
 	}
-	// Take ownership of the queue
+	addr := s.nodeAddr
 	pending := s.queue
 	s.queue = make([]pendingOp, 0)
 	s.queueMu.Unlock()
 
-	// Process each operation
 	for _, op := range pending {
 		switch op.opType {
 		case "set":
-			sendToLeader(s.ClientOpts(), op.key, op.obj, s.nodeAddr)
+			sendToLeader(s.ClientOpts(), op.key, op.obj, addr)
 		case "del":
-			sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, s.nodeAddr)
+			sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, addr)
 		}
 	}
+}
+
+// processQueue sends all queued per-key operations to leader
+func (s *syncer) processQueue() {
+	s.drainQueue()
 }
 
 // processQueueLocked sends all queued per-key operations to leader (caller must hold s.mu)
 func (s *syncer) processQueueLocked() {
+	s.drainQueue()
+}
+
+// QueueOrSendSet sends a set operation to leader, or queues it if Pull is in
+// progress or the syncer's nodeAddr hasn't been set yet (pre-OnStart startup
+// window). The queue is drained by the next Pull completion or by
+// SetNodeAddr, whichever comes first.
+func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 	s.queueMu.Lock()
-	if len(s.queue) == 0 {
+	if s.nodeAddr == "" {
+		s.queue = append(s.queue, pendingOp{opType: "set", key: key, obj: obj})
 		s.queueMu.Unlock()
 		return
 	}
-	pending := s.queue
-	s.queue = make([]pendingOp, 0)
+	addr := s.nodeAddr
 	s.queueMu.Unlock()
 
-	for _, op := range pending {
-		switch op.opType {
-		case "set":
-			sendToLeader(s.ClientOpts(), op.key, op.obj, s.nodeAddr)
-		case "del":
-			sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, s.nodeAddr)
-		}
-	}
-}
-
-// QueueOrSendSet sends a set operation to leader, or queues it if Pull is in progress
-func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 	if s.mu.TryLock() {
-		sendToLeader(s.ClientOpts(), key, obj, s.nodeAddr)
+		sendToLeader(s.ClientOpts(), key, obj, addr)
 		s.mu.Unlock()
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
@@ -724,10 +734,21 @@ func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 	}
 }
 
-// QueueOrSendDelete sends a delete operation to leader, or queues it if Pull is in progress
+// QueueOrSendDelete sends a delete operation to leader, or queues it if Pull
+// is in progress or the syncer's nodeAddr hasn't been set yet (pre-OnStart
+// startup window).
 func (s *syncer) QueueOrSendDelete(key string, ts int64) {
+	s.queueMu.Lock()
+	if s.nodeAddr == "" {
+		s.queue = append(s.queue, pendingOp{opType: "del", key: key, ts: ts})
+		s.queueMu.Unlock()
+		return
+	}
+	addr := s.nodeAddr
+	s.queueMu.Unlock()
+
 	if s.mu.TryLock() {
-		sendDeleteToLeader(s.ClientOpts(), key, ts, s.nodeAddr)
+		sendDeleteToLeader(s.ClientOpts(), key, ts, addr)
 		s.mu.Unlock()
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
@@ -741,11 +762,22 @@ func (s *syncer) QueueOrSendDelete(key string, ts int64) {
 	}
 }
 
-// Sync performs bidirectional synchronization with tracking
+// Sync performs bidirectional synchronization with tracking. Returns nil
+// without contacting the leader if nodeAddr is unset (pre-OnStart startup
+// window) — sending with empty Originator would prevent the leader from
+// skipping this node when fanning the change out, producing a self-trigger
+// echo. Reachable callers (AutoSyncOnStart, /synchronize/node) re-trigger
+// after OnStart, so skipping here is safe.
 func (s *syncer) Sync() error {
+	s.queueMu.Lock()
+	addr := s.nodeAddr
+	s.queueMu.Unlock()
+	if addr == "" {
+		return nil
+	}
 	s.mu.Lock()
 	opts := SyncOptions{
-		Originator:     s.nodeAddr,
+		Originator:     addr,
 		IsRecentDelete: s.tracker.pulledDelete,
 		OnDelete:       s.tracker.trackDelete,
 		OnSet:          s.tracker.trackSet,
