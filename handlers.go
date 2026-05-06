@@ -3,6 +3,7 @@ package pivot
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 
@@ -137,9 +138,18 @@ func Delete(db storage.Database, path string, originatorTracker *OriginatorTrack
 		if vvManager != nil {
 			vvManager.increment(itemKey)
 		}
-		err := db.Del(itemKey)
-		db.Set(StoragePrefix+path, json.RawMessage(time))
-		if err != nil {
+		// Tombstone first, then Del. The reverse order leaves a window where
+		// the item is physically gone but no tombstone records the delete; a
+		// crash, context-cancel, or storage error in that window lets the next
+		// sync round re-fetch the item from a node that hasn't observed the
+		// delete and silently resurrect it. Writing the tombstone first means
+		// the worst case is an orphan tombstone, which sync resolves correctly.
+		if _, err := db.Set(StoragePrefix+path, json.RawMessage(time)); err != nil {
+			log.Printf("[pivot] Delete tombstone write failed for %q: %v", path, err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := db.Del(itemKey); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
