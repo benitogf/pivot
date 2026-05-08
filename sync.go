@@ -800,50 +800,120 @@ func (s *syncer) PulledSet(key string) bool {
 // StorageSyncCallback is the callback type for storage sync events
 type StorageSyncCallback func(event storage.Event)
 
-// OriginatorTracker tracks which node originated a storage change.
-// This allows pivot to skip TriggerNodeSync back to the originating node.
-type OriginatorTracker struct {
-	mu          sync.Mutex
-	originators map[string]string // key -> originator address
+// HandlerWriteTracker counts in-flight handler-driven writes per key.
+// The Set/Delete handlers Mark before the storage write and the storage
+// event callback Consumes when the event lands; while the count for a
+// key is > 0, the callback knows a handler will own the post-write work
+// (VV bump + fanout/push) and skips its own. A counter — not a single
+// last-writer-wins entry — is required because two rapid handler writes
+// to the same key would otherwise have one tracker entry but produce
+// two storage events; the second event would find an empty tracker and
+// the callback would double-do the work.
+//
+// Direct (non-handler) storage writes never call Mark, so Consume returns
+// false and the callback runs its full path — that's how the callback
+// remains the source of truth for direct writes.
+type HandlerWriteTracker struct {
+	mu      sync.Mutex
+	pending map[string]int
 }
 
-// NewOriginatorTracker creates a new originator tracker
-func NewOriginatorTracker() *OriginatorTracker {
-	return &OriginatorTracker{
-		originators: make(map[string]string),
+// NewHandlerWriteTracker creates an empty tracker.
+func NewHandlerWriteTracker() *HandlerWriteTracker {
+	return &HandlerWriteTracker{pending: make(map[string]int)}
+}
+
+// Mark records that a handler is about to drive a write for the given key.
+// Must be called before the storage write so the dedup signal is in place
+// by the time the watch goroutine processes the event.
+func (t *HandlerWriteTracker) Mark(key string) {
+	t.mu.Lock()
+	t.pending[key]++
+	t.mu.Unlock()
+}
+
+// Unmark drops a previously-recorded mark — call from the handler's error
+// path when the storage write didn't fire an event.
+func (t *HandlerWriteTracker) Unmark(key string) {
+	t.mu.Lock()
+	if t.pending[key] > 0 {
+		t.pending[key]--
+		if t.pending[key] == 0 {
+			delete(t.pending, key)
+		}
 	}
+	t.mu.Unlock()
 }
 
-// Set records the originator for a key (call before storage write)
-func (t *OriginatorTracker) Set(key, originator string) {
-	if originator == "" {
+// Consume returns true and decrements the pending count if a mark is
+// present for the key (i.e. this event is handler-driven). Returns false
+// otherwise (i.e. this event is from a direct storage write).
+func (t *HandlerWriteTracker) Consume(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pending[key] == 0 {
+		return false
+	}
+	t.pending[key]--
+	if t.pending[key] == 0 {
+		delete(t.pending, key)
+	}
+	return true
+}
+
+// applyPivotFanout triggers a sync on every healthy peer node except the
+// originating one. Shared between the Set/Delete handlers (called
+// synchronously after the local VV bump) and the storage event callback
+// (called only for direct, non-handler writes).
+func applyPivotFanout(instance *Instance, getNodes getNodes, nodeHealth *NodeHealth, keyPath, originatorPeer string) {
+	if instance == nil || instance.triggers == nil || getNodes == nil {
 		return
 	}
-	t.mu.Lock()
-	t.originators[key] = originator
-	t.mu.Unlock()
+	for _, node := range getNodes() {
+		// Self-marker is collapsed by peerOriginator before this is called,
+		// so an originatorPeer of "" means "no peer to skip".
+		if node == originatorPeer && originatorPeer != "" {
+			continue
+		}
+		if nodeHealth != nil && !nodeHealth.IsCompatible(node) {
+			continue
+		}
+		instance.triggers.Trigger(node, keyPath)
+	}
 }
 
-// Get returns and clears the originator for a key (call in storage callback)
-func (t *OriginatorTracker) Get(key string) string {
-	t.mu.Lock()
-	originator := t.originators[key]
-	delete(t.originators, key)
-	t.mu.Unlock()
-	return originator
+// applyNodePush queues a Set or Delete to push to the pivot leader for the
+// node-role key. Shared between handler post-write and the storage event
+// callback's direct-write path.
+func applyNodePush(pool *syncerPool, db storage.Database, effectiveURL, op, itemKey string) {
+	if pool == nil {
+		return
+	}
+	s := pool.syncers[effectiveURL]
+	if s == nil {
+		return
+	}
+	if op == "del" {
+		s.QueueOrSendDelete(itemKey, time.Now().UnixNano())
+		return
+	}
+	obj, err := db.Get(itemKey)
+	if err == nil {
+		s.QueueOrSendSet(itemKey, obj)
+	}
 }
 
 // StorageSyncConfig holds configuration for storage sync callback creation.
 type StorageSyncConfig struct {
-	Client            *http.Client
-	ConfigClusterURL  string
-	Keys              []Key
-	NodesKey          string
-	GetNodes          getNodes
-	Pool              *syncerPool
-	NodeHealth        *NodeHealth
-	OriginatorTracker *OriginatorTracker
-	Instance          *Instance
+	Client           *http.Client
+	ConfigClusterURL string
+	Keys             []Key
+	NodesKey         string
+	GetNodes         getNodes
+	Pool             *syncerPool
+	NodeHealth       *NodeHealth
+	HandlerTracker   *HandlerWriteTracker
+	Instance         *Instance
 }
 
 // makeStorageSync creates a callback that triggers synchronization on storage events.
@@ -901,50 +971,34 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 			matchedDB.Del(StoragePrefix + matchedKey)
 		}
 
+		// Get and clear the originator for this key. A non-empty entry
+		// Handler-driven writes Mark before db.Set, so a Consume hit means
+		// "a handler will own both the VV bump and the post-write fanout/push";
+		// skip BOTH here so the handler can sequence them: bump first, then
+		// trigger peers. That ordering guarantee matters because a peer woken
+		// by the trigger immediately reads /activity to compare VVs, and a
+		// pre-bump VV would make it skip the pull. A miss means a direct
+		// (non-handler) storage write — the callback is then the only place
+		// that can bump and propagate.
+		//
+		// Caveat: a direct write that lands BETWEEN a handler's Mark and the
+		// watch goroutine processing the handler's event would Consume the
+		// handler's mark; the direct write would then get no bump/fanout
+		// here, and the handler's later event would find no mark and bump
+		// again. Closed-network deployment assumes a single writer per key
+		// path, so this race is unreachable in practice. If that assumption
+		// ever weakens, swap the per-key counter for an originator-tagged
+		// event id matched 1:1 to a handler write.
+		if cfg.HandlerTracker != nil && cfg.HandlerTracker.Consume(event.Key) {
+			return
+		}
+		if cfg.Instance != nil && cfg.Instance.VVManager != nil {
+			cfg.Instance.VVManager.increment(event.Key)
+		}
 		if isPivotForKey {
-			// This server IS pivot for this key - increment VV and notify all nodes asynchronously
-			if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-				cfg.Instance.VVManager.increment(event.Key)
-			}
-			// Get and clear the originator for this key (set by handler before storage write)
-			var originator string
-			if cfg.OriginatorTracker != nil {
-				originator = cfg.OriginatorTracker.Get(event.Key)
-			}
-			nodes := cfg.GetNodes()
-			for _, node := range nodes {
-				// Skip the originating node to prevent echo-back race condition
-				if node == originator {
-					continue
-				}
-				// Skip incompatible nodes - don't sync to nodes with different protocol version
-				if cfg.NodeHealth != nil && !cfg.NodeHealth.IsCompatible(node) {
-					continue
-				}
-				// The coalescer collapses bursts of triggers for the same node into a
-				// single in-flight HTTP call (drainer goroutine per node, 1-buffered
-				// notify, no timer). Setup always wires it on pivot servers, which
-				// is the only path that reaches this branch.
-				cfg.Instance.triggers.Trigger(node, matchedKeyConfig.Path)
-			}
+			applyPivotFanout(cfg.Instance, cfg.GetNodes, cfg.NodeHealth, matchedKeyConfig.Path, "")
 		} else {
-			// This server is node for this key - increment local VV and sync to pivot
-			if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-				cfg.Instance.VVManager.increment(event.Key)
-			}
-			if cfg.Pool != nil {
-				s := cfg.Pool.syncers[effectiveClusterURL]
-				if s != nil {
-					if event.Operation == "del" {
-						s.QueueOrSendDelete(event.Key, time.Now().UnixNano())
-					} else {
-						obj, err := matchedDB.Get(event.Key)
-						if err == nil {
-							s.QueueOrSendSet(event.Key, obj)
-						}
-					}
-				}
-			}
+			applyNodePush(cfg.Pool, matchedDB, effectiveClusterURL, event.Operation, event.Key)
 		}
 	}
 }
