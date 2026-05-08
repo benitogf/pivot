@@ -328,7 +328,7 @@ func TestSyncFallsBackToLastEntryWhenLeaderHasNoVV(t *testing.T) {
 
 	got, getErr := localDB.Get("things/x")
 	require.NoError(t, getErr, "leader's item must have been pulled locally")
-	require.Equal(t, "from-leader", string(got.Data[len("{\"v\":\""):len(got.Data)-2]),
+	require.JSONEq(t, `{"v":"from-leader"}`, string(got.Data),
 		"local copy must match leader's payload")
 }
 
