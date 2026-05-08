@@ -18,6 +18,25 @@ const VVKeyPrefix = StoragePrefix + "vv/"
 // LeaderID is the identifier used for the pivot/leader in version vectors
 const LeaderID = "leader"
 
+// decodeVVHeader parses an X-Pivot-VV header into a VersionVector.
+// The second return value is false if the header is empty or
+// malformed — callers should treat that as "no VV info, skip the
+// merge" rather than as an error condition. Empty/missing is the
+// backward-compat path for peers that don't emit the header.
+func decodeVVHeader(s string) (VersionVector, bool) {
+	if s == "" {
+		return nil, false
+	}
+	var vv VersionVector
+	if err := json.Unmarshal([]byte(s), &vv); err != nil {
+		return nil, false
+	}
+	if len(vv) == 0 {
+		return nil, false
+	}
+	return vv, true
+}
+
 // VersionVector represents a vector clock for tracking causality across nodes.
 // Maps node ID to that node's logical counter.
 type VersionVector map[string]int64

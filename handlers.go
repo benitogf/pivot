@@ -143,6 +143,15 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 		// the trigger could read /activity and see the pre-bump VV.
 		if vvManager != nil {
 			vvManager.increment(path)
+			// Merge-on-receive: integrate the originator's peer counters
+			// into local VV. Without this, each node's VV is just
+			// {"my-id": counter} and cross-node Compare always returns
+			// VVConcurrent; with it, /activity reflects the cluster's
+			// actual causal frontier and the idempotency / divergence
+			// detection paths can make meaningful decisions.
+			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
+				vvManager.set(path, peerVV)
+			}
 		}
 		if postWrite != nil {
 			postWrite(itemKey, "set", originatorPeer)
@@ -198,9 +207,13 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 		}
 		// VV bump at PATH scope (see the Set handler for the full rationale).
 		// Must precede the post-write trigger so a peer woken by the trigger
-		// reads a fresh VV.
+		// reads a fresh VV. Merge-on-receive integrates the originator's
+		// peer counters into local VV.
 		if vvManager != nil {
 			vvManager.increment(path)
+			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
+				vvManager.set(path, peerVV)
+			}
 		}
 		if postWrite != nil {
 			postWrite(itemKey, "del", originatorPeer)

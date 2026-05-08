@@ -41,6 +41,22 @@ const OriginatorHeader = "X-Pivot-Originator"
 // Old leaders don't emit it; new clients fall back to checkLeaderActivity.
 const ActivityHeader = "X-Pivot-Activity"
 
+// VVHeader carries the originator's local version vector for a key on
+// inbound Set/Delete. Receivers parse it and merge into local VV so
+// peer counters integrate (the merge-on-receive half of the VV
+// foundation). Old peers don't emit it; missing/empty header → no
+// merge, falls through to existing behavior.
+//
+// Trust boundary: the receiver merges via element-wise max into its
+// own VV state. A peer sending a counter near math.MaxInt64 would
+// permanently advance the receiver's view of that node and the real
+// value could never catch up. Closed-network deployment (per the
+// repo's review preamble) is the trust boundary that makes this
+// acceptable; the wire is authoritative on local counters and any
+// future open-network use needs an out-of-band signed VV or a
+// separate authority on counter advancement.
+const VVHeader = "X-Pivot-VV"
+
 // TriggerNodeSync will call pivot on a node server
 func TriggerNodeSync(client *http.Client, node string) {
 	TriggerNodeSyncWithHealth(ClientOpts{Client: client}, node, "")
@@ -143,7 +159,7 @@ func getEntryFromLeader(opts ClientOpts, key string) (meta.Object, error) {
 	return meta.DecodeFromReader(resp.Body)
 }
 
-func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator string) error {
+func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator string, vv VersionVector) error {
 	buf := new(bytes.Buffer)
 	json.NewEncoder(buf).Encode(obj)
 	req, err := http.NewRequest("POST", opts.URL(RoutePrefix+"/pivot/"+key), buf)
@@ -153,6 +169,9 @@ func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator strin
 	req.Header.Set("Content-Type", "application/json")
 	if originator != "" {
 		req.Header.Set(OriginatorHeader, originator)
+	}
+	if len(vv) > 0 {
+		req.Header.Set(VVHeader, string(encodeVV(vv)))
 	}
 	resp, err := opts.Client.Do(req)
 	if err != nil {
@@ -168,7 +187,7 @@ func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator strin
 	return nil
 }
 
-func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator string) error {
+func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator string, vv VersionVector) error {
 	url := opts.URL(RoutePrefix + "/pivot/" + key + "/" + strconv.FormatInt(lastEntry, 10))
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
@@ -176,6 +195,9 @@ func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator
 	}
 	if originator != "" {
 		req.Header.Set(OriginatorHeader, originator)
+	}
+	if len(vv) > 0 {
+		req.Header.Set(VVHeader, string(encodeVV(vv)))
 	}
 	resp, err := opts.Client.Do(req)
 	if err != nil {

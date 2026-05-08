@@ -271,12 +271,18 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Wait for both writes to complete
+	// Wait for both writes to complete. The wg decrements fire from
+	// AfterWrite (synchronous with the storage Set), but the VV bump
+	// runs in the storage event callback on the watch goroutine — those
+	// two paths are decoupled. Poll the VV reads instead of asserting
+	// once and racing the callback.
 	servers.NodeWg.Wait()
 	servers.PivotWg.Wait()
 
+	require.Eventually(t, func() bool {
+		return len(nodeInstance.VVManager.Get("policies")) > 0
+	}, 2*time.Second, 5*time.Millisecond, "node VV never bumped")
 	nodeVV := nodeInstance.VVManager.Get("policies")
-	require.NotEmpty(t, nodeVV, "Node should have VV for policies")
 	t.Logf("Node VV after write: %v", nodeVV)
 
 	// Verify pivot received the data
@@ -287,9 +293,10 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	require.Equal(t, "from-node", pivotData["value"], "Pivot should have received data from node")
 
 	// Verify pivot incremented its VV (via Set handler)
+	require.Eventually(t, func() bool {
+		return pivotInstance.VVManager.Get("policies")["leader"] > 0
+	}, 2*time.Second, 5*time.Millisecond, "pivot VV never bumped after node-driven write")
 	pivotVV := pivotInstance.VVManager.Get("policies")
-	require.NotEmpty(t, pivotVV, "Pivot should have VV for policies")
-	require.Greater(t, pivotVV["leader"], int64(0), "Pivot leader counter should be > 0")
 	t.Logf("Pivot VV after receiving: %v", pivotVV)
 
 	t.Log("Phase 1 passed: Node write syncs to pivot with VV tracking")
@@ -322,9 +329,11 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	json.Unmarshal(nodeObj2.Data, &nodeData)
 	require.Equal(t, "from-pivot", nodeData["value"], "Node should have received update from pivot")
 
-	// Check pivot VV incremented again
+	// Check pivot VV incremented again — same poll-vs-callback race story.
+	require.Eventually(t, func() bool {
+		return pivotInstance.VVManager.Get("policies")["leader"] > pivotVV["leader"]
+	}, 2*time.Second, 5*time.Millisecond, "pivot VV never re-bumped after the second write")
 	pivotVV2 := pivotInstance.VVManager.Get("policies")
-	require.Greater(t, pivotVV2["leader"], pivotVV["leader"], "Pivot VV should have incremented")
 	t.Logf("Pivot VV after second write: %v", pivotVV2)
 
 	t.Log("Phase 2 passed: Pivot write syncs to node")
@@ -351,10 +360,15 @@ func TestVersionVectorActivityEndpoint(t *testing.T) {
 	servers.NodeWg.Wait()
 	servers.PivotWg.Wait()
 
-	// Verify pivot has VV
+	// Verify pivot has VV. The wg decrements fire from AfterWrite
+	// (synchronous with the storage Set), but the VV bump runs in the
+	// storage event callback on the watch goroutine — those two paths
+	// are decoupled. Poll until the bump has landed instead of asserting
+	// once and racing the callback.
 	pivotInstance := pivot.GetInstance(servers.Pivot)
-	pivotVV := pivotInstance.VVManager.Get("policies")
-	require.Greater(t, pivotVV["leader"], int64(0), "Pivot should have VV")
+	require.Eventually(t, func() bool {
+		return pivotInstance.VVManager.Get("policies")["leader"] > 0
+	}, 2*time.Second, 5*time.Millisecond, "pivot VV never bumped after the policies write drained")
 
 	// Check activity endpoint on pivot includes VV
 	resp, err = servers.Pivot.Client.Get("http://" + servers.Pivot.Address + "/_pivot/activity/policies")
