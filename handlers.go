@@ -201,7 +201,6 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 			// Glob pattern delete (e.g., "things/123")
 			itemKey = path + "/" + index
 		}
-		originatorPeer := r.Header.Get(OriginatorHeader)
 		// Idempotency guard via the originator's VV — same shape as the
 		// Set handler. A retried or stale Delete whose VV is dominated
 		// must not remove a newer local write.
@@ -215,6 +214,7 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 				}
 			}
 		}
+		originatorPeer := r.Header.Get(OriginatorHeader)
 		if handlerTracker != nil {
 			handlerTracker.Mark(itemKey)
 		}

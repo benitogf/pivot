@@ -105,8 +105,6 @@ func TestSetGuardSkipsExactRetry(t *testing.T) {
 
 	require.Equal(t, int64(0), vvm.Get("things")["leader"],
 		"VVEqual must skip — leader counter must not advance from a duplicate")
-	require.Equal(t, int64(1), vvm.Get("things")["10.0.0.1:9000"],
-		"peer counter from the seed must be preserved (no merge on skip)")
 }
 
 // TestSetGuardAcceptsHigherVV: inbound strictly dominates local
@@ -213,6 +211,90 @@ func TestSetGuardPreservesClockDriftScenario(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"phase":"corrected"}`, string(got.Data),
 		"VVLess (higher counter, older timestamp) must be accepted — this is the clock-drift recovery path")
+	// Strengthen vs TestSetGuardAcceptsHigherVV: also assert the storage
+	// layer's Updated timestamp now reflects the corrected value (100),
+	// not the future-timestamped seed (999). Catches a hypothetical
+	// regression that retains storage state on the proceed path.
+	require.Equal(t, int64(100), got.Updated,
+		"corrected (older) timestamp must overwrite the future-timestamped record")
+}
+
+// TestSetGuardProceedsOnVVConcurrent: each side has unique counters
+// the other hasn't seen (VVConcurrent). The guard must proceed —
+// inbound has new info worth integrating; the merge step that runs
+// after the guard lands the peer counter into local. This pins the
+// VVConcurrent → proceed convention shared with pullKeyWithCacheUpdate.
+func TestSetGuardProceedsOnVVConcurrent(t *testing.T) {
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, db.Start(storage.Options{}))
+	defer db.Close()
+	storage.WatchWithCallback(db, func(storage.Event) {})
+
+	_, err := db.SetWithMeta("things/x", []byte(`{"v":"local"}`), 100, 100)
+	require.NoError(t, err)
+
+	vvm := NewVVManager(db, "leader")
+	// Local has counters inbound doesn't know about; inbound has counters
+	// local doesn't know about → VVConcurrent.
+	vvm.set("things/*", VersionVector{"leader": 5})
+	handler := Set(db, "things", NewHandlerWriteTracker(), vvm, nil)
+
+	obj := meta.Object{Created: 200, Updated: 200, Index: "x", Path: "things/x", Data: []byte(`{"v":"from-A"}`)}
+	body, err := json.Marshal(obj)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("POST", "/_pivot/pivot/things/x", bytes.NewReader(body))
+	req = mux.SetURLVars(req, map[string]string{"index": "x"})
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(VVHeader, `{"10.0.0.1:9000":3}`) // disjoint from local → VVConcurrent
+	w := httptest.NewRecorder()
+	handler(w, req)
+	require.Equal(t, 200, w.Code)
+
+	got, err := db.Get("things/x")
+	require.NoError(t, err)
+	require.JSONEq(t, `{"v":"from-A"}`, string(got.Data),
+		"VVConcurrent must proceed — inbound has unique writes worth integrating")
+
+	// Merge from #47 lands the peer counter; the leader counter advances
+	// from the handler's own increment(path).
+	mergedVV := vvm.Get("things")
+	require.Equal(t, int64(6), mergedVV["leader"], "leader bumped from 5 → 6 by handler increment")
+	require.Equal(t, int64(3), mergedVV["10.0.0.1:9000"], "peer counter merged from inbound VV")
+}
+
+// TestSetGuardProceedsOnMalformedHeader: a truncated/garbled JSON in
+// X-Pivot-VV must not jam the handler — decodeVVHeader returns false,
+// guard falls through, write proceeds. Locks the failure mode of a
+// proxy or buggy peer that ships an unparseable header.
+func TestSetGuardProceedsOnMalformedHeader(t *testing.T) {
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, db.Start(storage.Options{}))
+	defer db.Close()
+	storage.WatchWithCallback(db, func(storage.Event) {})
+
+	vvm := NewVVManager(db, "leader")
+	vvm.set("things/*", VersionVector{"leader": 5}) // would dominate if compared
+	handler := Set(db, "things", NewHandlerWriteTracker(), vvm, nil)
+
+	obj := meta.Object{Created: 100, Updated: 100, Index: "x", Path: "things/x", Data: []byte(`{"v":"applied"}`)}
+	body, err := json.Marshal(obj)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("POST", "/_pivot/pivot/things/x", bytes.NewReader(body))
+	req = mux.SetURLVars(req, map[string]string{"index": "x"})
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(VVHeader, "{not valid json") // garbled
+	w := httptest.NewRecorder()
+	handler(w, req)
+	require.Equal(t, 200, w.Code)
+
+	got, err := db.Get("things/x")
+	require.NoError(t, err)
+	require.JSONEq(t, `{"v":"applied"}`, string(got.Data),
+		"malformed VV header must not block the write — guard falls through")
 }
 
 // TestDeleteGuardSkipsStaleTombstone mirrors the Set test for Delete.
