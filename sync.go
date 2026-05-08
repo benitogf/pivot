@@ -770,14 +770,25 @@ func (s *syncer) processQueueLocked() {
 	s.drainQueue()
 }
 
-// snapshotVV returns the originator's current VV for the given key,
-// or nil if no VVManager is configured. Captured eagerly at
-// queue/send time so the value travels with the obj to the leader.
-func (s *syncer) snapshotVV(key string) VersionVector {
+// snapshotVV returns the originator's current VV at the registered
+// path scope for the storage key, or nil if no VVManager is configured.
+// Captured eagerly at queue/send time so the value travels with the
+// obj to the leader. Resolves the matching registered Key.Path so the
+// snapshot reads from the same scope writes/`/activity` use; without
+// that resolution, snapshotVV("things/x") would look at item scope
+// (nothing in production writes there).
+func (s *syncer) snapshotVV(itemKey string) VersionVector {
 	if s.vvManager == nil {
 		return nil
 	}
-	return s.vvManager.Get(key)
+	for _, k := range s.keys {
+		if key.Match(k.Path, itemKey) {
+			return s.vvManager.Get(k.Path)
+		}
+	}
+	// No registered match — fall back to whatever the item-scope key
+	// returns; will be empty in normal operation.
+	return s.vvManager.Get(itemKey)
 }
 
 // QueueOrSendSet sends a set operation to leader, or queues it if Pull is in

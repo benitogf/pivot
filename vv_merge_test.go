@@ -15,7 +15,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/benitogf/ooo/meta"
 	"github.com/benitogf/ooo/monotonic"
@@ -141,16 +143,72 @@ func TestSendToLeaderEmitsVVHeader(t *testing.T) {
 }
 
 // TestQueuedOpCarriesQueueTimeVV pins that VV captured at queue time
-// travels with the obj when the queue eventually drains. Pre-fix, a
-// drain that ran after intervening local bumps would attach a newer
-// VV to the older obj — leader's idempotency guard would then see
-// VVEqual on a later queued write and silently drop it.
+// travels with the obj when the queue eventually drains. Without
+// queue-time capture (i.e. if drainQueue read s.vvManager fresh per
+// op), a drain that ran after intervening local bumps would attach a
+// uniform "current" VV to every queued op — receiver's merge would
+// then see the same VV on the second op as on the first, and any
+// future idempotency consumer downstream would mistakenly skip the
+// later write.
+//
+// Setup: queue two ops with different VV snapshots, drain, verify
+// the leader received them in order with the per-op VV.
 func TestQueuedOpCarriesQueueTimeVV(t *testing.T) {
-	// Verified at unit level via the snapshotVV helper — the queue
-	// path captures s.vvManager.Get(key) before the queueMu lock,
-	// which means each pendingOp records the VV that was current
-	// when that specific write reached the queue. drainQueue then
-	// passes op.vv into sendToLeader. End-to-end coverage of the
-	// queue+drain path lives in cluster_test.go's offline-sync flows.
-	t.Skip("covered by sync_vv_merge_e2e_test.go and existing offline-sync e2e flow")
+	monotonic.Init()
+	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, db.Start(storage.Options{}))
+	defer db.Close()
+
+	// Capture the VV header from every inbound POST.
+	type recv struct {
+		key string
+		vv  string
+	}
+	var (
+		mu       struct{ sync.Mutex }
+		received []recv
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		received = append(received, recv{key: r.URL.Path, vv: r.Header.Get(VVHeader)})
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// Build a syncer with an empty nodeAddr so writes are queued, not sent
+	// immediately. We'll drain via SetNodeAddr at the end.
+	vvm := NewVVManager(db, "10.0.0.1:9000")
+	pool := newSyncerPool(srv.Client(), []Key{{Path: "things/*", Database: db}},
+		srv.URL[len("http://"):], false, vvm)
+
+	// Op #1: snapshot at VV {nodeA:1}.
+	vvm.set("things/*", VersionVector{"10.0.0.1:9000": 1})
+	pool.syncers[srv.URL[len("http://"):]].QueueOrSendSet("things/a",
+		meta.Object{Created: 1, Updated: 1, Index: "a", Path: "things/a", Data: []byte(`{}`)})
+
+	// Op #2: VV bumps to {nodeA:2} between the two writes.
+	vvm.set("things/*", VersionVector{"10.0.0.1:9000": 2})
+	pool.syncers[srv.URL[len("http://"):]].QueueOrSendSet("things/b",
+		meta.Object{Created: 2, Updated: 2, Index: "b", Path: "things/b", Data: []byte(`{}`)})
+
+	// Drain by setting the node addr — the queue runs through sendToLeader
+	// with op.vv as the header value.
+	pool.SetNodeAddr("10.0.0.1:9000")
+
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(received) == 2
+	}, time.Second, 5*time.Millisecond, "queue never drained both ops")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, received, 2)
+	require.Contains(t, received[0].key, "things/a")
+	require.JSONEq(t, `{"10.0.0.1:9000":1}`, received[0].vv,
+		"first op must carry the queue-time VV {nodeA:1}, not the later snapshot")
+	require.Contains(t, received[1].key, "things/b")
+	require.JSONEq(t, `{"10.0.0.1:9000":2}`, received[1].vv,
+		"second op must carry the queue-time VV {nodeA:2}")
 }

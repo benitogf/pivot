@@ -46,6 +46,15 @@ const ActivityHeader = "X-Pivot-Activity"
 // peer counters integrate (the merge-on-receive half of the VV
 // foundation). Old peers don't emit it; missing/empty header → no
 // merge, falls through to existing behavior.
+//
+// Trust boundary: the receiver merges via element-wise max into its
+// own VV state. A peer sending a counter near math.MaxInt64 would
+// permanently advance the receiver's view of that node and the real
+// value could never catch up. Closed-network deployment (per the
+// repo's review preamble) is the trust boundary that makes this
+// acceptable; the wire is authoritative on local counters and any
+// future open-network use needs an out-of-band signed VV or a
+// separate authority on counter advancement.
 const VVHeader = "X-Pivot-VV"
 
 // TriggerNodeSync will call pivot on a node server
