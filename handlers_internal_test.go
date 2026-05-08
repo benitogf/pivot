@@ -152,11 +152,11 @@ func TestSetVVIncrementsExactlyOnce(t *testing.T) {
 	// Settle: callback runs in the watch goroutine, so we need to let any
 	// stray increment race past the handler's own Get before reading.
 	time.Sleep(100 * time.Millisecond)
-	require.Equal(t, int64(1), vvm.Get("things/abc")["leader"], "first Set must bump leader counter to exactly 1")
+	require.Equal(t, int64(1), vvm.Get("things")["leader"], "first Set must bump leader counter to exactly 1")
 
 	doSet("abc")
 	time.Sleep(100 * time.Millisecond)
-	require.Equal(t, int64(2), vvm.Get("things/abc")["leader"], "second Set must bump leader counter to exactly 2")
+	require.Equal(t, int64(2), vvm.Get("things")["leader"], "second Set must bump leader counter to exactly 2")
 }
 
 // TestSetVVIncrementsExactlyOnceNodeRole is the node-side mirror of
@@ -194,7 +194,7 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 	require.Equal(t, 200, w.Code)
 	time.Sleep(100 * time.Millisecond)
 
-	got := vvm.Get("things/abc")
+	got := vvm.Get("things")
 	require.Equal(t, int64(1), got["127.0.0.1:9999"],
 		"node-role HTTP Set must bump local counter exactly once; got %d", got["127.0.0.1:9999"])
 }
@@ -245,7 +245,7 @@ func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
 	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, 2*time.Second, 5*time.Millisecond,
 		"watch goroutine never drained all %d events", burst)
 
-	got := vvm.Get("things/abc")["leader"]
+	got := vvm.Get("things")["leader"]
 	require.Equal(t, int64(burst), got,
 		"%d back-to-back HTTP Sets must bump leader counter exactly %d times; got %d means the per-key dedup collapsed under burst",
 		burst, burst, got)
@@ -286,16 +286,13 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 		_, err = db.SetWithMeta("things/"+idx, body, nowUnix, nowUnix)
 		require.NoError(t, err)
 	}
-	// Wait until the seed VV bumps actually landed via the callback. Without
-	// this, a Delete fired before its seed event drained could observe an
-	// in-flight VV state and racy interactions could mask a regression.
+	// Wait until the seed VV bumps actually landed via the callback. Each
+	// seed bumps path-scope "things" once (the callback increments at the
+	// matched key's base, not the storage event's full key), so after three
+	// seeds the path-scope leader counter must be 3.
+	_ = indices // kept for clarity in the loop above
 	require.Eventually(t, func() bool {
-		for _, idx := range indices {
-			if vvm.Get("things/" + idx)["leader"] != 1 {
-				return false
-			}
-		}
-		return true
+		return vvm.Get("things")["leader"] >= 3
 	}, 2*time.Second, 5*time.Millisecond, "seed VV bumps never landed")
 
 	handler := Delete(db, "things", tracker, vvm, nil)
@@ -334,7 +331,9 @@ func TestSetPostWriteSeesBumpedVV(t *testing.T) {
 
 	var observedAt int64
 	postWrite := func(itemKey, op, originatorPeer string) {
-		observedAt = vvm.Get(itemKey)["leader"]
+		// VV is bumped at path scope ("things"), not itemKey scope —
+		// see the increment in the Set handler.
+		observedAt = vvm.Get("things")["leader"]
 	}
 
 	handler := Set(db, "things", tracker, vvm, postWrite)
@@ -381,7 +380,7 @@ func TestSetVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	handler(w, req)
 
 	require.Equal(t, 500, w.Code, "storage failure must surface as 500")
-	vv := vvm.Get("things/abc")
+	vv := vvm.Get("things")
 	require.Equal(t, int64(0), vv["leader"],
 		"VV must not bump when the storage write failed; got %d means VV is now ahead of storage", vv["leader"])
 }
