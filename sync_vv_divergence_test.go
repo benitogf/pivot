@@ -129,7 +129,7 @@ func TestSyncDetectsVVDivergenceOnEqualLastEntryPushCase(t *testing.T) {
 	vvm := NewVVManager(localDB, "127.0.0.1:9000")
 	vvm.set("things/*", VersionVector{"leader": 5, "127.0.0.1:9000": 3}) // normalizes to baseKey "things"; local strictly greater
 
-	leader, _ := stubLeader(t, "things", ActivityEntry{
+	leader, pushes := stubLeader(t, "things", ActivityEntry{
 		LastEntry: collidedTS,
 		VV:        VersionVector{"leader": 5},
 	}, []meta.Object{})
@@ -140,13 +140,66 @@ func TestSyncDetectsVVDivergenceOnEqualLastEntryPushCase(t *testing.T) {
 		Originator: "127.0.0.1:9000",
 		VVManager:  vvm,
 	})
-	// The fix's contract here: choose the push direction (call syncToLeader)
-	// instead of short-circuiting on equal LastEntry. Whether any item
-	// actually transfers is gated by syncToLeader's per-item timestamp
-	// guards (objLocal.Created > leaderActivity, etc.) — pre-existing and
-	// intentional. We just pin that the function no longer reports
-	// "nothing to synchronize".
 	require.NoError(t, err)
+
+	// Distinguish push from pull. With this scenario:
+	//   - Push (correct, VVGreater): syncToLeader runs against an empty leader
+	//     list. The local item's Created == leaderActivity, so syncToLeader's
+	//     per-item guard prevents the actual POST — pushes stays at 0. But
+	//     the local item is preserved.
+	//   - Pull (wrong direction): syncLocalEntriesWithTracking would see x in
+	//     local and not in leader, and DELETE x locally (negative-diff path).
+	//   - Pre-fix "nothing to synchronize": err != nil, already caught above.
+	// So the surviving local item is what pins push-direction.
+	_, getErr := localDB.Get("things/x")
+	require.NoError(t, getErr,
+		"VVGreater should pick push direction; the local-only item must NOT be deleted (which is what wrongly choosing pull would do)")
+	// pushes will be 0 here for the equal-timestamp edge case — syncToLeader's
+	// per-item Created>leaderActivity guard suppresses the POST. Pre-existing
+	// and orthogonal to this fix; documented in the issue's "practical impact
+	// bounded" note.
+	_ = pushes
+}
+
+// TestSyncPushDirectionPushesWhenItemTimestampsAllow exercises the same
+// VVGreater branch with a local item whose Updated strictly exceeds
+// leader's last activity, so syncToLeader's per-item guard lets the
+// POST through. Without this scenario, the push-case regression test
+// can't distinguish "push direction chosen but per-item guard fired"
+// from "the function silently no-op'd".
+func TestSyncPushDirectionPushesWhenItemTimestampsAllow(t *testing.T) {
+	monotonic.Init()
+	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, localDB.Start(storage.Options{}))
+	defer localDB.Close()
+	storage.WatchWithCallback(localDB, func(storage.Event) {})
+
+	leaderTS := int64(1_700_000_000_000_000_000)
+	localTS := leaderTS + 1_000_000 // strictly newer item
+
+	obj := meta.Object{Created: localTS, Updated: localTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"local-newer"}`)}
+	body, err := json.Marshal(obj)
+	require.NoError(t, err)
+	_, err = localDB.SetWithMeta("things/x", body, localTS, localTS)
+	require.NoError(t, err)
+
+	vvm := NewVVManager(localDB, "127.0.0.1:9000")
+	vvm.set("things/*", VersionVector{"leader": 5, "127.0.0.1:9000": 3})
+
+	leader, pushes := stubLeader(t, "things", ActivityEntry{
+		LastEntry: leaderTS,
+		VV:        VersionVector{"leader": 5},
+	}, []meta.Object{})
+
+	clientOpts := ClientOpts{Client: http.DefaultClient, Leader: leader}
+	err = synchronizeItemWithTracking(clientOpts, SyncOptions{
+		Key:        Key{Path: "things/*", Database: localDB},
+		Originator: "127.0.0.1:9000",
+		VVManager:  vvm,
+	})
+	require.NoError(t, err)
+	require.Greater(t, pushes.Load(), int32(0),
+		"VVGreater with item timestamps that pass the per-item guard must POST to leader")
 }
 
 // TestSyncSkipsWhenVVsAreEqual: local and leader VVs are identical.
@@ -246,8 +299,11 @@ func TestSyncConcurrentVVsLogsAndPullsLeader(t *testing.T) {
 }
 
 // TestSyncFallsBackToLastEntryWhenLeaderHasNoVV: an old leader returns
-// activity without a VV. The bidirectional reconciler must fall back to
-// the existing LastEntry comparison so older peers continue to work.
+// activity without a VV. The reconciler must fall back to the existing
+// LastEntry comparison and pull the leader's item. Pinning that the
+// fallback path actually drives a pull (not just a no-op) — without an
+// item assertion the test would pass even if the fallback regressed
+// to "nothing to synchronize".
 func TestSyncFallsBackToLastEntryWhenLeaderHasNoVV(t *testing.T) {
 	monotonic.Init()
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
@@ -256,9 +312,10 @@ func TestSyncFallsBackToLastEntryWhenLeaderHasNoVV(t *testing.T) {
 	storage.WatchWithCallback(localDB, func(storage.Event) {})
 
 	leaderTS := int64(1_700_000_000_000_000_500)
+	leaderItem := meta.Object{Created: leaderTS, Updated: leaderTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"from-leader"}`)}
 
 	// Leader reports newer LastEntry, NO VV (simulates an old peer).
-	leader, _ := stubLeader(t, "things", ActivityEntry{LastEntry: leaderTS}, []meta.Object{})
+	leader, _ := stubLeader(t, "things", ActivityEntry{LastEntry: leaderTS}, []meta.Object{leaderItem})
 
 	clientOpts := ClientOpts{Client: http.DefaultClient, Leader: leader}
 	vvm := NewVVManager(localDB, "127.0.0.1:9000")
@@ -267,13 +324,45 @@ func TestSyncFallsBackToLastEntryWhenLeaderHasNoVV(t *testing.T) {
 		Originator: "127.0.0.1:9000",
 		VVManager:  vvm,
 	})
-	// Local has nothing seeded so checkActivity reports LastEntry=0.
-	// Leader reports leaderTS > 0 → fallback path picks "pull leader to local".
-	// We only guard against the function silently reporting "nothing to
-	// synchronize" — any other outcome (nil error, or an error from the
-	// stub's degenerate GetList response) is acceptable.
-	if err != nil {
-		require.NotContains(t, err.Error(), "nothing to synchronize",
-			"LastEntry fallback should still drive a pull when leader is newer")
-	}
+	require.NoError(t, err, "fallback must drive a pull, not return 'nothing to synchronize'")
+
+	got, getErr := localDB.Get("things/x")
+	require.NoError(t, getErr, "leader's item must have been pulled locally")
+	require.Equal(t, "from-leader", string(got.Data[len("{\"v\":\""):len(got.Data)-2]),
+		"local copy must match leader's payload")
+}
+
+// TestSyncFallsBackToLastEntryWhenLocalHasNoVV: this server has just
+// started up and hasn't bumped its VV yet. Leader reports a non-empty
+// VV. The asymmetric case must still drive a pull via the LastEntry
+// fallback, not silently no-op. Worth pinning because a future change
+// could accidentally gate the VV path on either side's presence and
+// regress this code path.
+func TestSyncFallsBackToLastEntryWhenLocalHasNoVV(t *testing.T) {
+	monotonic.Init()
+	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, localDB.Start(storage.Options{}))
+	defer localDB.Close()
+	storage.WatchWithCallback(localDB, func(storage.Event) {})
+
+	leaderTS := int64(1_700_000_000_000_000_500)
+	leaderItem := meta.Object{Created: leaderTS, Updated: leaderTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"from-leader"}`)}
+
+	// Leader has VV; local does not (no vvm.set calls).
+	leader, _ := stubLeader(t, "things", ActivityEntry{
+		LastEntry: leaderTS,
+		VV:        VersionVector{"leader": 5},
+	}, []meta.Object{leaderItem})
+
+	clientOpts := ClientOpts{Client: http.DefaultClient, Leader: leader}
+	vvm := NewVVManager(localDB, "127.0.0.1:9000")
+	err := synchronizeItemWithTracking(clientOpts, SyncOptions{
+		Key:        Key{Path: "things/*", Database: localDB},
+		Originator: "127.0.0.1:9000",
+		VVManager:  vvm,
+	})
+	require.NoError(t, err, "asymmetric VV (only leader) must fall back to LastEntry-driven pull")
+
+	_, getErr := localDB.Get("things/x")
+	require.NoError(t, getErr, "leader's item must have been pulled locally via LastEntry fallback")
 }
