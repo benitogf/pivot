@@ -501,9 +501,20 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	getNodes := makeGetNodes(server, config.NodesKey, instance)
 	getNodesCached := makeGetNodesCached(instance)
 
+	// Construct VVManager first so the syncer pool can read local VVs
+	// when reconciling against a leader. nodeID stays empty on node
+	// servers until OnStart wires the actual address via SetNodeID.
+	var vvManager *VVManager
+	if pivotURL == "" {
+		vvManager = NewVVManager(server.Storage, LeaderID)
+	} else {
+		vvManager = NewVVManager(server.Storage, "")
+	}
+	instance.VVManager = vvManager
+
 	// Create syncer pool for keys that need outbound sync
 	// Keys with Local=true or where server IS pivot won't have syncers
-	pool := newSyncerPool(client, keys, pivotURL, config.SSL)
+	pool := newSyncerPool(client, keys, pivotURL, config.SSL, vvManager)
 
 	// Create node health tracker
 	// NodeHealth is needed if server is pivot for ANY key (pure pivot or mixed role)
@@ -575,18 +586,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// Handler-write tracker is created on every server. The Set/Delete
 	// handlers Mark before each storage write so the async storage event
 	// callback knows to skip its own bump+fanout for handler-driven events.
-	// Create version vector manager for all servers (pivot uses LeaderID,
-	// nodes use their address).
 	handlerTracker := NewHandlerWriteTracker()
-	var vvManager *VVManager
-	if pivotURL == "" {
-		vvManager = NewVVManager(server.Storage, LeaderID)
-	} else {
-		// Node servers: VVManager will be initialized with node address once server starts
-		// For now create with empty ID, will be set via SetNodeID later
-		vvManager = NewVVManager(server.Storage, "")
-	}
-	instance.VVManager = vvManager
 
 	// Per-node trigger coalescer — replaces the goroutine-per-event-per-node
 	// fan-out from the broadcast loop. Only pivot servers broadcast, so we
@@ -609,15 +609,15 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	})
 
 	syncCallback := makeStorageSync(StorageSyncConfig{
-		Client:            client,
-		ConfigClusterURL:  pivotURL,
-		Keys:              keys,
-		NodesKey:          config.NodesKey,
-		GetNodes:          getNodesCached,
-		Pool:              pool,
-		NodeHealth:        nodeHealth,
-		HandlerTracker: handlerTracker,
-		Instance:          instance,
+		Client:           client,
+		ConfigClusterURL: pivotURL,
+		Keys:             keys,
+		NodesKey:         config.NodesKey,
+		GetNodes:         getNodesCached,
+		Pool:             pool,
+		NodeHealth:       nodeHealth,
+		HandlerTracker:   handlerTracker,
+		Instance:         instance,
 	})
 
 	// Set up OnStorageEvent for write/delete synchronization on server.Storage

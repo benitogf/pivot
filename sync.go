@@ -24,6 +24,13 @@ type SyncOptions struct {
 	OnSet          func(key string)
 	SkipSet        func(key string) bool
 	IsRecentDelete func(key string) bool
+	// VVManager exposes the local version vector to the bidirectional
+	// reconciler. When non-nil and both sides report a VV, direction is
+	// chosen by VV.Compare instead of LastEntry — the latter silently
+	// reports "nothing to synchronize" on timestamp collisions even when
+	// content actually diverges. Optional for backward compatibility:
+	// nil falls back to LastEntry-only logic.
+	VVManager *VVManager
 }
 
 // baseKeyFromPath strips all trailing glob segments (/*) from a path.
@@ -245,7 +252,6 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 }
 
 func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error {
-	update := false
 	_key := baseKeyFromPath(opts.Key.Path)
 
 	activityLeader, err := checkLeaderActivity(clientOpts, _key)
@@ -257,7 +263,47 @@ func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error 
 		return errors.New("failed to check activity for " + _key + " on local")
 	}
 
-	// sync local to leader (includes sending deletes for items deleted locally)
+	// checkActivity is a local read that doesn't carry the VV. Pull it
+	// from the manager directly so the comparison below has both sides.
+	if opts.VVManager != nil {
+		activityLocal.VV = opts.VVManager.Get(_key)
+	}
+
+	// Direction logic. When BOTH sides report a non-empty VV, use VV
+	// comparison — that's clock-independent and detects content
+	// divergence even when timestamps collide. Concurrent writes
+	// producing equal LastEntry but disjoint VV updates used to fall
+	// through the timestamp comparison and silently report "nothing to
+	// synchronize", leaving the cluster diverged until the next write
+	// bumped the timestamp past the collision.
+	//
+	// Fall back to LastEntry comparison when either side has no VV
+	// (older peers, or the very first sync before any VV bump).
+	useVV := len(activityLeader.VV) > 0 && len(activityLocal.VV) > 0
+	if useVV {
+		switch activityLocal.VV.Compare(activityLeader.VV) {
+		case VVEqual:
+			return errors.New("nothing to synchronize for " + opts.Key.Path)
+		case VVGreater:
+			opts.LastEntry = activityLeader.LastEntry
+			return syncToLeader(clientOpts, opts)
+		case VVLess:
+			opts.LastEntry = activityLeader.LastEntry
+			return syncLocalEntriesWithTracking(clientOpts, opts)
+		case VVConcurrent:
+			// Both sides have writes the other hasn't seen. Match the
+			// last-sync-wins convention from pullKeyWithCacheUpdate so
+			// the cluster converges on a single canonical state — local-
+			// only items are dropped this round but get re-pushed on the
+			// next sync after a write bumps local's VV further.
+			logConflict(_key, activityLocal.VV, activityLeader.VV, "last-sync-wins: pulling leader")
+			opts.LastEntry = activityLeader.LastEntry
+			return syncLocalEntriesWithTracking(clientOpts, opts)
+		}
+	}
+
+	// LastEntry fallback (backward compatibility with peers that don't expose VV).
+	update := false
 	if activityLocal.LastEntry > activityLeader.LastEntry {
 		opts.LastEntry = activityLeader.LastEntry
 		if err := syncToLeader(clientOpts, opts); err != nil {
@@ -266,7 +312,6 @@ func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error 
 		update = true
 	}
 
-	// sync leader to local
 	if activityLocal.LastEntry < activityLeader.LastEntry {
 		opts.LastEntry = activityLeader.LastEntry
 		if err := syncLocalEntriesWithTracking(clientOpts, opts); err != nil {
@@ -364,15 +409,16 @@ type pendingOp struct {
 // It ensures only one sync runs at a time and tracks pulled keys.
 // Uses a per-key queue to ensure operations aren't lost during contention.
 type syncer struct {
-	mu       sync.Mutex
-	tracker  *pullTracker
-	client   *http.Client
-	pivot    string
-	keys     []Key
-	nodeAddr string // This node's address (for originator tracking)
-	ssl      bool   // Use HTTPS instead of HTTP
-	queueMu  sync.Mutex
-	queue    []pendingOp // Per-key operations queued during Pull
+	mu        sync.Mutex
+	tracker   *pullTracker
+	client    *http.Client
+	pivot     string
+	keys      []Key
+	nodeAddr  string     // This node's address (for originator tracking)
+	ssl       bool       // Use HTTPS instead of HTTP
+	vvManager *VVManager // Local VV manager — passed into SyncOptions so the bidirectional reconciler can compare VVs.
+	queueMu   sync.Mutex
+	queue     []pendingOp // Per-key operations queued during Pull
 
 	// Version vector cache: tracks last synced pivot VV per key.
 	// This is the primary sync indicator, independent of system clocks.
@@ -389,13 +435,14 @@ type syncer struct {
 	connected          map[string]bool  // baseKey -> true if we've received TriggerNodeSync for this key
 }
 
-func newSyncer(client *http.Client, pivot string, keys []Key, ssl bool) *syncer {
+func newSyncer(client *http.Client, pivot string, keys []Key, ssl bool, vvManager *VVManager) *syncer {
 	return &syncer{
 		tracker:            newPullTracker(),
 		client:             client,
 		pivot:              pivot,
 		keys:               keys,
 		ssl:                ssl,
+		vvManager:          vvManager,
 		queue:              make([]pendingOp, 0),
 		lastSyncedVV:       make(map[string]VersionVector),
 		lastSyncedActivity: make(map[string]int64),
@@ -421,7 +468,7 @@ type syncerPool struct {
 // newSyncerPool creates a syncer pool from keys grouped by their effective ClusterURL.
 // configClusterURL is used as fallback for keys without explicit ClusterURL.
 // ssl enables HTTPS for URL construction.
-func newSyncerPool(client *http.Client, keys []Key, configClusterURL string, ssl bool) *syncerPool {
+func newSyncerPool(client *http.Client, keys []Key, configClusterURL string, ssl bool, vvManager *VVManager) *syncerPool {
 	pool := &syncerPool{
 		syncers: make(map[string]*syncer),
 		keyMap:  make(map[string]string),
@@ -443,7 +490,7 @@ func newSyncerPool(client *http.Client, keys []Key, configClusterURL string, ssl
 
 	// Create a syncer for each unique pivot URL
 	for pivotURL, pivotKeys := range keysByPivot {
-		pool.syncers[pivotURL] = newSyncer(client, pivotURL, pivotKeys, ssl)
+		pool.syncers[pivotURL] = newSyncer(client, pivotURL, pivotKeys, ssl, vvManager)
 	}
 
 	return pool
@@ -781,6 +828,7 @@ func (s *syncer) Sync() error {
 		IsRecentDelete: s.tracker.pulledDelete,
 		OnDelete:       s.tracker.trackDelete,
 		OnSet:          s.tracker.trackSet,
+		VVManager:      s.vvManager,
 	}
 	err := synchronizeKeysWithTracking(s.ClientOpts(), opts, s.keys)
 	s.mu.Unlock()
