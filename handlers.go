@@ -132,13 +132,17 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		// VV bump after a successful storage write so the on-disk VV can
-		// never advance past data that wasn't written. The bump must
-		// complete BEFORE we trigger peers — otherwise a peer woken by the
-		// trigger could read /activity and see the pre-bump VV, conclude
-		// it's up to date, and skip the pull.
+		// VV bump after a successful storage write. Bump at PATH scope —
+		// the registered base path is what /activity exposes, what peers
+		// cache as lastSyncedVV, and what every other VV consumer reads.
+		// Bumping at item scope (the storage event's full key) would land
+		// in a separate, never-read VV entry; /activity would still
+		// expose an empty VV for glob paths and the whole VV machinery
+		// would silently degrade to LastEntry-only logic. The bump must
+		// complete BEFORE we trigger peers — otherwise a peer woken by
+		// the trigger could read /activity and see the pre-bump VV.
 		if vvManager != nil {
-			vvManager.increment(itemKey)
+			vvManager.increment(path)
 		}
 		if postWrite != nil {
 			postWrite(itemKey, "set", originatorPeer)
@@ -192,10 +196,11 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		// VV bump after both storage writes succeeded; bump must precede the
-		// post-write trigger so a peer woken by the trigger reads a fresh VV.
+		// VV bump at PATH scope (see the Set handler for the full rationale).
+		// Must precede the post-write trigger so a peer woken by the trigger
+		// reads a fresh VV.
 		if vvManager != nil {
-			vvManager.increment(itemKey)
+			vvManager.increment(path)
 		}
 		if postWrite != nil {
 			postWrite(itemKey, "del", originatorPeer)

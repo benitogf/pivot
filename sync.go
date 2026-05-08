@@ -630,27 +630,33 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 		localVV, hasLocalVV := s.lastSyncedVV[baseKey]
 		s.vvMu.RUnlock()
 
+		// Always read local activity. The LastEntry path is the
+		// authoritative signal for "pivot has data my LastEntry doesn't
+		// reflect" because pivot's LastEntry advances synchronously with
+		// the storage write. The VV bump for DIRECT writes (writes that
+		// don't go through pivot's Set/Delete handlers — e.g. ooo's
+		// standard route, custom AfterWrite hooks, internal mutations)
+		// runs in the async storage event callback and can briefly lag
+		// the storage write. Handler-driven writes are synchronous and
+		// don't have this gap, but we can't tell the two paths apart
+		// from here — so always check LastEntry as a fallback signal.
+		activityLocal, actErr := checkActivity(_key)
+
 		if len(activityPivot.VV) > 0 && hasLocalVV {
 			// Version vector comparison (preferred, clock-independent)
-			// Compare pivot's VV with our last synced VV
 			switch localVV.Compare(activityPivot.VV) {
 			case VVLess:
-				// Local is behind pivot - need to sync
 				needSync = true
 			case VVConcurrent:
-				// Conflict detected - log and sync (last-sync-wins)
 				logConflict(baseKey, localVV, activityPivot.VV, "last-sync-wins: accepting pivot data")
 				needSync = true
 			}
-			// VVEqual or VVGreater means no sync needed
-		} else {
-			// Fallback: timestamp-based comparison
-			// Used for backward compatibility and first sync (before we have local VV)
-			activityLocal, err := checkActivity(_key)
-			if err != nil {
-				continue
-			}
-			needSync = activityPivot.LastEntry > activityLocal.LastEntry
+		}
+
+		// LastEntry secondary signal — independent of the VV branch above.
+		// Catches the VV-lag case described at the top of this loop.
+		if actErr == nil && activityPivot.LastEntry > activityLocal.LastEntry {
+			needSync = true
 		}
 
 		// Update caches with pivot's current values
@@ -1041,7 +1047,11 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 			return
 		}
 		if cfg.Instance != nil && cfg.Instance.VVManager != nil {
-			cfg.Instance.VVManager.increment(event.Key)
+			// Increment at PATH scope — matchedKey is already
+			// baseKeyFromPath(matchedKeyConfig.Path), the same scope
+			// /activity exposes. Bumping at event.Key (item scope)
+			// would land in a separate, never-read VV entry.
+			cfg.Instance.VVManager.increment(matchedKey)
 		}
 		if isPivotForKey {
 			applyPivotFanout(cfg.Instance, cfg.GetNodes, cfg.NodeHealth, matchedKeyConfig.Path, "")
