@@ -77,7 +77,7 @@ func TestSyncerDefersSendUntilNodeAddrSet(t *testing.T) {
 	leader := newFakeLeader()
 	defer leader.close()
 
-	s := newSyncer(leader.srv.Client(), leader.addr(), []Key{{Path: "things/*"}}, false)
+	s := newSyncer(leader.srv.Client(), leader.addr(), []Key{{Path: "things/*"}}, false, nil)
 
 	now := monotonic.Now()
 	obj := meta.Object{
@@ -109,7 +109,7 @@ func TestSyncerDefersDeleteUntilNodeAddrSet(t *testing.T) {
 	leader := newFakeLeader()
 	defer leader.close()
 
-	s := newSyncer(leader.srv.Client(), leader.addr(), []Key{{Path: "things/*"}}, false)
+	s := newSyncer(leader.srv.Client(), leader.addr(), []Key{{Path: "things/*"}}, false, nil)
 
 	s.QueueOrSendDelete("things/abc", monotonic.Now())
 
@@ -129,7 +129,7 @@ func TestSyncerSendsImmediatelyAfterNodeAddrSet(t *testing.T) {
 	leader := newFakeLeader()
 	defer leader.close()
 
-	s := newSyncer(leader.srv.Client(), leader.addr(), []Key{{Path: "things/*"}}, false)
+	s := newSyncer(leader.srv.Client(), leader.addr(), []Key{{Path: "things/*"}}, false, nil)
 	const nodeAddr = "127.0.0.1:9003"
 	s.SetNodeAddr(nodeAddr)
 
