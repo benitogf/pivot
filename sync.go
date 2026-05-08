@@ -163,6 +163,14 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 	if _key.Database == nil || !_key.Database.Active() {
 		return ErrStorageNotActive
 	}
+	// localVV is the originator's per-key VV at send time; the leader
+	// merges it into its own VV (merge-on-receive). Nil when the syncer
+	// has no VVManager — the leader treats that as the legacy behavior
+	// and skips the merge.
+	var localVV VersionVector
+	if opts.VVManager != nil {
+		localVV = opts.VVManager.Get(_key.Path)
+	}
 	if key.LastIndex(_key.Path) == "*" {
 		baseKey := baseKeyFromPath(_key.Path)
 		objsLocal, err := _key.Database.GetList(_key.Path)
@@ -213,12 +221,12 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 			if objLeader, exists := leaderEntries[objLocal.Index]; exists {
 				// Item exists on both sides - send if local is newer
 				if objLocal.Updated > objLeader.Updated {
-					sendToLeader(clientOpts, fullKey, objLocal, originator)
+					sendToLeader(clientOpts, fullKey, objLocal, originator, localVV)
 				}
 			} else {
 				// Item only exists locally - check if it's new or was deleted on leader
 				if leaderActivity == 0 || objLocal.Created > leaderActivity {
-					sendToLeader(clientOpts, fullKey, objLocal, originator)
+					sendToLeader(clientOpts, fullKey, objLocal, originator, localVV)
 				}
 			}
 		}
@@ -230,7 +238,7 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 				if isRecentDelete != nil && isRecentDelete(fullKey) {
 					continue
 				}
-				sendDeleteToLeader(clientOpts, fullKey, objLeader.Updated, originator)
+				sendDeleteToLeader(clientOpts, fullKey, objLeader.Updated, originator, localVV)
 			}
 		}
 
@@ -242,11 +250,11 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 		// Key doesn't exist locally - check if it exists on leader and delete it
 		leaderObj, leaderErr := getEntryFromLeader(clientOpts, _key.Path)
 		if leaderErr == nil {
-			sendDeleteToLeader(clientOpts, _key.Path, leaderObj.Updated, originator)
+			sendDeleteToLeader(clientOpts, _key.Path, leaderObj.Updated, originator, localVV)
 		}
 		return nil
 	}
-	sendToLeader(clientOpts, obj.Index, obj, originator)
+	sendToLeader(clientOpts, obj.Index, obj, originator, localVV)
 
 	return nil
 }
@@ -399,10 +407,14 @@ func (p *pullTracker) pulledSet(key string) bool {
 
 // pendingOp represents a queued per-key operation
 type pendingOp struct {
-	opType string      // "set" or "del"
-	key    string      // full key path
-	obj    meta.Object // for set operations
-	ts     int64       // timestamp for delete operations
+	opType string        // "set" or "del"
+	key    string        // full key path
+	obj    meta.Object   // for set operations
+	ts     int64         // timestamp for delete operations
+	vv     VersionVector // originator's VV at queue time — sent verbatim
+	// to leader so the receiver merges the VV that matched obj, not
+	// whatever the syncer's manager holds at drain time (which has
+	// advanced past this write).
 }
 
 // syncer coordinates synchronization operations for a server.
@@ -741,9 +753,9 @@ func (s *syncer) drainQueue() {
 	for _, op := range pending {
 		switch op.opType {
 		case "set":
-			sendToLeader(s.ClientOpts(), op.key, op.obj, addr)
+			sendToLeader(s.ClientOpts(), op.key, op.obj, addr, op.vv)
 		case "del":
-			sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, addr)
+			sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, addr, op.vv)
 		}
 	}
 }
@@ -758,14 +770,25 @@ func (s *syncer) processQueueLocked() {
 	s.drainQueue()
 }
 
+// snapshotVV returns the originator's current VV for the given key,
+// or nil if no VVManager is configured. Captured eagerly at
+// queue/send time so the value travels with the obj to the leader.
+func (s *syncer) snapshotVV(key string) VersionVector {
+	if s.vvManager == nil {
+		return nil
+	}
+	return s.vvManager.Get(key)
+}
+
 // QueueOrSendSet sends a set operation to leader, or queues it if Pull is in
 // progress or the syncer's nodeAddr hasn't been set yet (pre-OnStart startup
 // window). The queue is drained by the next Pull completion or by
 // SetNodeAddr, whichever comes first.
 func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
+	vv := s.snapshotVV(key)
 	s.queueMu.Lock()
 	if s.nodeAddr == "" {
-		s.queue = append(s.queue, pendingOp{opType: "set", key: key, obj: obj})
+		s.queue = append(s.queue, pendingOp{opType: "set", key: key, obj: obj, vv: vv})
 		s.queueMu.Unlock()
 		return
 	}
@@ -773,12 +796,12 @@ func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 	s.queueMu.Unlock()
 
 	if s.mu.TryLock() {
-		sendToLeader(s.ClientOpts(), key, obj, addr)
+		sendToLeader(s.ClientOpts(), key, obj, addr, vv)
 		s.mu.Unlock()
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
 		s.queueMu.Lock()
-		s.queue = append(s.queue, pendingOp{opType: "set", key: key, obj: obj})
+		s.queue = append(s.queue, pendingOp{opType: "set", key: key, obj: obj, vv: vv})
 		s.queueMu.Unlock()
 		// Wait for Pull to release the lock, then process queue under lock
 		s.mu.Lock()
@@ -791,9 +814,10 @@ func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 // is in progress or the syncer's nodeAddr hasn't been set yet (pre-OnStart
 // startup window).
 func (s *syncer) QueueOrSendDelete(key string, ts int64) {
+	vv := s.snapshotVV(key)
 	s.queueMu.Lock()
 	if s.nodeAddr == "" {
-		s.queue = append(s.queue, pendingOp{opType: "del", key: key, ts: ts})
+		s.queue = append(s.queue, pendingOp{opType: "del", key: key, ts: ts, vv: vv})
 		s.queueMu.Unlock()
 		return
 	}
@@ -801,12 +825,12 @@ func (s *syncer) QueueOrSendDelete(key string, ts int64) {
 	s.queueMu.Unlock()
 
 	if s.mu.TryLock() {
-		sendDeleteToLeader(s.ClientOpts(), key, ts, addr)
+		sendDeleteToLeader(s.ClientOpts(), key, ts, addr, vv)
 		s.mu.Unlock()
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
 		s.queueMu.Lock()
-		s.queue = append(s.queue, pendingOp{opType: "del", key: key, ts: ts})
+		s.queue = append(s.queue, pendingOp{opType: "del", key: key, ts: ts, vv: vv})
 		s.queueMu.Unlock()
 		// Wait for Pull to release the lock, then process queue under lock
 		s.mu.Lock()
