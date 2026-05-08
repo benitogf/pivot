@@ -290,7 +290,6 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 	// seed bumps path-scope "things" once (the callback increments at the
 	// matched key's base, not the storage event's full key), so after three
 	// seeds the path-scope leader counter must be 3.
-	_ = indices // kept for clarity in the loop above
 	require.Eventually(t, func() bool {
 		return vvm.Get("things")["leader"] >= 3
 	}, 2*time.Second, 5*time.Millisecond, "seed VV bumps never landed")
@@ -436,7 +435,7 @@ func TestDeleteVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	handler(w, req)
 
 	require.Equal(t, 500, w.Code)
-	vv := vvm.Get(itemKey)
+	vv := vvm.Get("things")
 	require.Equal(t, int64(0), vv["leader"],
 		"VV must not bump when the Delete tombstone write failed; got %d means VV is ahead of storage", vv["leader"])
 }

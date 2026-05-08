@@ -633,11 +633,13 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 		// Always read local activity. The LastEntry path is the
 		// authoritative signal for "pivot has data my LastEntry doesn't
 		// reflect" because pivot's LastEntry advances synchronously with
-		// the storage write — the VV bump runs in the async storage
-		// event callback and can briefly lag. Without this fallback, a
-		// read that lands in the lag window sees activityPivot.VV ==
-		// lastSyncedVV (no advance yet) and skips a needed pull, leaving
-		// stale data locally until the next storage event drains.
+		// the storage write. The VV bump for DIRECT writes (writes that
+		// don't go through pivot's Set/Delete handlers — e.g. ooo's
+		// standard route, custom AfterWrite hooks, internal mutations)
+		// runs in the async storage event callback and can briefly lag
+		// the storage write. Handler-driven writes are synchronous and
+		// don't have this gap, but we can't tell the two paths apart
+		// from here — so always check LastEntry as a fallback signal.
 		activityLocal, actErr := checkActivity(_key)
 
 		if len(activityPivot.VV) > 0 && hasLocalVV {

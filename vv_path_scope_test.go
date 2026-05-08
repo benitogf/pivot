@@ -15,10 +15,10 @@ package pivot
 // share state.
 
 import (
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benitogf/ooo/monotonic"
 	"github.com/benitogf/ooo/storage"
@@ -29,15 +29,28 @@ import (
 // TestActivityExposesVVAfterGlobWrite is the headline regression
 // test: a write under a glob path must show up in the VV that
 // /activity exposes for that path. Pre-fix this was always empty.
+//
+// The full production callback is wired here (not a no-op) so the
+// handler+callback Mark/Consume dedup is genuinely exercised — a
+// regression that re-introduced a callback double-bump would land
+// the path-scope leader counter at 2, not 1.
 func TestActivityExposesVVAfterGlobWrite(t *testing.T) {
 	monotonic.Init()
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
 
 	vvm := NewVVManager(db, "leader")
 	tracker := NewHandlerWriteTracker()
+
+	keys := []Key{{Path: "things/*", Database: db}}
+	instance := &Instance{VVManager: vvm}
+	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+		Keys:           keys,
+		GetNodes:       func() []string { return nil },
+		HandlerTracker: tracker,
+		Instance:       instance,
+	}))
 
 	// Wire a Set handler the way a glob-path key registers it: path=
 	// "things" (the registered base, with the /* stripped before
@@ -100,23 +113,34 @@ func TestCallbackIncrementsAtPathScope(t *testing.T) {
 	// goroutine — a small wait is enough.
 	require.Eventually(t, func() bool {
 		return vvm.Get("things/*")["leader"] >= 1
-	}, 1*1_000_000_000, 5*1_000_000,
+	}, time.Second, 5*time.Millisecond,
 		"storage callback must increment path-scope VV on direct writes")
 }
 
 // TestHandlerIncrementMatchesActivityScope pins the symmetry: every
 // handler-driven write produces a VV that Activity exposes 1:1. If a
-// future change re-introduces an item-scope increment, this test
-// regresses immediately.
+// future change re-introduces an item-scope increment, OR if the
+// callback dedup regresses and double-bumps, this test fails (3 writes
+// must produce exactly 3, not 6).
 func TestHandlerIncrementMatchesActivityScope(t *testing.T) {
 	monotonic.Init()
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
 
 	vvm := NewVVManager(db, "leader")
-	setHandler := Set(db, "things", NewHandlerWriteTracker(), vvm, nil)
+	tracker := NewHandlerWriteTracker()
+
+	keys := []Key{{Path: "things/*", Database: db}}
+	instance := &Instance{VVManager: vvm}
+	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+		Keys:           keys,
+		GetNodes:       func() []string { return nil },
+		HandlerTracker: tracker,
+		Instance:       instance,
+	}))
+
+	setHandler := Set(db, "things", tracker, vvm, nil)
 
 	for i, idx := range []string{"a", "b", "c"} {
 		body := strings.NewReader(`{"created":0,"updated":0,"index":"` + idx + `","path":"things/` + idx + `","data":"e30="}`)
@@ -128,12 +152,17 @@ func TestHandlerIncrementMatchesActivityScope(t *testing.T) {
 		require.Equal(t, 200, w.Code, "write %d failed", i)
 	}
 
+	// Wait for the watch goroutine to drain. Once tracker is empty, every
+	// handler Mark has been Consumed by the callback (callback skipped
+	// each).
+	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, time.Second, 5*time.Millisecond)
+
 	// Three writes under the same registered glob path → one VV with
 	// leader counter at 3. Pre-fix each write bumped a separate item-
 	// scope VV (things/a, things/b, things/c) — none of which /activity
-	// would have read.
+	// would have read. Asserting exactly 3 (not >=3) catches a regression
+	// that lets the callback also bump (would land 6).
 	exposedVV := vvm.Get("things/*")
 	require.Equal(t, int64(3), exposedVV["leader"],
-		"three writes under things/* must increment the path-scope VV by 3; got %v", exposedVV)
-	_ = http.StatusOK // keep import
+		"three writes under things/* must increment the path-scope VV by exactly 3; got %v", exposedVV)
 }
