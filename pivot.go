@@ -651,8 +651,8 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		}
 		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k, vvManager)).Methods("GET")
 		if baseKey != k.Path {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:"+key.PathPattern+"}", Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:"+key.PathPattern+"}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
 		} else {
 			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
 			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")

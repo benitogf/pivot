@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"github.com/benitogf/auth"
+	"github.com/benitogf/go-json"
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/client"
 	ooio "github.com/benitogf/ooo/io"
 	"github.com/benitogf/ooo/key"
 	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/pivot"
-	"github.com/benitogf/go-json"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/require"
 )
@@ -484,6 +484,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	var pivotThings, nodeThings []client.Meta[Thing]
 	var pivotSettings, nodeSettings []client.Meta[Settings]
 	var pivotItems, nodeItems []client.Meta[Item]
+	// Subscriptions for the special-character key sync cases. The
+	// multi-glob pattern items/cat-1/sub.v2/* lets us drive items whose
+	// path segments contain hyphens and dots while the leaf carries an
+	// underscore — exercises all three new key characters at once.
+	var pivotSpecialItems, nodeSpecialItems []client.Meta[Item]
 	var mu sync.Mutex
 
 	pivotServer, pivotWg := FakeServer(t, "")
@@ -522,7 +527,9 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 
 	ctx := t.Context()
-	wsWg.Add(6)
+	// 6 base subscriptions + 2 for the special-character item path = 8
+	// initial messages before any test write fires.
+	wsWg.Add(8)
 
 	// Subscribe to things, settings, and items on both servers
 	go client.SubscribeList(client.SubscribeConfig{
@@ -587,6 +594,31 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		nodeItems = data
+		mu.Unlock()
+		wsWg.Done()
+	}})
+	// Multi-glob subscription with special characters in the path
+	// segments — covers `-` in cat-1, `.` in sub.v2, and (via the leaf
+	// keys we write below) `_` in file_name.
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "items/cat-1/sub.v2/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
+		mu.Lock()
+		pivotSpecialItems = data
+		mu.Unlock()
+		wsWg.Done()
+	}})
+	go client.SubscribeList(client.SubscribeConfig{
+		Ctx:     ctx,
+		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Header:  authHeader,
+		Silence: true,
+	}, "items/cat-1/sub.v2/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
+		mu.Lock()
+		nodeSpecialItems = data
 		mu.Unlock()
 		wsWg.Done()
 	}})
@@ -894,6 +926,97 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	mu.Lock()
 	require.Equal(t, 0, len(pivotItems), "pivot should have 0 items after node delete")
 	require.Equal(t, 0, len(nodeItems), "node should have 0 items after node delete")
+	mu.Unlock()
+
+	// === Special-character key sync tests ===
+	// The ooo dependency (PR #73) widens key.IsValid to admit hyphens,
+	// dots, and underscores in middle positions. Pivot's index regex
+	// for the /_pivot/<base>/{index}/{time} routes is widened to match.
+	// Verify the new characters propagate end-to-end through pivot's
+	// HTTP set/delete routes AND through both the pattern-level
+	// subscription (things/*, which still receives writes to
+	// things/<special-char-id>) and a sub-glob subscription that has
+	// special characters in its own path segments
+	// (items/cat-1/sub.v2/*).
+
+	// findThing scans a things/* subscription's state for a specific id.
+	findThing := func(list []client.Meta[Thing], id string) bool {
+		for _, m := range list {
+			if m.Index == id {
+				return true
+			}
+		}
+		return false
+	}
+	// Each id covers one of the three new characters in turn.
+	specialIDs := []string{"hyphen-id", "underscore_id", "dot.id"}
+
+	// Cycle each special-id thing through the pivot direction: pivot
+	// writes, syncs to node via the trigger fanout (the pivot Set/Delete
+	// HTTP handler is the URL surface that PR #73 widened — but the
+	// pivot's local ooo.Set→callback fanout also matters because the
+	// triggered node pulls via /pivot/things which serves entries whose
+	// indexes now legally contain hyphens, dots, and underscores).
+	for _, id := range specialIDs {
+		wsWg.Add(2)
+		ops.setThing(t, true, id, Thing{IP: "10.1.1.1", Port: 0, On: true})
+		wsWg.Wait()
+		mu.Lock()
+		require.True(t, findThing(pivotThings, id), "pivot sub should see things/%s after pivot-side set", id)
+		require.True(t, findThing(nodeThings, id), "node sub should see things/%s after sync from pivot", id)
+		mu.Unlock()
+
+		wsWg.Add(2)
+		ops.deleteThing(t, true, id)
+		wsWg.Wait()
+		mu.Lock()
+		require.False(t, findThing(pivotThings, id), "pivot sub should NOT see things/%s after delete", id)
+		require.False(t, findThing(nodeThings, id), "node sub should NOT see things/%s after sync of delete", id)
+		mu.Unlock()
+	}
+
+	// Multi-glob with special characters in the path AND the leaf key.
+	// The subscription pattern itself contains `-` (cat-1) and `.` (sub.v2);
+	// the leaf key (file_name) carries `_`. All three new characters are
+	// exercised at once. Unlike things/* — which carries tombstone activity
+	// from earlier cycles — this path starts clean, so a node-direction
+	// write can be paired with the cross-server pivot write deterministically
+	// (Add(2) = one node WS + one pivot WS). That gives node→pivot URL
+	// coverage of the widened /pivot/<base>/{index} regex without racing
+	// against stale tombstone state.
+	specialItemKey := "items/cat-1/sub.v2/file_name"
+
+	// Pivot-side set: covers /pivot fanout → node pull on a special path.
+	wsWg.Add(2)
+	ops.setItem(t, true, specialItemKey, Item{Name: "special-1", Value: 100})
+	wsWg.Wait()
+	mu.Lock()
+	require.Equal(t, 1, len(pivotSpecialItems), "pivot's special-path sub should see the new item")
+	require.Equal(t, "special-1", pivotSpecialItems[0].Data.Name)
+	require.Equal(t, 1, len(nodeSpecialItems), "node's special-path sub should see the synced item")
+	require.Equal(t, "special-1", nodeSpecialItems[0].Data.Name)
+	mu.Unlock()
+
+	// Node-side update: exercises pivot's widened {index} regex via the
+	// node→leader POST URL /pivot/items/cat-1/sub.v2/file_name. The pivot
+	// Set handler accepts the path, writes locally, and the node sees the
+	// confirmation via its WS sub.
+	wsWg.Add(2)
+	ops.setItem(t, false, specialItemKey, Item{Name: "special-2", Value: 200})
+	wsWg.Wait()
+	mu.Lock()
+	require.Equal(t, "special-2", pivotSpecialItems[0].Data.Name, "pivot should see the node-side update")
+	require.Equal(t, "special-2", nodeSpecialItems[0].Data.Name)
+	mu.Unlock()
+
+	// Node-side delete: exercises the widened {index} regex on the DELETE
+	// route too (/pivot/<base>/{index}/{time}).
+	wsWg.Add(2)
+	ops.deleteItem(t, false, specialItemKey)
+	wsWg.Wait()
+	mu.Lock()
+	require.Equal(t, 0, len(pivotSpecialItems), "pivot's special-path sub should be empty after node-side delete")
+	require.Equal(t, 0, len(nodeSpecialItems), "node's special-path sub should be empty after node-side delete")
 	mu.Unlock()
 }
 
