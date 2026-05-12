@@ -110,6 +110,27 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 		if index == "" {
 			itemKey = path
 		}
+		// Idempotency guard via the originator's VV. A retried Trigger or
+		// a delayed coalescer drainer can deliver a write whose VV is
+		// dominated by what pivot already holds — without this skip, the
+		// stale write would clobber a newer locally-pivoted one. VV is
+		// the right signal because the codebase deliberately allows
+		// older-timestamped writes with higher counters
+		// (TestClockDriftScenario), so timestamp comparison can't be
+		// used. Skip on VVGreater (local strictly dominates) and VVEqual
+		// (exact retry of an already-applied write); proceed on VVLess
+		// and VVConcurrent (inbound has new info worth integrating).
+		// Missing/empty header = older peer, fall through (backward compat).
+		if vvManager != nil {
+			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
+				localVV := vvManager.Get(path)
+				cmp := localVV.Compare(peerVV)
+				if cmp == VVGreater || cmp == VVEqual {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+			}
+		}
 		// Mark before the storage write so the dedup signal is in place
 		// by the time the watch goroutine processes the event. The
 		// originator header is captured locally for the post-write fanout
@@ -179,6 +200,19 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 		} else {
 			// Glob pattern delete (e.g., "things/123")
 			itemKey = path + "/" + index
+		}
+		// Idempotency guard via the originator's VV — same shape as the
+		// Set handler. A retried or stale Delete whose VV is dominated
+		// must not remove a newer local write.
+		if vvManager != nil {
+			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
+				localVV := vvManager.Get(path)
+				cmp := localVV.Compare(peerVV)
+				if cmp == VVGreater || cmp == VVEqual {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+			}
 		}
 		originatorPeer := r.Header.Get(OriginatorHeader)
 		if handlerTracker != nil {
