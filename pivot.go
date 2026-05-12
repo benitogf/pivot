@@ -31,6 +31,12 @@ const (
 	RoutePrefix = "/_pivot"
 	// StoragePrefix is the key prefix for pivot metadata in storage
 	StoragePrefix = "pivot/"
+	// timePattern is the gorilla/mux regex matching the {time} route variable
+	// on Delete routes. Tombstone timestamps are monotonic-clock decimal strings
+	// (see ooo.Time), so the digit class covers production payloads; the
+	// letters and `*` are retained for forward compatibility with any
+	// non-numeric scheme a caller might pass on the wire.
+	timePattern = `[a-zA-Z\*\d\/]+`
 )
 
 // Config holds the configuration for cluster synchronization.
@@ -651,11 +657,11 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 		}
 		server.Router.HandleFunc(RoutePrefix+"/activity/"+baseKey, Activity(k, vvManager)).Methods("GET")
 		if baseKey != k.Path {
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}", Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:[a-zA-Z\\*\\d\\/]+}/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:"+key.PathPattern+"}", Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{index:"+key.PathPattern+"}/{time:"+timePattern+"}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
 		} else {
 			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey, Set(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("POST")
-			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:[a-zA-Z\\*\\d\\/]+}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
+			server.Router.HandleFunc(RoutePrefix+"/pivot/"+baseKey+"/{time:"+timePattern+"}", Delete(k.Database, baseKey, handlerTracker, vvManager, postWrite)).Methods("DELETE")
 		}
 		// Expose GET routes for all synced keys
 		if baseKey != k.Path {
