@@ -31,6 +31,18 @@ type SyncOptions struct {
 	// content actually diverges. Optional for backward compatibility:
 	// nil falls back to LastEntry-only logic.
 	VVManager *VVManager
+	// LeaderVV is the version vector for opts.Key.Path as reported by the
+	// leader's /activity endpoint. Passed down from the orchestrator so the
+	// inner per-item dedup in syncSetFromLeader can ask "does my local VV
+	// already cover this base key?" instead of relying on the timestamp
+	// gate (local.Updated >= obj.Updated). The timestamp gate is unsafe
+	// under clock skew: a peer-written future-Updated value beats every
+	// honest present-time write until wall-clock catches up. VV is
+	// clock-independent and authoritative when present.
+	//
+	// Empty when the leader doesn't expose VV (older peer): the inner gate
+	// falls back to the legacy timestamp comparison.
+	LeaderVV VersionVector
 }
 
 // baseKeyFromPath strips all trailing glob segments (/*) from a path.
@@ -146,11 +158,40 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 			return nil
 		}
 	}
-	// Check if local data exists and is up-to-date (skip write if timestamps match)
+	// Dedup: skip the write if local already has this revision (or is ahead).
+	//
+	// Prefer version-vector comparison when both sides have one — VV is
+	// clock-independent. The legacy timestamp comparison (local.Updated >=
+	// obj.Updated) is unsafe under clock skew: a peer that wrote with its
+	// wall clock set forward stores a future-Updated value that beats every
+	// honest present-time write until real time catches up. With VV, a
+	// clock-skewed peer's writes still carry the same VV they would carry
+	// with an honest clock, so the gate decides on causal order, not on
+	// raw timestamps.
+	//
+	// Fall back to timestamp comparison only when one side lacks a VV
+	// (older peer, or pre-SetNodeID startup window).
 	localObj, localErr := _key.Database.Get(_key.Path)
-	if localErr == nil && localObj.Updated >= obj.Updated {
-		// Local data is same or newer - no need to write
-		return nil
+	if localErr == nil {
+		if opts.VVManager != nil && len(opts.LeaderVV) > 0 {
+			baseKey := baseKeyFromPath(_key.Path)
+			localVV := opts.VVManager.Get(baseKey)
+			if len(localVV) > 0 {
+				switch localVV.Compare(opts.LeaderVV) {
+				case VVGreater, VVEqual:
+					// Local VV already covers the leader's VV — the write
+					// would be a no-op or a regression. Skip.
+					return nil
+				}
+				// VVLess or VVConcurrent — proceed with the write.
+			} else if localObj.Updated >= obj.Updated {
+				// Local has no VV yet (cold start); use the timestamp
+				// fallback for this single decision.
+				return nil
+			}
+		} else if localObj.Updated >= obj.Updated {
+			return nil
+		}
 	}
 	// Track BEFORE set so storage callback can skip this event
 	if onSet != nil {
@@ -300,6 +341,15 @@ func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error 
 	//
 	// Fall back to LastEntry comparison when either side has no VV
 	// (older peers, or the very first sync before any VV bump).
+	// Always propagate the leader's VV (when present) so the inner per-item
+	// gate in syncLocalEntriesWithTracking / syncSetFromLeader can do
+	// VV-aware dedup independently of whether the outer direction was
+	// chosen by VV or by LastEntry. Without this, a useVV=false outer
+	// decision would leave the inner gate falling back to the wall-clock
+	// timestamp comparison, which is unsafe under clock skew (a peer's
+	// future-Updated value beats every honest present-time write).
+	opts.LeaderVV = activityLeader.VV
+
 	useVV := len(activityLeader.VV) > 0 && len(activityLocal.VV) > 0
 	if useVV {
 		switch activityLocal.VV.Compare(activityLeader.VV) {
