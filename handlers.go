@@ -139,7 +139,7 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 		if handlerTracker != nil {
 			handlerTracker.Mark(itemKey)
 		}
-		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, decoded.Updated)
+		_, err = db.SetWithMeta(itemKey, decoded.Data, decoded.Created, clampFutureUpdated(itemKey, decoded.Updated))
 		if err != nil {
 			// Contract: a non-nil error from the storage layer means no
 			// event was fired (verified for Layered: every error path

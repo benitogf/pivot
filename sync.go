@@ -61,6 +61,14 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 		if err != nil {
 			return err
 		}
+		// Clamp future Updated values from peers BEFORE the diff so the
+		// comparison sees the values we'd actually write. Otherwise a
+		// peer-skewed future timestamp wins the diff, gets clamped on
+		// SetWithMeta, and the next pull loops on the same record because
+		// local.Updated (clamped) < peer.Updated (still future).
+		for i := range objsLeader {
+			objsLeader[i].Updated = clampFutureUpdated(objsLeader[i].Path, objsLeader[i].Updated)
+		}
 
 		objsLocal, err := _key.Database.GetList(_key.Path)
 		if err != nil {
@@ -118,6 +126,11 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 		_key.Database.Del(StoragePrefix + _key.Path)
 		return nil
 	}
+	// Clamp future Updated values from peers BEFORE the localObj.Updated >=
+	// obj.Updated gate below so the gate sees what we'd actually write.
+	// Otherwise a peer-skewed timestamp loses the diff on every pull and
+	// triggers a fresh clamped write forever.
+	obj.Updated = clampFutureUpdated(_key.Path, obj.Updated)
 	// Skip if this key was locally deleted and not yet synced
 	if skipSet != nil && skipSet(_key.Path) {
 		return nil
