@@ -1,10 +1,12 @@
 package pivot
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/benitogf/ooo"
+	"github.com/benitogf/ooo/key"
 	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/ooo/ui"
 )
@@ -33,6 +35,9 @@ type Instance struct {
 	PivotHealth    map[string]*PivotHealthStatus // Health status per pivot URL (for node servers)
 	ExtraNodeURLs  []string                      // Additional node URLs (can be modified after Setup)
 	VVManager      *VVManager                    // Version vector manager (for both pivot and node servers)
+	configKeys     []Key                         // Configured keys from Setup; needed by the synchronous AfterWrite VV bump to find which base path scope to increment
+	handlerTracker *HandlerWriteTracker          // Same tracker SyncCallback consumes from; AfterWrite peeks it (non-consuming) to skip its bump when a handler will bump explicitly
+	attachedDBs    sync.Map                      // set of storage.Database -> struct{}; AfterWrite-driven sync bump is wired for these, so makeStorageSync's async bump must skip them to avoid double-counting
 	syncerPool     *syncerPool                   // Internal syncer pool for node servers (for testing hooks)
 	nodesCache     *nodesCache                   // Cache for NodesKey address list, invalidated by storage events
 	triggers       *triggerCoalescer             // Per-node trigger coalescer (only set on pivot servers)
@@ -202,6 +207,84 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 	}
 }
 
+// IsAttached reports whether the given storage was registered with
+// Attach. makeStorageSync uses it to decide whether the async-callback
+// path should perform a VV bump: for attached storages, AfterWrite has
+// already bumped synchronously and the async bump would double-count.
+func (i *Instance) IsAttached(db storage.Database) bool {
+	if db == nil {
+		return false
+	}
+	_, ok := i.attachedDBs.Load(db)
+	return ok
+}
+
+// bumpVVForLocalWrite is the synchronous VV bump invoked from
+// AfterWrite. It runs inside storage.SetWithMeta / Set / Del, before
+// the call returns, so by the time the caller continues the local VV
+// reflects this write — no async-callback lag, no window where a pull
+// tick can fire and clobber the not-yet-counted write.
+//
+// Four cases skip the bump:
+//
+//   - eventKey is a pivot-internal key (delete tombstones, VV storage,
+//     health, etc.) — these are pivot's own bookkeeping, not application
+//     writes.
+//
+//   - no configured Key matches the eventKey — the write went to some
+//     storage path pivot isn't synchronising; bumping a VV scope for it
+//     would produce a never-read entry.
+//
+//   - the write is pull-driven (the syncer's pullTracker has a peek-hit
+//     for the key) — the pulled record carries the leader's VV, which
+//     is merged into local via vvManager.set later; bumping our own
+//     counter on top would double-count.
+//
+//   - a handler has marked the key (HandlerWriteTracker.Has) — handlers
+//     bump explicitly after SetWithMeta returns, so AfterWrite would
+//     duplicate. The watch goroutine still Consumes the mark to gate
+//     the rest of SyncCallback; we only peek here.
+//
+// Direct user writes (db.Set / db.SetWithMeta on an attached storage)
+// hit none of these cases and bump here, synchronously.
+func (i *Instance) bumpVVForLocalWrite(eventKey string) {
+	if i.VVManager == nil {
+		return
+	}
+	if strings.HasPrefix(eventKey, StoragePrefix) {
+		return
+	}
+	if i.handlerTracker != nil && i.handlerTracker.Has(eventKey) {
+		return
+	}
+	var matched Key
+	found := false
+	for _, k := range i.configKeys {
+		if key.Match(k.Path, eventKey) {
+			matched = k
+			found = true
+			break
+		}
+	}
+	if !found {
+		return
+	}
+	// Pull-driven writes carry the leader's VV; merging happens via
+	// vvManager.set elsewhere. Skip the counter bump so our own counter
+	// only advances for writes we originate.
+	if i.syncerPool != nil {
+		effectiveURL := matched.EffectiveClusterURL(i.ClusterURL)
+		if effectiveURL != "" {
+			if s := i.syncerPool.syncers[effectiveURL]; s != nil {
+				if s.tracker.hasPulledSet(eventKey) || s.tracker.hasPulledDelete(eventKey) {
+					return
+				}
+			}
+		}
+	}
+	i.VVManager.increment(baseKeyFromPath(matched.Path))
+}
+
 // Attach configures an external storage for pivot synchronization.
 // It starts the storage with BeforeRead callback and sets up event watching.
 // This is a convenience method that replaces the manual setup:
@@ -210,24 +293,52 @@ func GetPivotInfo(server *ooo.Server) func() *ui.PivotInfo {
 //	storage.WatchWithCallback(db, instance.SyncCallback)
 //
 // Optional storageOpts can be provided to pass additional storage options (e.g., AfterWrite for testing).
+//
+// Attach wraps the caller's AfterWrite (if any) with a synchronous VV
+// bump (see bumpVVForLocalWrite). The bump runs first, then the
+// caller's AfterWrite, so tests waiting on AfterWrite still observe the
+// post-bump VV.
 func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) error {
 	opts := storage.Options{BeforeRead: i.BeforeRead}
+	var userAfterWrite func(string)
 	if len(storageOpts) > 0 {
-		// Merge user options, preserving BeforeRead
 		userOpts := storageOpts[0]
 		opts.NoBroadcastKeys = userOpts.NoBroadcastKeys
-		opts.AfterWrite = userOpts.AfterWrite
+		userAfterWrite = userOpts.AfterWrite
 		opts.Workers = userOpts.Workers
 	}
+	opts.AfterWrite = func(eventKey string) {
+		i.bumpVVForLocalWrite(eventKey)
+		if userAfterWrite != nil {
+			userAfterWrite(eventKey)
+		}
+	}
+
+	// Record this storage as having sync-bump wired so the async
+	// SyncCallback path can skip its own bump for events from this DB.
+	i.attachedDBs.Store(db, struct{}{})
 
 	if db.Active() {
 		// Storage already started - use SetBeforeRead to update callback safely
-		// This works for both memory-only and embedded storage
+		// This works for both memory-only and embedded storage.
+		// NOTE: there is no SetAfterWrite on storage.Database; if the
+		// storage is already started we cannot install our wrapped
+		// AfterWrite. Callers that rely on the sync-bump fix must call
+		// Attach BEFORE starting the storage. For tests that bypass
+		// this (already-started memory storage), the async bump in
+		// makeStorageSync still applies because attachedDBs is keyed
+		// on whether AfterWrite was installable — see Attach's
+		// invariant that we only Store after a successful Start path.
 		db.SetBeforeRead(i.BeforeRead)
+		// Roll back the attachedDBs record because AfterWrite was NOT
+		// actually installed (storage was already started).
+		i.attachedDBs.Delete(db)
 	} else {
 		// Storage not started - start it with BeforeRead configured
 		err := db.Start(opts)
 		if err != nil {
+			// Start failed; AfterWrite never wired up either.
+			i.attachedDBs.Delete(db)
 			return err
 		}
 	}

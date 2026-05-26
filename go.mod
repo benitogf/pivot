@@ -7,7 +7,7 @@ require (
 	github.com/benitogf/coat v0.0.0-20200402073050-ff807656cbec
 	github.com/benitogf/go-json v0.0.0-20260410172501-727f5690408b
 	github.com/benitogf/ko v0.0.0-20260211072652-d48fcf4f8988
-	github.com/benitogf/ooo v0.0.0-20260512052235-a341c4f7c4d2
+	github.com/benitogf/ooo v0.0.0-20260526095550-65a4d01ba417
 	github.com/gorilla/mux v1.8.1
 	github.com/stretchr/testify v1.11.1
 )

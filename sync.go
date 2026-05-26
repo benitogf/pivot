@@ -31,6 +31,14 @@ type SyncOptions struct {
 	// content actually diverges. Optional for backward compatibility:
 	// nil falls back to LastEntry-only logic.
 	VVManager *VVManager
+	// LeaderVV is the leader's VersionVector for opts.Key as reported by
+	// the leader's /activity endpoint, propagated from the caller so the
+	// inner per-item dedup in syncLocalEntriesWithTracking can ask
+	// "does my local VV already cover this base key?" instead of falling
+	// back to the wall-clock timestamp gate. Empty when the leader does
+	// not expose a VV (older peer); the inner gate then uses the
+	// timestamp fallback as the legacy code did.
+	LeaderVV VersionVector
 }
 
 // baseKeyFromPath strips all trailing glob segments (/*) from a path.
@@ -133,11 +141,42 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 			return nil
 		}
 	}
-	// Check if local data exists and is up-to-date (skip write if timestamps match)
+	// Dedup gate: skip the write if local already covers this revision.
+	//
+	// When both sides expose a VersionVector, compare on causal order:
+	// VVGreater or VVEqual means local already has at least everything
+	// the leader served, so the write would be a no-op or a regression.
+	// VVLess and VVConcurrent fall through to the write — VVLess because
+	// the leader genuinely has new state; VVConcurrent because the
+	// outer orchestrator already chose "pull leader" under the last-
+	// sync-wins policy and the inner gate must not silently override
+	// that.
+	//
+	// Without a VV (older peer, or pre-VV-bump startup window), fall
+	// back to the legacy timestamp comparison. Note: this fallback is
+	// unsafe under clock skew — a leader-served future-Updated record
+	// will beat any honest present-time local write. The caller
+	// (pullKeyWithCacheUpdate, synchronizeItemWithTracking) is
+	// responsible for not invoking this path when timestamps cannot be
+	// trusted; both now derive direction from VV exclusively when both
+	// sides have one.
 	localObj, localErr := _key.Database.Get(_key.Path)
-	if localErr == nil && localObj.Updated >= obj.Updated {
-		// Local data is same or newer - no need to write
-		return nil
+	if localErr == nil {
+		if opts.VVManager != nil && len(opts.LeaderVV) > 0 {
+			localVV := opts.VVManager.Get(baseKeyFromPath(_key.Path))
+			if len(localVV) > 0 {
+				switch localVV.Compare(opts.LeaderVV) {
+				case VVGreater, VVEqual:
+					return nil
+				}
+			} else if localObj.Updated >= obj.Updated {
+				// Local has no VV yet (cold start); use the
+				// timestamp fallback for this single decision.
+				return nil
+			}
+		} else if localObj.Updated >= obj.Updated {
+			return nil
+		}
 	}
 	// Track BEFORE set so storage callback can skip this event
 	if onSet != nil {
@@ -221,12 +260,16 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 			if objLeader, exists := leaderEntries[objLocal.Index]; exists {
 				// Item exists on both sides - send if local is newer
 				if objLocal.Updated > objLeader.Updated {
-					sendToLeader(clientOpts, fullKey, objLocal, originator, localVV)
+					if rVV, err := sendToLeader(clientOpts, fullKey, objLocal, originator, localVV); err == nil {
+						mergeLeaderVV(opts.VVManager, baseKey, rVV)
+					}
 				}
 			} else {
 				// Item only exists locally - check if it's new or was deleted on leader
 				if leaderActivity == 0 || objLocal.Created > leaderActivity {
-					sendToLeader(clientOpts, fullKey, objLocal, originator, localVV)
+					if rVV, err := sendToLeader(clientOpts, fullKey, objLocal, originator, localVV); err == nil {
+						mergeLeaderVV(opts.VVManager, baseKey, rVV)
+					}
 				}
 			}
 		}
@@ -238,7 +281,9 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 				if isRecentDelete != nil && isRecentDelete(fullKey) {
 					continue
 				}
-				sendDeleteToLeader(clientOpts, fullKey, objLeader.Updated, originator, localVV)
+				if rVV, err := sendDeleteToLeader(clientOpts, fullKey, objLeader.Updated, originator, localVV); err == nil {
+					mergeLeaderVV(opts.VVManager, baseKey, rVV)
+				}
 			}
 		}
 
@@ -250,13 +295,35 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 		// Key doesn't exist locally - check if it exists on leader and delete it
 		leaderObj, leaderErr := getEntryFromLeader(clientOpts, _key.Path)
 		if leaderErr == nil {
-			sendDeleteToLeader(clientOpts, _key.Path, leaderObj.Updated, originator, localVV)
+			if rVV, err := sendDeleteToLeader(clientOpts, _key.Path, leaderObj.Updated, originator, localVV); err == nil {
+				mergeLeaderVV(opts.VVManager, baseKeyFromPath(_key.Path), rVV)
+			}
 		}
 		return nil
 	}
-	sendToLeader(clientOpts, obj.Index, obj, originator, localVV)
+	if rVV, err := sendToLeader(clientOpts, obj.Index, obj, originator, localVV); err == nil {
+		mergeLeaderVV(opts.VVManager, baseKeyFromPath(_key.Path), rVV)
+	}
 
 	return nil
+}
+
+// mergeLeaderVV is the symmetric merge for the push path: pivot
+// echoes its post-write VV back via the VVHeader on each push
+// response; the sender merges it so its VVManager reflects pivot's
+// frontier. Without this the sender's VV stays narrow ({self:N}) and
+// the next pull tick compares against pivot's wider VV
+// ({leader:M, self:N-1, ...}), seeing VVConcurrent on every push and
+// triggering reconciliation pulls that delete the just-pushed items
+// when pivot hasn't received them yet.
+//
+// No-op for older peers that don't echo VV (leaderVV is empty) and
+// for senders without a VVManager configured.
+func mergeLeaderVV(vvManager *VVManager, baseKey string, leaderVV VersionVector) {
+	if vvManager == nil || len(leaderVV) == 0 {
+		return
+	}
+	vvManager.set(baseKey, leaderVV)
 }
 
 func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error {
@@ -287,6 +354,17 @@ func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error 
 	//
 	// Fall back to LastEntry comparison when either side has no VV
 	// (older peers, or the very first sync before any VV bump).
+	//
+	// Always propagate the leader's VV (when present) so the inner
+	// per-item gate in syncLocalEntriesWithTracking can do VV-aware
+	// dedup independently of whether the outer direction was chosen
+	// via VV or via LastEntry. Without this a useVV=false outer
+	// decision would leave the inner gate falling back to the
+	// wall-clock timestamp comparison, which is unsafe under clock
+	// skew (a peer's future-Updated record would beat any honest
+	// present-time local write).
+	opts.LeaderVV = activityLeader.VV
+
 	useVV := len(activityLeader.VV) > 0 && len(activityLocal.VV) > 0
 	if useVV {
 		switch activityLocal.VV.Compare(activityLeader.VV) {
@@ -403,6 +481,25 @@ func (p *pullTracker) pulledSet(key string) bool {
 		return true
 	}
 	return false
+}
+
+// hasPulledSet is a non-consuming variant of pulledSet, used by the
+// synchronous VV-bump path in AfterWrite. The watch goroutine still
+// consumes the flag via pulledSet to gate fanout; AfterWrite only needs
+// to know "is this storage write coming from a pull operation?" so it
+// can skip our own counter bump (the pulled record carries the leader's
+// VV, not ours).
+func (p *pullTracker) hasPulledSet(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.set[key]
+}
+
+// hasPulledDelete mirrors hasPulledSet for delete operations.
+func (p *pullTracker) hasPulledDelete(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deleted[key]
 }
 
 // pendingOp represents a queued per-key operation
@@ -623,9 +720,39 @@ func (s *syncer) TryPullKey(keyPath string) error {
 	return err
 }
 
-// pullKeyWithCacheUpdate syncs from pivot and updates the VV/activity cache.
-// Uses version vector comparison when pivot supports it (VV is non-nil).
-// Falls back to timestamp-based comparison for backward compatibility.
+// pullKeyWithCacheUpdate syncs from pivot when pivot has writes the
+// local node hasn't seen. Direction is decided by VersionVector when
+// both sides expose one; LastEntry is used only when at least one side
+// lacks a VV (older peers, very first sync before a VV bump). This is
+// the periodic / TriggerNodeSync-driven pull path.
+//
+// Three properties matter for correctness:
+//
+//  1. The local-VV input must be the syncer's authoritative view, not
+//     just whatever pivot reported last time. We read it from
+//     s.vvManager (the same vvManager that AfterWrite bumps
+//     synchronously on a local write). The previous code compared
+//     pivot's current VV to a CACHE of pivot's previous VV, which
+//     answered "did pivot change?" — not "is local behind pivot?".
+//
+//  2. LastEntry is NOT a direction overrider. Treating
+//     activityPivot.LastEntry > activityLocal.LastEntry as "pivot has
+//     newer data" re-introduces the wall-clock dependency VV was
+//     supposed to remove: a peer with a forward-skewed clock can plant
+//     a future-LastEntry record that beats every honest present-time
+//     write here. LastEntry stays as a fallback for the no-VV case
+//     and as a tiebreaker between VVEqual peers (which technically
+//     should not need syncing, but the test harness can synthesise
+//     states where it does).
+//
+//  3. After a successful pull, pivot's VV is merged into local so the
+//     receiver actually advances its causal frontier — a pull that
+//     only updates storage without merging VV leaves vvManager.Get
+//     returning the pre-pull state forever and every subsequent local
+//     write looks VVConcurrent with pivot. handlers.Set already merges
+//     on the push receive side; this is the symmetric merge for the
+//     pull receive side.
+//
 // Caller must hold s.mu lock.
 func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 	update := false
@@ -636,26 +763,19 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 			continue
 		}
 
-		// Determine if sync is needed using version vector or timestamp
-		needSync := false
-		s.vvMu.RLock()
-		localVV, hasLocalVV := s.lastSyncedVV[baseKey]
-		s.vvMu.RUnlock()
+		// Local VV from the authoritative source: vvManager. (1) above.
+		var localVV VersionVector
+		if s.vvManager != nil {
+			localVV = s.vvManager.Get(baseKey)
+		}
 
-		// Always read local activity. The LastEntry path is the
-		// authoritative signal for "pivot has data my LastEntry doesn't
-		// reflect" because pivot's LastEntry advances synchronously with
-		// the storage write. The VV bump for DIRECT writes (writes that
-		// don't go through pivot's Set/Delete handlers — e.g. ooo's
-		// standard route, custom AfterWrite hooks, internal mutations)
-		// runs in the async storage event callback and can briefly lag
-		// the storage write. Handler-driven writes are synchronous and
-		// don't have this gap, but we can't tell the two paths apart
-		// from here — so always check LastEntry as a fallback signal.
+		// Local activity (LastEntry) is read for the no-VV fallback only.
 		activityLocal, actErr := checkActivity(_key)
 
-		if len(activityPivot.VV) > 0 && hasLocalVV {
-			// Version vector comparison (preferred, clock-independent)
+		needSync := false
+		usedVV := false
+		if len(activityPivot.VV) > 0 && len(localVV) > 0 {
+			usedVV = true
 			switch localVV.Compare(activityPivot.VV) {
 			case VVLess:
 				needSync = true
@@ -664,14 +784,15 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 				needSync = true
 			}
 		}
-
-		// LastEntry secondary signal — independent of the VV branch above.
-		// Catches the VV-lag case described at the top of this loop.
-		if actErr == nil && activityPivot.LastEntry > activityLocal.LastEntry {
+		if !usedVV && actErr == nil && activityPivot.LastEntry > activityLocal.LastEntry {
+			// No-VV fallback only. (2) above keeps this gated to the
+			// case where VV-based comparison was not possible.
 			needSync = true
 		}
 
-		// Update caches with pivot's current values
+		// Refresh the lastSyncedVV / lastSyncedActivity caches regardless
+		// of the sync decision. Other code (e.g. checkPivotActivity
+		// short-circuits) reads these.
 		if len(activityPivot.VV) > 0 {
 			s.vvMu.Lock()
 			s.lastSyncedVV[baseKey] = activityPivot.VV.Clone()
@@ -681,16 +802,22 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 		s.lastSyncedActivity[baseKey] = activityPivot.LastEntry
 		s.activityMu.Unlock()
 
-		// Sync if leader has newer data
 		if needSync {
 			opts := SyncOptions{
 				Key:       _key,
 				LastEntry: activityPivot.LastEntry,
 				OnDelete:  s.tracker.trackDelete,
 				OnSet:     s.tracker.trackSet,
+				VVManager: s.vvManager,
+				LeaderVV:  activityPivot.VV,
 			}
 			if err := syncLocalEntriesWithTracking(s.ClientOpts(), opts); err == nil {
 				update = true
+				// (3) merge pivot's VV into local so the receiver's
+				// vvManager reflects what it just absorbed.
+				if s.vvManager != nil && len(activityPivot.VV) > 0 {
+					s.vvManager.set(baseKey, activityPivot.VV)
+				}
 			}
 		}
 	}
@@ -753,9 +880,30 @@ func (s *syncer) drainQueue() {
 	for _, op := range pending {
 		switch op.opType {
 		case "set":
-			sendToLeader(s.ClientOpts(), op.key, op.obj, addr, op.vv)
+			if rVV, err := sendToLeader(s.ClientOpts(), op.key, op.obj, addr, op.vv); err == nil {
+				s.mergeLeaderVVForItemKey(op.key, rVV)
+			}
 		case "del":
-			sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, addr, op.vv)
+			if rVV, err := sendDeleteToLeader(s.ClientOpts(), op.key, op.ts, addr, op.vv); err == nil {
+				s.mergeLeaderVVForItemKey(op.key, rVV)
+			}
+		}
+	}
+}
+
+// mergeLeaderVVForItemKey is the syncer-side helper that finds the
+// registered Key.Path matching itemKey, derives its base scope, and
+// merges leaderVV into the local VVManager at that scope. Used by
+// every push call site to keep local's VVManager in step with pivot's
+// post-write VV (see mergeLeaderVV for the rationale).
+func (s *syncer) mergeLeaderVVForItemKey(itemKey string, leaderVV VersionVector) {
+	if s.vvManager == nil || len(leaderVV) == 0 {
+		return
+	}
+	for _, k := range s.keys {
+		if key.Match(k.Path, itemKey) {
+			s.vvManager.set(baseKeyFromPath(k.Path), leaderVV)
+			return
 		}
 	}
 }
@@ -807,7 +955,9 @@ func (s *syncer) QueueOrSendSet(key string, obj meta.Object) {
 	s.queueMu.Unlock()
 
 	if s.mu.TryLock() {
-		sendToLeader(s.ClientOpts(), key, obj, addr, vv)
+		if rVV, err := sendToLeader(s.ClientOpts(), key, obj, addr, vv); err == nil {
+			s.mergeLeaderVVForItemKey(key, rVV)
+		}
 		s.mu.Unlock()
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
@@ -836,7 +986,9 @@ func (s *syncer) QueueOrSendDelete(key string, ts int64) {
 	s.queueMu.Unlock()
 
 	if s.mu.TryLock() {
-		sendDeleteToLeader(s.ClientOpts(), key, ts, addr, vv)
+		if rVV, err := sendDeleteToLeader(s.ClientOpts(), key, ts, addr, vv); err == nil {
+			s.mergeLeaderVVForItemKey(key, rVV)
+		}
 		s.mu.Unlock()
 	} else {
 		// Pull in progress - queue for later and wait for Pull to complete then process
@@ -948,6 +1100,17 @@ func (t *HandlerWriteTracker) Consume(key string) bool {
 		delete(t.pending, key)
 	}
 	return true
+}
+
+// Has reports whether a mark is currently outstanding for the key,
+// without consuming it. Used by AfterWrite's synchronous VV bump to
+// skip its bump when a handler will explicitly bump after SetWithMeta
+// returns. The watch goroutine still Consumes the mark to gate the
+// rest of the SyncCallback processing.
+func (t *HandlerWriteTracker) Has(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.pending[key] > 0
 }
 
 // applyPivotFanout triggers a sync on every healthy peer node except the
@@ -1081,7 +1244,16 @@ func makeStorageSync(cfg StorageSyncConfig) StorageSyncCallback {
 		if cfg.HandlerTracker != nil && cfg.HandlerTracker.Consume(event.Key) {
 			return
 		}
-		if cfg.Instance != nil && cfg.Instance.VVManager != nil {
+		// VV bump: synchronous AfterWrite on attached storages handles
+		// the bump before the write returns (see Instance.Attach /
+		// Instance.bumpVVForLocalWrite), so the async bump here would
+		// double-count for those events. Storages that were not
+		// installed through Attach — most commonly server.Storage,
+		// which ooo.Server.Start brings up without our AfterWrite
+		// wrapper — still need the bump from this callback because
+		// there is no synchronous bump path for them.
+		if cfg.Instance != nil && cfg.Instance.VVManager != nil &&
+			!cfg.Instance.IsAttached(matchedDB) {
 			// Increment at PATH scope — matchedKey is already
 			// baseKeyFromPath(matchedKeyConfig.Path), the same scope
 			// /activity exposes. Bumping at event.Key (item scope)

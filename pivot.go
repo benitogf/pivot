@@ -422,11 +422,21 @@ func readURLFingerprint(db storage.Database, storageKey string) string {
 }
 
 // wipeStorage deletes all entries matching the given path pattern
-// and also deletes the associated activity metadata
+// and also deletes the associated activity and version-vector metadata.
+// VV metadata at VVKeyPrefix+baseKey carries the previous pivot's
+// frontier; leaving it intact after a pivot URL change would make the
+// post-wipe local VV look VVGreater than the new pivot's empty/fresh
+// VV (because every leader counter the old pivot bumped is still in
+// local), and the first pull tick would short-circuit instead of
+// repopulating local from the new pivot.
 func wipeStorage(db storage.Database, path string) {
 	baseKey := baseKeyFromPath(path)
 	// Delete activity metadata
 	db.Del(StoragePrefix + baseKey)
+	// Delete VV state (was implicit prior to the sync-VV-bump change;
+	// becomes load-bearing once pullKeyWithCacheUpdate reads vvManager
+	// directly instead of an in-memory lastSyncedVV cache).
+	db.Del(VVKeyPrefix + baseKey)
 
 	// For wildcard paths, get all entries and delete individually
 	if key.LastIndex(path) == "*" {
@@ -593,6 +603,12 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// handlers Mark before each storage write so the async storage event
 	// callback knows to skip its own bump+fanout for handler-driven events.
 	handlerTracker := NewHandlerWriteTracker()
+	// AfterWrite (sync-bump path) needs to peek the same tracker so it
+	// skips its bump when a handler will bump explicitly post-SetWithMeta.
+	instance.handlerTracker = handlerTracker
+	// AfterWrite also matches eventKey against the configured Keys to find
+	// the base path scope to increment.
+	instance.configKeys = keys
 
 	// Per-node trigger coalescer — replaces the goroutine-per-event-per-node
 	// fan-out from the broadcast loop. Only pivot servers broadcast, so we
@@ -697,6 +713,22 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 
 	// Assign BeforeRead to server
 	server.BeforeRead = beforeRead
+
+	// Assign AfterWrite to server so writes to server.Storage get the
+	// synchronous VV bump on the writer's goroutine, closing the
+	// VV-lag race where /activity could return a pre-bump VV between
+	// a write committing and the watch goroutine processing the event.
+	// instance.bumpVVForLocalWrite handles internal-prefix skip,
+	// configured-key matching, pull-driven skip via the pullTracker
+	// peek, and handler-write skip via the HandlerWriteTracker peek.
+	server.AfterWrite = instance.bumpVVForLocalWrite
+	// Record server.Storage as sync-bump-installed so makeStorageSync's
+	// async-path bump skips events from it (the AfterWrite above already
+	// bumped). Mirrors the Store inside Instance.Attach for external
+	// storages.
+	if server.Storage != nil {
+		instance.attachedDBs.Store(server.Storage, struct{}{})
+	}
 
 	// Complete instance setup and store for GetInstance lookup
 	instance.BeforeRead = beforeRead
