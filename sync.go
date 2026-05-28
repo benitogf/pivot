@@ -158,15 +158,30 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 	if skipSet != nil && skipSet(_key.Path) {
 		return nil
 	}
+	shouldApplyDeleteTimestampGate := true
+	if opts.VVManager != nil && len(opts.LeaderVV) > 0 {
+		localVV := opts.VVManager.Get(baseKeyFromPath(_key.Path))
+		if len(localVV) > 0 {
+			switch localVV.Compare(opts.LeaderVV) {
+			case VVLess, VVConcurrent:
+				// VV already says local does not dominate leader for this
+				// key, so don't let wall-clock tombstone timestamps block
+				// reconciliation under skew.
+				shouldApplyDeleteTimestampGate = false
+			}
+		}
+	}
 	// Re-check: if a local delete happened while we were fetching from pivot, skip the set
 	// This prevents a racing delete from being overwritten by stale pivot data
-	localDeleteTs, delErr := _key.Database.Get(StoragePrefix + _key.Path)
-	if delErr == nil && len(localDeleteTs.Data) > 0 {
-		// Local delete timestamp exists - check if it's newer than pivot data
-		deleteTime, _ := strconv.ParseInt(string(localDeleteTs.Data), 10, 64)
-		if deleteTime > obj.Created {
-			// Local delete is newer than pivot data - skip the set
-			return nil
+	if shouldApplyDeleteTimestampGate {
+		localDeleteTs, delErr := _key.Database.Get(StoragePrefix + _key.Path)
+		if delErr == nil && len(localDeleteTs.Data) > 0 {
+			// Local delete timestamp exists - check if it's newer than pivot data
+			deleteTime, _ := strconv.ParseInt(string(localDeleteTs.Data), 10, 64)
+			if deleteTime > obj.Created {
+				// Local delete is newer than pivot data - skip the set
+				return nil
+			}
 		}
 	}
 	// Dedup gate: skip the write if local already covers this revision.
