@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -50,6 +51,27 @@ func baseKeyFromPath(path string) string {
 	return path
 }
 
+// syncObjectsDiffer reports whether two objects for the same item index
+// differ in payload or metadata relevant to reconciliation.
+func syncObjectsDiffer(a, b meta.Object) bool {
+	return a.Created != b.Created || a.Updated != b.Updated || !bytes.Equal(a.Data, b.Data)
+}
+
+func getEntriesAuthoritativeDiff(objsDst, objsSrc []meta.Object) []meta.Object {
+	dstEntries := make(map[string]meta.Object, len(objsDst))
+	for _, obj := range objsDst {
+		dstEntries[obj.Index] = obj
+	}
+
+	var result []meta.Object
+	for _, objSrc := range objsSrc {
+		if objDst, found := dstEntries[objSrc.Index]; !found || syncObjectsDiffer(objDst, objSrc) {
+			result = append(result, objSrc)
+		}
+	}
+	return result
+}
+
 // syncLocalEntriesWithTracking syncs from leader and tracks synced keys via callbacks.
 // onDelete is called for each key deleted locally (item exists locally but not on leader)
 // onSet is called for each key set locally (item exists on leader but not locally, or leader is newer)
@@ -91,7 +113,13 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 			_key.Database.Del(fullKey)
 		}
 
+		useAuthoritativeDiff := opts.VVManager != nil && len(opts.LeaderVV) > 0
 		objsToSend := GetEntriesPositiveDiff(objsLocal, objsLeader)
+		if useAuthoritativeDiff {
+			// When VV already chose pull direction, leader is authoritative
+			// for this round; don't re-introduce timestamp trust here.
+			objsToSend = getEntriesAuthoritativeDiff(objsLocal, objsLeader)
+		}
 		for _, obj := range objsToSend {
 			fullKey := obj.Path
 			// Skip if this key was locally deleted and not yet synced
@@ -210,6 +238,7 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 	if opts.VVManager != nil {
 		localVV = opts.VVManager.Get(_key.Path)
 	}
+	authoritativeLocal := len(localVV) > 0 && len(opts.LeaderVV) > 0 && localVV.Compare(opts.LeaderVV) == VVGreater
 	if key.LastIndex(_key.Path) == "*" {
 		baseKey := baseKeyFromPath(_key.Path)
 		objsLocal, err := _key.Database.GetList(_key.Path)
@@ -258,15 +287,16 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 			}
 
 			if objLeader, exists := leaderEntries[objLocal.Index]; exists {
-				// Item exists on both sides - send if local is newer
-				if objLocal.Updated > objLeader.Updated {
+				// Under VVGreater, local is authoritative this round even
+				// if wall-clock timestamps disagree due to skew.
+				if (authoritativeLocal && syncObjectsDiffer(objLocal, objLeader)) || (!authoritativeLocal && objLocal.Updated > objLeader.Updated) {
 					if rVV, err := sendToLeader(clientOpts, fullKey, objLocal, originator, localVV); err == nil {
 						mergeLeaderVV(opts.VVManager, baseKey, rVV)
 					}
 				}
 			} else {
-				// Item only exists locally - check if it's new or was deleted on leader
-				if leaderActivity == 0 || objLocal.Created > leaderActivity {
+				// Item only exists locally.
+				if authoritativeLocal || leaderActivity == 0 || objLocal.Created > leaderActivity {
 					if rVV, err := sendToLeader(clientOpts, fullKey, objLocal, originator, localVV); err == nil {
 						mergeLeaderVV(opts.VVManager, baseKey, rVV)
 					}

@@ -25,18 +25,20 @@ func GetEntriesNegativeDiff(objsDst, objsSrc []meta.Object) []string {
 // GetEntriesPositiveDiff returns entries in objsSrc that are new or updated compared to objsDst.
 // O(n) using map lookup instead of O(n²) nested loops.
 func GetEntriesPositiveDiff(objsDst, objsSrc []meta.Object) []meta.Object {
-	// Build map of destination entries for O(1) lookup
-	dstEntries := make(map[string]meta.Object, len(objsDst))
+	// Build map of destination updated timestamps for O(1) lookup.
+	// We only need Updated for the comparison, so avoid copying full
+	// meta.Object values (which include RawMessage payloads).
+	dstUpdated := make(map[string]int64, len(objsDst))
 	for _, obj := range objsDst {
-		dstEntries[obj.Index] = obj
+		dstUpdated[obj.Index] = obj.Updated
 	}
 
 	var result []meta.Object
 	for _, objSrc := range objsSrc {
-		if objDst, found := dstEntries[objSrc.Index]; !found {
+		if updatedDst, found := dstUpdated[objSrc.Index]; !found {
 			// New entry - not in destination
 			result = append(result, objSrc)
-		} else if objSrc.Updated > objDst.Updated {
+		} else if objSrc.Updated > updatedDst {
 			// Updated entry - source is newer
 			result = append(result, objSrc)
 		}
