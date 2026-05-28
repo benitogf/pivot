@@ -327,8 +327,10 @@ func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) e
 		// Attach BEFORE starting the storage. For tests that bypass
 		// this (already-started memory storage), the async bump in
 		// makeStorageSync still applies because attachedDBs is keyed
-		// on whether AfterWrite was installable — see Attach's
-		// invariant that we only Store after a successful Start path.
+		// on whether AfterWrite was installable — we optimistically
+		// Store before checking Active(), then Delete immediately in
+		// this already-started branch because wrapped AfterWrite was
+		// not installable.
 		db.SetBeforeRead(i.BeforeRead)
 		// Roll back the attachedDBs record because AfterWrite was NOT
 		// actually installed (storage was already started).

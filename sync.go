@@ -740,10 +740,8 @@ func (s *syncer) TryPullKey(keyPath string) error {
 //     newer data" re-introduces the wall-clock dependency VV was
 //     supposed to remove: a peer with a forward-skewed clock can plant
 //     a future-LastEntry record that beats every honest present-time
-//     write here. LastEntry stays as a fallback for the no-VV case
-//     and as a tiebreaker between VVEqual peers (which technically
-//     should not need syncing, but the test harness can synthesise
-//     states where it does).
+//     write here. LastEntry stays only as a fallback for the no-VV
+//     case.
 //
 //  3. After a successful pull, pivot's VV is merged into local so the
 //     receiver actually advances its causal frontier — a pull that
