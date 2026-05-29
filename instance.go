@@ -254,7 +254,7 @@ func (i *Instance) bumpVVForLocalWrite(eventKey string) {
 	if strings.HasPrefix(eventKey, StoragePrefix) {
 		return
 	}
-	if i.handlerTracker != nil && i.handlerTracker.Has(eventKey) {
+	if i.handlerTracker != nil && i.handlerTracker.ConsumeBumpSkip(eventKey) {
 		return
 	}
 	var matched Key
@@ -271,12 +271,14 @@ func (i *Instance) bumpVVForLocalWrite(eventKey string) {
 	}
 	// Pull-driven writes carry the leader's VV; merging happens via
 	// vvManager.set elsewhere. Skip the counter bump so our own counter
-	// only advances for writes we originate.
+	// only advances for writes we originate. Consuming consume (not a
+	// peek) — see the pullTracker doc on why each consumer drains its
+	// own mark.
 	if i.syncerPool != nil {
 		effectiveURL := matched.EffectiveClusterURL(i.ClusterURL)
 		if effectiveURL != "" {
 			if s := i.syncerPool.syncers[effectiveURL]; s != nil {
-				if s.tracker.hasPulledSet(eventKey) || s.tracker.hasPulledDelete(eventKey) {
+				if s.tracker.consumeBumpSkipSet(eventKey) || s.tracker.consumeBumpSkipDelete(eventKey) {
 					return
 				}
 			}

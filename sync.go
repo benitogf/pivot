@@ -8,11 +8,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/benitogf/ooo"
 	"github.com/benitogf/ooo/key"
 	"github.com/benitogf/ooo/meta"
+	"github.com/benitogf/ooo/monotonic"
 	"github.com/benitogf/ooo/storage"
 )
 
@@ -103,14 +103,33 @@ func syncLocalEntriesWithTracking(clientOpts ClientOpts, opts SyncOptions) error
 			indexToPath[obj.Index] = obj.Path
 		}
 
-		objsToDelete := GetEntriesNegativeDiff(objsLocal, objsLeader)
-		for _, index := range objsToDelete {
-			fullKey := indexToPath[index]
-			// Track BEFORE delete so storage callback can skip this event
-			if onDelete != nil {
-				onDelete(fullKey)
+		// Decide whether the glob diff may delete local-only items (items
+		// the leader's list doesn't contain). Only when the leader is
+		// strictly causally ahead (VVLess) is a missing-on-leader item a
+		// real deletion to mirror. Under VVConcurrent or VVGreater the
+		// local-only item may be a fresh local create the leader hasn't
+		// seen yet — deleting it here would lose data. The item's own
+		// push direction handles propagating it. No-VV fallback keeps the
+		// legacy unconditional delete. Symmetric to the push-side
+		// authoritativeLocal gate.
+		deleteLocalOnly := true
+		if opts.VVManager != nil && len(opts.LeaderVV) > 0 {
+			localVV := opts.VVManager.Get(baseKey)
+			if len(localVV) > 0 && localVV.Compare(opts.LeaderVV) != VVLess {
+				deleteLocalOnly = false
 			}
-			_key.Database.Del(fullKey)
+		}
+		var objsToDelete []string
+		if deleteLocalOnly {
+			objsToDelete = GetEntriesNegativeDiff(objsLocal, objsLeader)
+			for _, index := range objsToDelete {
+				fullKey := indexToPath[index]
+				// Track BEFORE delete so storage callback can skip this event
+				if onDelete != nil {
+					onDelete(fullKey)
+				}
+				_key.Database.Del(fullKey)
+			}
 		}
 
 		useAuthoritativeDiff := opts.VVManager != nil && len(opts.LeaderVV) > 0
@@ -319,14 +338,17 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 			}
 		}
 
-		// Send delete commands for items that exist on leader but not locally
+		// Send delete commands for items that exist on leader but not locally.
+		// Tombstone time from the sender's monotonic clock, not the leader's
+		// stored Updated (which may be skewed): a skewed value would pollute
+		// the leader's base-key LastEntry on every downstream activity read.
 		for _, objLeader := range objsLeader {
 			if _, exists := localEntries[objLeader.Index]; !exists {
 				fullKey := objLeader.Path
 				if isRecentDelete != nil && isRecentDelete(fullKey) {
 					continue
 				}
-				if rVV, err := sendDeleteToLeader(clientOpts, fullKey, objLeader.Updated, originator, localVV); err == nil {
+				if rVV, err := sendDeleteToLeader(clientOpts, fullKey, monotonic.Now(), originator, localVV); err == nil {
 					mergeLeaderVV(opts.VVManager, baseKey, rVV)
 				}
 			}
@@ -337,10 +359,10 @@ func syncToLeader(clientOpts ClientOpts, opts SyncOptions) error {
 
 	obj, err := _key.Database.Get(_key.Path)
 	if err != nil {
-		// Key doesn't exist locally - check if it exists on leader and delete it
-		leaderObj, leaderErr := getEntryFromLeader(clientOpts, _key.Path)
-		if leaderErr == nil {
-			if rVV, err := sendDeleteToLeader(clientOpts, _key.Path, leaderObj.Updated, originator, localVV); err == nil {
+		// Key doesn't exist locally - check if it exists on leader and delete it.
+		// Tombstone time from the sender's monotonic clock, same rationale.
+		if _, leaderErr := getEntryFromLeader(clientOpts, _key.Path); leaderErr == nil {
+			if rVV, err := sendDeleteToLeader(clientOpts, _key.Path, monotonic.Now(), originator, localVV); err == nil {
 				mergeLeaderVV(opts.VVManager, baseKeyFromPath(_key.Path), rVV)
 			}
 		}
@@ -410,6 +432,23 @@ func synchronizeItemWithTracking(clientOpts ClientOpts, opts SyncOptions) error 
 	// present-time local write).
 	opts.LeaderVV = activityLeader.VV
 
+	// Asymmetric VV: the leader has a VV but local does not. Local's
+	// data is un-VV'd — it lost its causal history (e.g. the VV in
+	// server.Storage was ephemeral relative to a durable data storage
+	// and didn't survive a restart) or was written in the pre-SetNodeID
+	// startup window. Either way it is the untrustworthy state VV exists
+	// to detect, so the leader is authoritative: PULL. Do NOT fall
+	// through to the LastEntry comparison below — under clock skew the
+	// un-VV'd local data can carry a future-dated Updated, and the
+	// fallback would then PUSH that stale record over the leader's
+	// honest value. Losing un-acked local writes on VV-loss is a
+	// predictable resync; corrupting the cluster with a stale-future
+	// push is not.
+	if len(activityLeader.VV) > 0 && len(activityLocal.VV) == 0 {
+		opts.LastEntry = activityLeader.LastEntry
+		return syncLocalEntriesWithTracking(clientOpts, opts)
+	}
+
 	useVV := len(activityLeader.VV) > 0 && len(activityLocal.VV) > 0
 	if useVV {
 		switch activityLocal.VV.Compare(activityLeader.VV) {
@@ -476,37 +515,55 @@ func synchronizeKeysWithTracking(clientOpts ClientOpts, opts SyncOptions, keys [
 	return errors.New("nothing to synchronize")
 }
 
-// pullTracker tracks keys that are being modified during sync operations.
-// Keys are tracked before storage operations and consumed (removed) when checked.
-// This ensures each storage event is only skipped once.
+// pullTracker tracks keys modified during a pull. Two independent
+// consumers must recognize a pull-driven storage event:
+//
+//  1. the watch goroutine (makeStorageSync) — to skip fanout/push of
+//     data it just pulled;
+//  2. AfterWrite's synchronous VV bump (bumpVVForLocalWrite) — to skip
+//     bumping our own counter, since the pulled record carries the
+//     leader's VV, not ours.
+//
+// Each consumer drains its OWN mark so neither deprives the other. A
+// single mark peeked by AfterWrite and consumed by the watch goroutine
+// left a stale mark whenever the watch goroutine was slow or suppressed
+// (NoBroadcastKeys), which then wrongly skipped a later direct write's
+// bump. The pull sets both marks via trackSet/trackDelete.
 type pullTracker struct {
-	mu      sync.Mutex
-	deleted map[string]bool // keys being deleted during current sync
-	set     map[string]bool // keys being set during current sync
+	mu             sync.Mutex
+	deleted        map[string]bool // watch-goroutine consume (fanout-skip)
+	set            map[string]bool // watch-goroutine consume (fanout-skip)
+	bumpSkipDelete map[string]bool // AfterWrite consume (bump-skip)
+	bumpSkipSet    map[string]bool // AfterWrite consume (bump-skip)
 }
 
 func newPullTracker() *pullTracker {
 	return &pullTracker{
-		deleted: make(map[string]bool),
-		set:     make(map[string]bool),
+		deleted:        make(map[string]bool),
+		set:            make(map[string]bool),
+		bumpSkipDelete: make(map[string]bool),
+		bumpSkipSet:    make(map[string]bool),
 	}
 }
 
-// trackDelete records a key being deleted during sync
+// trackDelete records a key being deleted during sync (sets both the
+// fanout-skip and bump-skip marks).
 func (p *pullTracker) trackDelete(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.deleted[key] = true
+	p.bumpSkipDelete[key] = true
 }
 
-// trackSet records a key being set during sync
+// trackSet mirrors trackDelete for set operations.
 func (p *pullTracker) trackSet(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.set[key] = true
+	p.bumpSkipSet[key] = true
 }
 
-// pulledDelete returns true if key was deleted during sync, and consumes the flag
+// pulledDelete returns true and consumes the fanout-skip flag (watch goroutine).
 func (p *pullTracker) pulledDelete(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -517,7 +574,7 @@ func (p *pullTracker) pulledDelete(key string) bool {
 	return false
 }
 
-// pulledSet returns true if key was set during sync, and consumes the flag
+// pulledSet returns true and consumes the fanout-skip flag (watch goroutine).
 func (p *pullTracker) pulledSet(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -528,23 +585,28 @@ func (p *pullTracker) pulledSet(key string) bool {
 	return false
 }
 
-// hasPulledSet is a non-consuming variant of pulledSet, used by the
-// synchronous VV-bump path in AfterWrite. The watch goroutine still
-// consumes the flag via pulledSet to gate fanout; AfterWrite only needs
-// to know "is this storage write coming from a pull operation?" so it
-// can skip our own counter bump (the pulled record carries the leader's
-// VV, not ours).
-func (p *pullTracker) hasPulledSet(key string) bool {
+// consumeBumpSkipSet returns true and consumes the bump-skip flag
+// (AfterWrite). Replaces the earlier non-consuming peek that leaked
+// stale marks when the watch goroutine never ran (NoBroadcastKeys).
+func (p *pullTracker) consumeBumpSkipSet(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.set[key]
+	if p.bumpSkipSet[key] {
+		delete(p.bumpSkipSet, key)
+		return true
+	}
+	return false
 }
 
-// hasPulledDelete mirrors hasPulledSet for delete operations.
-func (p *pullTracker) hasPulledDelete(key string) bool {
+// consumeBumpSkipDelete mirrors consumeBumpSkipSet for delete operations.
+func (p *pullTracker) consumeBumpSkipDelete(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.deleted[key]
+	if p.bumpSkipDelete[key] {
+		delete(p.bumpSkipDelete, key)
+		return true
+	}
+	return false
 }
 
 // pendingOp represents a queued per-key operation
@@ -707,6 +769,17 @@ func (s *syncer) Pull() error {
 		delete(s.lastSyncedActivity, baseKey)
 	}
 	s.activityMu.Unlock()
+	// Also invalidate the VV cache, matching PullKey. The VV cache is
+	// now the PRIMARY short-circuit in TryPullKey, so leaving it stale
+	// here while clearing lastSyncedActivity could let a later
+	// sync-on-read TryPullKey see localVV.Compare(staleLastSyncedVV) ==
+	// VVEqual and skip a pull pivot triggered precisely because it had
+	// new data.
+	s.vvMu.Lock()
+	for _, k := range s.keys {
+		delete(s.lastSyncedVV, baseKeyFromPath(k.Path))
+	}
+	s.vvMu.Unlock()
 
 	s.mu.Lock()
 	err := s.pullKeyWithCacheUpdate(s.keys)
@@ -734,20 +807,38 @@ func (s *syncer) TryPullKey(keyPath string) error {
 		return nil
 	}
 
-	// Check if we can skip based on activity cache (no lock needed for read)
-	// Only use cache if we're "connected" (have received TriggerNodeSync for this key)
+	// Check if we can skip based on the cache (no lock needed for read).
+	// Only use cache if we're "connected" (have received TriggerNodeSync).
+	//
+	// VV-equality is the primary short-circuit: if both the cached pivot
+	// VV and the current local VV are non-empty and equal, no causal
+	// progress has happened on either side since the last sync — skip
+	// the HTTP roundtrip. The legacy LastEntry equality is the fallback
+	// for the no-VV case only; a zeroed or skewed LastEntry must not
+	// suppress a legitimate pull, which VV-equality avoids.
 	baseKey := baseKeyFromPath(keyPath)
 	s.activityMu.RLock()
 	isConnected := s.connected[baseKey]
-	lastSynced, hasCached := s.lastSyncedActivity[baseKey]
+	lastSyncedActivity, hasCachedActivity := s.lastSyncedActivity[baseKey]
 	s.activityMu.RUnlock()
+	s.vvMu.RLock()
+	lastSyncedVV, hasCachedVV := s.lastSyncedVV[baseKey]
+	s.vvMu.RUnlock()
 
-	if isConnected && hasCached {
-		activityLocal, err := checkActivity(*matchingKey)
-		if err == nil && activityLocal.LastEntry == lastSynced {
-			// Local activity equals what we last synced, nothing has changed
-			// No need to make HTTP request to check pivot activity
-			return nil
+	if isConnected {
+		var localVV VersionVector
+		if s.vvManager != nil {
+			localVV = s.vvManager.Get(baseKey)
+		}
+		if hasCachedVV && len(lastSyncedVV) > 0 && len(localVV) > 0 {
+			if localVV.Compare(lastSyncedVV) == VVEqual {
+				return nil
+			}
+		} else if hasCachedActivity {
+			activityLocal, err := checkActivity(*matchingKey)
+			if err == nil && activityLocal.LastEntry == lastSyncedActivity {
+				return nil
+			}
 		}
 	}
 
@@ -817,14 +908,23 @@ func (s *syncer) pullKeyWithCacheUpdate(keys []Key) error {
 
 		needSync := false
 		usedVV := false
-		if len(activityPivot.VV) > 0 && len(localVV) > 0 {
+		if len(activityPivot.VV) > 0 {
 			usedVV = true
-			switch localVV.Compare(activityPivot.VV) {
-			case VVLess:
+			if len(localVV) == 0 {
+				// Local has no VV but the leader does. Treat empty
+				// localVV as VVLess: the leader is authoritative for
+				// whatever it is serving, so pull. Avoids falling
+				// through to the LastEntry fallback, which fails to
+				// fire when both LastEntry values are zero/skewed.
 				needSync = true
-			case VVConcurrent:
-				logConflict(baseKey, localVV, activityPivot.VV, "last-sync-wins: accepting pivot data")
-				needSync = true
+			} else {
+				switch localVV.Compare(activityPivot.VV) {
+				case VVLess:
+					needSync = true
+				case VVConcurrent:
+					logConflict(baseKey, localVV, activityPivot.VV, "last-sync-wins: accepting pivot data")
+					needSync = true
+				}
 			}
 		}
 		if !usedVV && actErr == nil && activityPivot.LastEntry > activityLocal.LastEntry {
@@ -1097,27 +1197,41 @@ type StorageSyncCallback func(event storage.Event)
 // Direct (non-handler) storage writes never call Mark, so Consume returns
 // false and the callback runs its full path — that's how the callback
 // remains the source of truth for direct writes.
+// Two independent consumers recognize a handler-driven write, mirroring
+// pullTracker: the watch goroutine (Consume, to skip its bump+fanout)
+// and AfterWrite (ConsumeBumpSkip, to skip its synchronous bump because
+// the handler bumps explicitly). Each drains its own counter; a single
+// counter peeked by one and consumed by the other left a stale mark
+// whenever the watch goroutine never ran (a pivot-synced key in
+// NoBroadcastKeys, or a storage error before dispatch), which then
+// swallowed a later direct write's legitimate bump.
 type HandlerWriteTracker struct {
-	mu      sync.Mutex
-	pending map[string]int
+	mu          sync.Mutex
+	pending     map[string]int // consumed by the watch goroutine (fanout-skip)
+	bumpPending map[string]int // consumed by AfterWrite (bump-skip)
 }
 
 // NewHandlerWriteTracker creates an empty tracker.
 func NewHandlerWriteTracker() *HandlerWriteTracker {
-	return &HandlerWriteTracker{pending: make(map[string]int)}
+	return &HandlerWriteTracker{
+		pending:     make(map[string]int),
+		bumpPending: make(map[string]int),
+	}
 }
 
 // Mark records that a handler is about to drive a write for the given key.
-// Must be called before the storage write so the dedup signal is in place
-// by the time the watch goroutine processes the event.
+// Must be called before the storage write so both dedup signals are in
+// place by the time AfterWrite and the watch goroutine observe the event.
 func (t *HandlerWriteTracker) Mark(key string) {
 	t.mu.Lock()
 	t.pending[key]++
+	t.bumpPending[key]++
 	t.mu.Unlock()
 }
 
-// Unmark drops a previously-recorded mark — call from the handler's error
-// path when the storage write didn't fire an event.
+// Unmark drops a previously-recorded mark from BOTH counters — call from
+// the handler's error path when the storage write didn't fire an event
+// (so neither consumer will drain the marks).
 func (t *HandlerWriteTracker) Unmark(key string) {
 	t.mu.Lock()
 	if t.pending[key] > 0 {
@@ -1126,12 +1240,18 @@ func (t *HandlerWriteTracker) Unmark(key string) {
 			delete(t.pending, key)
 		}
 	}
+	if t.bumpPending[key] > 0 {
+		t.bumpPending[key]--
+		if t.bumpPending[key] == 0 {
+			delete(t.bumpPending, key)
+		}
+	}
 	t.mu.Unlock()
 }
 
-// Consume returns true and decrements the pending count if a mark is
-// present for the key (i.e. this event is handler-driven). Returns false
-// otherwise (i.e. this event is from a direct storage write).
+// Consume returns true and decrements the fanout-skip count if a mark is
+// present (i.e. this event is handler-driven). Consumed by the watch
+// goroutine.
 func (t *HandlerWriteTracker) Consume(key string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -1145,15 +1265,22 @@ func (t *HandlerWriteTracker) Consume(key string) bool {
 	return true
 }
 
-// Has reports whether a mark is currently outstanding for the key,
-// without consuming it. Used by AfterWrite's synchronous VV bump to
-// skip its bump when a handler will explicitly bump after SetWithMeta
-// returns. The watch goroutine still Consumes the mark to gate the
-// rest of the SyncCallback processing.
-func (t *HandlerWriteTracker) Has(key string) bool {
+// ConsumeBumpSkip returns true and decrements the bump-skip count if a
+// mark is present (i.e. a handler will bump the VV for this write, so
+// AfterWrite must skip). Consumed by bumpVVForLocalWrite. Replaces the
+// earlier non-consuming Has peek — see the type doc for why consuming
+// matters.
+func (t *HandlerWriteTracker) ConsumeBumpSkip(key string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.pending[key] > 0
+	if t.bumpPending[key] == 0 {
+		return false
+	}
+	t.bumpPending[key]--
+	if t.bumpPending[key] == 0 {
+		delete(t.bumpPending, key)
+	}
+	return true
 }
 
 // applyPivotFanout triggers a sync on every healthy peer node except the
@@ -1189,7 +1316,12 @@ func applyNodePush(pool *syncerPool, db storage.Database, effectiveURL, op, item
 		return
 	}
 	if op == "del" {
-		s.QueueOrSendDelete(itemKey, time.Now().UnixNano())
+		// monotonic.Now(), not time.Now(): pivot's monotonic clock is
+		// anchored at process start and advances via the runtime's
+		// monotonic source, so a mid-process wall-clock jump can't skew
+		// the tombstone timestamp the leader stores and exposes as
+		// LastEntry.
+		s.QueueOrSendDelete(itemKey, monotonic.Now())
 		return
 	}
 	obj, err := db.Get(itemKey)
