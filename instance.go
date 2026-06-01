@@ -299,16 +299,35 @@ func (i *Instance) bumpVVForLocalWrite(eventKey string) {
 // Attach wraps the caller's AfterWrite (if any) with a synchronous VV
 // bump (see bumpVVForLocalWrite). The bump runs first, then the
 // caller's AfterWrite, so tests waiting on AfterWrite still observe the
-// post-bump VV.
+// post-bump VV. A caller-supplied BeforeRead is likewise composed with
+// pivot's sync-on-read callback (pivot first, caller second) rather than
+// dropped.
 func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) error {
-	opts := storage.Options{BeforeRead: i.BeforeRead}
+	var opts storage.Options
 	var userAfterWrite func(string)
+	var userBeforeRead func(string)
 	if len(storageOpts) > 0 {
 		userOpts := storageOpts[0]
 		opts.NoBroadcastKeys = userOpts.NoBroadcastKeys
 		userAfterWrite = userOpts.AfterWrite
+		userBeforeRead = userOpts.BeforeRead
 		opts.Workers = userOpts.Workers
 	}
+	// Compose pivot's sync-on-read BeforeRead with the caller's (if any),
+	// rather than overwriting it. Pivot runs first so its pull lands
+	// before the caller's hook observes the key — same ordering as the
+	// AfterWrite wrapping below (pivot's bump first, caller's hook second).
+	// Attach's documented use case is external storages that want to read,
+	// so silently dropping a caller-supplied BeforeRead would defeat it.
+	beforeRead := func(eventKey string) {
+		if i.BeforeRead != nil {
+			i.BeforeRead(eventKey)
+		}
+		if userBeforeRead != nil {
+			userBeforeRead(eventKey)
+		}
+	}
+	opts.BeforeRead = beforeRead
 	opts.AfterWrite = func(eventKey string) {
 		i.bumpVVForLocalWrite(eventKey)
 		if userAfterWrite != nil {
@@ -333,7 +352,7 @@ func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) e
 		// Store before checking Active(), then Delete immediately in
 		// this already-started branch because wrapped AfterWrite was
 		// not installable.
-		db.SetBeforeRead(i.BeforeRead)
+		db.SetBeforeRead(beforeRead)
 		// Roll back the attachedDBs record because AfterWrite was NOT
 		// actually installed (storage was already started).
 		i.attachedDBs.Delete(db)
