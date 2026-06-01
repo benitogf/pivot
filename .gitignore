@@ -1,3 +1,4 @@
+.janitor/
 pivot.test
 test_*
 test/

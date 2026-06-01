@@ -173,6 +173,16 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
 				vvManager.set(path, peerVV)
 			}
+			// Return the post-write VV so the sender can merge pivot's
+			// state into its own VVManager. Without this, the sender
+			// only knows its own bump; the next pull tick compares
+			// {sender:N} against pivot's {leader:M, sender:N-1, ...}
+			// and sees VVConcurrent on every push, triggering spurious
+			// reconciliation pulls that delete the just-pushed items
+			// when pivot hasn't received them yet. With this, the
+			// sender's VV strictly dominates pivot's after each
+			// successful push and the next pull is a no-op.
+			w.Header().Set(VVHeader, string(encodeVV(vvManager.Get(path))))
 		}
 		if postWrite != nil {
 			postWrite(itemKey, "set", originatorPeer)
@@ -248,6 +258,9 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
 				vvManager.set(path, peerVV)
 			}
+			// Echo pivot's post-write VV back in the response so the
+			// sender can merge it (see the Set handler for the rationale).
+			w.Header().Set(VVHeader, string(encodeVV(vvManager.Get(path))))
 		}
 		if postWrite != nil {
 			postWrite(itemKey, "del", originatorPeer)

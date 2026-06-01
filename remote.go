@@ -159,12 +159,17 @@ func getEntryFromLeader(opts ClientOpts, key string) (meta.Object, error) {
 	return meta.DecodeFromReader(resp.Body)
 }
 
-func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator string, vv VersionVector) error {
+// sendToLeader pushes a single item to the leader. On a 200 response,
+// the leader's post-write VersionVector is returned via the second
+// value (decoded from the VVHeader on the response). Empty when the
+// leader is an older peer that doesn't echo VV — callers should treat
+// that as the legacy "no info" case.
+func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator string, vv VersionVector) (VersionVector, error) {
 	buf := new(bytes.Buffer)
 	json.NewEncoder(buf).Encode(obj)
 	req, err := http.NewRequest("POST", opts.URL(RoutePrefix+"/pivot/"+key), buf)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if originator != "" {
@@ -175,23 +180,27 @@ func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator strin
 	}
 	resp, err := opts.Client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return errors.New("failed to send update to leader " + resp.Status)
+		return nil, errors.New("failed to send update to leader " + resp.Status)
 	}
 
-	return nil
+	leaderVV, _ := decodeVVHeader(resp.Header.Get(VVHeader))
+	return leaderVV, nil
 }
 
-func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator string, vv VersionVector) error {
+// sendDeleteToLeader mirrors sendToLeader for delete operations. The
+// returned VV (when non-empty) is pivot's post-delete VV; senders merge
+// it locally so their VVManager reflects pivot's frontier.
+func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator string, vv VersionVector) (VersionVector, error) {
 	url := opts.URL(RoutePrefix + "/pivot/" + key + "/" + strconv.FormatInt(lastEntry, 10))
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if originator != "" {
 		req.Header.Set(OriginatorHeader, originator)
@@ -201,13 +210,14 @@ func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator
 	}
 	resp, err := opts.Client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return errors.New("failed to send delete to leader " + resp.Status)
+		return nil, errors.New("failed to send delete to leader " + resp.Status)
 	}
 
-	return nil
+	leaderVV, _ := decodeVVHeader(resp.Header.Get(VVHeader))
+	return leaderVV, nil
 }

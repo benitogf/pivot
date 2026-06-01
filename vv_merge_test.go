@@ -136,7 +136,7 @@ func TestSendToLeaderEmitsVVHeader(t *testing.T) {
 	clientOpts := ClientOpts{Client: srv.Client(), Leader: leader}
 	obj := meta.Object{Created: 1, Updated: 1, Index: "x", Path: "things/x", Data: []byte(`{"v":"v1"}`)}
 
-	err := sendToLeader(clientOpts, "things/x", obj, "10.0.0.1:9000", VersionVector{"10.0.0.1:9000": 5, "leader": 2})
+	_, err := sendToLeader(clientOpts, "things/x", obj, "10.0.0.1:9000", VersionVector{"10.0.0.1:9000": 5, "leader": 2})
 	require.NoError(t, err)
 	require.NotEmpty(t, receivedHeader, "sendToLeader must set X-Pivot-VV when given a non-empty vv")
 	require.JSONEq(t, `{"10.0.0.1:9000":5,"leader":2}`, receivedHeader)
