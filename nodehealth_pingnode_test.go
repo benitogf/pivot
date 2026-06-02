@@ -38,6 +38,15 @@ func TestPingNodeProbesUnauthedEndpoint(t *testing.T) {
 	server.Start("localhost:0")
 	defer server.Close(os.Interrupt)
 
+	// Premise check: the ooo root IS behind the Audit gate, so a direct GET
+	// "/" on this hardened server is rejected. If this ever stops being 401,
+	// the bug this test guards against no longer exists.
+	rootResp, err := http.Get("http://" + server.Address + "/")
+	require.NoError(t, err)
+	rootResp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, rootResp.StatusCode,
+		"premise: the ooo root must be Audit-gated on a hardened node")
+
 	nh := NewNodeHealth(nil)
 	defer nh.Stop()
 
