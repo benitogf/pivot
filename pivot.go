@@ -653,7 +653,9 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 
 	// Node health endpoint (only meaningful on pivot servers)
 	server.Router.HandleFunc(RoutePrefix+"/health/nodes", NodeHealthHandler(nodeHealth)).Methods("GET")
-	// Version endpoint for protocol detection
+	// Version endpoint for protocol detection, also used by
+	// NodeHealth.pingNode as the reachability probe. Registered without the
+	// Audit wrapper so health checks reach hardened nodes.
 	server.Router.HandleFunc(RoutePrefix+"/version", VersionHandler()).Methods("GET")
 	for _, k := range keys {
 		baseKey := baseKeyFromPath(k.Path)
