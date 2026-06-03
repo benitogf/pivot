@@ -315,15 +315,22 @@ func (nh *NodeHealth) IsCompatible(node string) bool {
 	return proto == ProtocolVersion
 }
 
-// pingNode checks if a node is reachable
+// pingNode checks if a node is reachable. It probes the pivot-internal
+// /_pivot/version route rather than the ooo root ("/"): the root is served by
+// the UI handler behind the Audit gate, so a node hardened with a non-trivial
+// Audit returns 401 on "/" and would be permanently marked unhealthy. The
+// /_pivot/version route is registered without the Audit wrapper, so it stays
+// reachable. GET (not HEAD) keeps the probe compatible with older nodes that
+// registered /_pivot/version for GET only, so a rolling upgrade never marks a
+// not-yet-upgraded node unhealthy.
 func (nh *NodeHealth) pingNode(node string) bool {
 	select {
 	case <-nh.ctx.Done():
 		return false
 	default:
 	}
-	url := nh.Scheme() + "://" + node + "/"
-	req, err := http.NewRequestWithContext(nh.ctx, "GET", url, nil)
+	url := nh.Scheme() + "://" + node + RoutePrefix + "/version"
+	req, err := http.NewRequestWithContext(nh.ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return false
 	}
