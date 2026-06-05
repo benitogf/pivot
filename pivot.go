@@ -3,6 +3,7 @@ package pivot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -452,11 +453,25 @@ func wipeStorage(db storage.Database, path string) {
 	}
 }
 
-// Setup configures pivot synchronization on the server.
-// It modifies the server by setting routes, OnStorageEvent, and BeforeRead.
-// Returns the server to make side-effects explicit.
-// Use GetInstance(server) to access BeforeRead/SyncCallback for external storages.
+// Setup configures pivot synchronization on the server and returns it. It is
+// the panic-on-misconfiguration convenience wrapper around SetupWithError: a
+// conflicting key configuration kills the process. Callers that want to detect
+// and report a configuration error cleanly should call SetupWithError instead.
 func Setup(server *ooo.Server, config Config) *ooo.Server {
+	s, err := SetupWithError(server, config)
+	if err != nil {
+		panic(err)
+	}
+	return s
+}
+
+// SetupWithError configures pivot synchronization on the server. It modifies
+// the server by setting routes, OnStorageEvent, and BeforeRead, and returns it
+// to make side-effects explicit; use GetInstance(server) to access
+// BeforeRead/SyncCallback for external storages. It returns an error (instead
+// of panicking) when the key configuration is invalid, so the calling process
+// can recover or report cleanly rather than being killed by a startup typo.
+func SetupWithError(server *ooo.Server, config Config) (*ooo.Server, error) {
 	// Initialize router if not set
 	if server.Router == nil {
 		server.Router = mux.NewRouter()
@@ -473,15 +488,15 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 
 	// Validate key configurations
 	for _, k := range config.Keys {
-		// Panic if both Local and ClusterURL are set - conflicting configuration
+		// Conflicting configuration: Local and ClusterURL are mutually exclusive.
 		if k.Local && k.ClusterURL != "" {
-			panic("pivot: Key " + k.Path + " has both Local=true and ClusterURL set - these are mutually exclusive")
+			return nil, errors.New("pivot: Key " + k.Path + " has both Local=true and ClusterURL set - these are mutually exclusive")
 		}
-		// Panic if Config.ClusterURL is empty but Key.ClusterURL is set without Local
-		// This would mean the server is a pivot but trying to sync some keys from another pivot
-		// which requires the server to also be a node (have Config.ClusterURL set)
+		// Config.ClusterURL empty but Key.ClusterURL set without Local: the
+		// server would be a pivot trying to sync some keys from another pivot,
+		// which requires the server to also be a node (Config.ClusterURL set).
 		if pivotURL == "" && k.ClusterURL != "" {
-			panic("pivot: Key " + k.Path + " has ClusterURL set but Config.ClusterURL is empty - set Config.ClusterURL or use Local=true for local keys")
+			return nil, errors.New("pivot: Key " + k.Path + " has ClusterURL set but Config.ClusterURL is empty - set Config.ClusterURL or use Local=true for local keys")
 		}
 	}
 
@@ -809,7 +824,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	// Set GetPivotInfo on server for UI integration
 	server.GetPivotInfo = GetPivotInfo(server)
 
-	return server
+	return server, nil
 }
 
 // retryInitialSyncPool retries the initial sync for all syncers with exponential backoff until successful or stopped.
