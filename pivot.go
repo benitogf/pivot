@@ -734,14 +734,17 @@ func SetupWithError(server *ooo.Server, config Config) (*ooo.Server, error) {
 	// Assign BeforeRead to server
 	server.BeforeRead = beforeRead
 
-	// Assign AfterWrite to server so writes to server.Storage get the
+	// Assign AfterWriteOp to server so writes to server.Storage get the
 	// synchronous VV bump on the writer's goroutine, closing the
 	// VV-lag race where /activity could return a pre-bump VV between
 	// a write committing and the watch goroutine processing the event.
+	// The op-aware hook lets bumpVVForLocalWrite consume only the
+	// bump-skip mark matching the write's operation (set vs del), so a
+	// pulled delete's mark can't suppress a concurrent local set's bump.
 	// instance.bumpVVForLocalWrite handles internal-prefix skip,
 	// configured-key matching, pull-driven skip via the pullTracker
-	// peek, and handler-write skip via the HandlerWriteTracker peek.
-	server.AfterWrite = instance.bumpVVForLocalWrite
+	// consume, and handler-write skip via the HandlerWriteTracker peek.
+	server.AfterWriteOp = instance.bumpVVForLocalWrite
 	// Record server.Storage as sync-bump-installed so makeStorageSync's
 	// async-path bump skips events from it (the AfterWrite above already
 	// bumped). Mirrors the Store inside Instance.Attach for external
