@@ -17,6 +17,22 @@ type ClientOpts struct {
 	Client *http.Client
 	Leader string // Leader/pivot server address
 	SSL    bool   // Use HTTPS instead of HTTP
+
+	// ctx bounds the lifetime of requests issued with these options. The
+	// syncer stamps its instance-scoped context here (via ClientOpts) so a
+	// graceful Instance.Shutdown() cancels in-flight leader calls instead of
+	// leaving them to wait out the client timeout. Unexported: external
+	// callers leave it nil and reqContext falls back to context.Background().
+	ctx context.Context
+}
+
+// reqContext returns the request context for these options, defaulting to
+// context.Background() when no context was supplied.
+func (c ClientOpts) reqContext() context.Context {
+	if c.ctx != nil {
+		return c.ctx
+	}
+	return context.Background()
 }
 
 // Scheme returns "https" if SSL is true, "http" otherwise.
@@ -96,7 +112,11 @@ func TriggerNodeSyncWithHealth(opts ClientOpts, node string, keyPath string) boo
 
 func getEntriesFromLeader(opts ClientOpts, key string) ([]meta.Object, error) {
 	var objs []meta.Object
-	resp, err := opts.Client.Get(opts.URL(RoutePrefix + "/pivot/" + key))
+	req, err := http.NewRequestWithContext(opts.reqContext(), http.MethodGet, opts.URL(RoutePrefix+"/pivot/"+key), nil)
+	if err != nil {
+		return objs, err
+	}
+	resp, err := opts.Client.Do(req)
 	if err != nil {
 		return objs, err
 	}
@@ -119,7 +139,11 @@ func getEntriesFromLeader(opts ClientOpts, key string) ([]meta.Object, error) {
 // hasActivity is false against older leaders that don't emit the header — the
 // caller is expected to fall back to checkLeaderActivity in that case.
 func getEntriesAndActivityFromLeader(opts ClientOpts, key string) (objs []meta.Object, activity int64, hasActivity bool, err error) {
-	resp, err := opts.Client.Get(opts.URL(RoutePrefix + "/pivot/" + key))
+	req, err := http.NewRequestWithContext(opts.reqContext(), http.MethodGet, opts.URL(RoutePrefix+"/pivot/"+key), nil)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	resp, err := opts.Client.Do(req)
 	if err != nil {
 		return nil, 0, false, err
 	}
@@ -146,7 +170,11 @@ func getEntriesAndActivityFromLeader(opts ClientOpts, key string) (objs []meta.O
 
 func getEntryFromLeader(opts ClientOpts, key string) (meta.Object, error) {
 	var obj meta.Object
-	resp, err := opts.Client.Get(opts.URL(RoutePrefix + "/pivot/" + key))
+	req, err := http.NewRequestWithContext(opts.reqContext(), http.MethodGet, opts.URL(RoutePrefix+"/pivot/"+key), nil)
+	if err != nil {
+		return obj, err
+	}
+	resp, err := opts.Client.Do(req)
 	if err != nil {
 		return obj, err
 	}
@@ -167,7 +195,7 @@ func getEntryFromLeader(opts ClientOpts, key string) (meta.Object, error) {
 func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator string, vv VersionVector) (VersionVector, error) {
 	buf := new(bytes.Buffer)
 	json.NewEncoder(buf).Encode(obj)
-	req, err := http.NewRequest("POST", opts.URL(RoutePrefix+"/pivot/"+key), buf)
+	req, err := http.NewRequestWithContext(opts.reqContext(), http.MethodPost, opts.URL(RoutePrefix+"/pivot/"+key), buf)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +226,7 @@ func sendToLeader(opts ClientOpts, key string, obj meta.Object, originator strin
 // it locally so their VVManager reflects pivot's frontier.
 func sendDeleteToLeader(opts ClientOpts, key string, lastEntry int64, originator string, vv VersionVector) (VersionVector, error) {
 	url := opts.URL(RoutePrefix + "/pivot/" + key + "/" + strconv.FormatInt(lastEntry, 10))
-	req, err := http.NewRequest("DELETE", url, nil)
+	req, err := http.NewRequestWithContext(opts.reqContext(), http.MethodDelete, url, nil)
 	if err != nil {
 		return nil, err
 	}

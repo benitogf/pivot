@@ -2,6 +2,7 @@ package pivot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -627,6 +628,7 @@ type pendingOp struct {
 type syncer struct {
 	mu        sync.Mutex
 	tracker   *pullTracker
+	ctx       context.Context // Instance lifetime; stamped onto ClientOpts so Shutdown cancels in-flight leader calls
 	client    *http.Client
 	pivot     string
 	keys      []Key
@@ -651,9 +653,10 @@ type syncer struct {
 	connected          map[string]bool  // baseKey -> true if we've received TriggerNodeSync for this key
 }
 
-func newSyncer(client *http.Client, pivot string, keys []Key, ssl bool, vvManager *VVManager) *syncer {
+func newSyncer(ctx context.Context, client *http.Client, pivot string, keys []Key, ssl bool, vvManager *VVManager) *syncer {
 	return &syncer{
 		tracker:            newPullTracker(),
+		ctx:                ctx,
 		client:             client,
 		pivot:              pivot,
 		keys:               keys,
@@ -666,9 +669,10 @@ func newSyncer(client *http.Client, pivot string, keys []Key, ssl bool, vvManage
 	}
 }
 
-// ClientOpts returns the client options for this syncer.
+// ClientOpts returns the client options for this syncer, carrying the
+// instance-scoped context so a graceful Shutdown cancels in-flight leader calls.
 func (s *syncer) ClientOpts() ClientOpts {
-	return ClientOpts{Client: s.client, Leader: s.pivot, SSL: s.ssl}
+	return ClientOpts{Client: s.client, Leader: s.pivot, SSL: s.ssl, ctx: s.ctx}
 }
 
 // syncerPool manages multiple syncers, one per unique pivot URL.
@@ -684,7 +688,7 @@ type syncerPool struct {
 // newSyncerPool creates a syncer pool from keys grouped by their effective ClusterURL.
 // configClusterURL is used as fallback for keys without explicit ClusterURL.
 // ssl enables HTTPS for URL construction.
-func newSyncerPool(client *http.Client, keys []Key, configClusterURL string, ssl bool, vvManager *VVManager) *syncerPool {
+func newSyncerPool(ctx context.Context, client *http.Client, keys []Key, configClusterURL string, ssl bool, vvManager *VVManager) *syncerPool {
 	pool := &syncerPool{
 		syncers: make(map[string]*syncer),
 		keyMap:  make(map[string]string),
@@ -706,7 +710,7 @@ func newSyncerPool(client *http.Client, keys []Key, configClusterURL string, ssl
 
 	// Create a syncer for each unique pivot URL
 	for pivotURL, pivotKeys := range keysByPivot {
-		pool.syncers[pivotURL] = newSyncer(client, pivotURL, pivotKeys, ssl, vvManager)
+		pool.syncers[pivotURL] = newSyncer(ctx, client, pivotURL, pivotKeys, ssl, vvManager)
 	}
 
 	return pool

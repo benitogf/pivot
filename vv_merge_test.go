@@ -11,6 +11,7 @@ package pivot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -179,7 +180,7 @@ func TestQueuedOpCarriesQueueTimeVV(t *testing.T) {
 	// Build a syncer with an empty nodeAddr so writes are queued, not sent
 	// immediately. We'll drain via SetNodeAddr at the end.
 	vvm := NewVVManager(db, "10.0.0.1:9000")
-	pool := newSyncerPool(srv.Client(), []Key{{Path: "things/*", Database: db}},
+	pool := newSyncerPool(context.Background(), srv.Client(), []Key{{Path: "things/*", Database: db}},
 		srv.URL[len("http://"):], false, vvm)
 
 	// Op #1: snapshot at VV {nodeA:1}.
