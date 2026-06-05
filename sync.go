@@ -1291,7 +1291,12 @@ func applyPivotFanout(instance *Instance, getNodes getNodes, nodeHealth *NodeHea
 	if instance == nil || instance.triggers == nil || getNodes == nil {
 		return
 	}
-	for _, node := range getNodes() {
+	nodes := getNodes()
+	// Prune drainers for nodes that have left the cluster so perNode (and its
+	// goroutines) stays bounded by current membership. Retain(nil) is a no-op,
+	// so a transient-empty read never reaps live drainers.
+	instance.triggers.Retain(nodes)
+	for _, node := range nodes {
 		// Self-marker is collapsed by peerOriginator before this is called,
 		// so an originatorPeer of "" means "no peer to skip".
 		if node == originatorPeer && originatorPeer != "" {

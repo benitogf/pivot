@@ -42,6 +42,9 @@ type nodeTrigger struct {
 	mu      sync.Mutex
 	pending map[string]struct{} // key paths waiting to be sent
 	notify  chan struct{}       // 1-buffered wake-up signal
+
+	done   chan struct{} // closed by Retain to stop just this node's drainer
+	exited chan struct{} // closed by drain when its goroutine returns
 }
 
 func newTriggerCoalescer(client *http.Client, pool *syncerPool, health *NodeHealth) *triggerCoalescer {
@@ -81,6 +84,8 @@ func (c *triggerCoalescer) newNodeTriggerLocked(node string) *nodeTrigger {
 		parent:  c,
 		pending: make(map[string]struct{}),
 		notify:  make(chan struct{}, 1),
+		done:    make(chan struct{}),
+		exited:  make(chan struct{}),
 	}
 	c.perNode[node] = nt
 	c.wg.Add(1)
@@ -102,18 +107,24 @@ func (nt *nodeTrigger) signal(keyPath string) {
 	}
 }
 
-// drain is the per-node loop that fires HTTP triggers. Stops when
-// parent.stop is closed.
+// drain is the per-node loop that fires HTTP triggers. Stops when parent.stop
+// is closed (full shutdown) or nt.done is closed (this node reaped by Retain
+// because it left the cluster).
 func (nt *nodeTrigger) drain() {
 	defer nt.parent.wg.Done()
+	defer close(nt.exited)
 	for {
 		select {
 		case <-nt.parent.stop:
 			return
+		case <-nt.done:
+			return
 		case <-nt.notify:
-			// Re-check stop in case shutdown raced a notify.
+			// Re-check stop/done in case shutdown or a reap raced a notify.
 			select {
 			case <-nt.parent.stop:
+				return
+			case <-nt.done:
 				return
 			default:
 			}
@@ -158,6 +169,38 @@ func (nt *nodeTrigger) fire(keyPath string) {
 		} else {
 			nt.parent.health.MarkUnhealthy(nt.node)
 		}
+	}
+}
+
+// Retain prunes per-node triggers whose node is absent from current, stopping
+// each pruned node's drainer goroutine, so perNode (and its goroutines) can't
+// grow without bound as nodes leave the cluster. It is driven off the
+// write-fanout path with the authoritative membership list — event-driven, no
+// timer — which keeps pivot's deterministic-causal testing model intact.
+//
+// An empty current set is treated as "no information", not "everyone left":
+// getNodes() can momentarily return nil during a storage read error or
+// shutdown, and reaping on that would kill every live drainer only to respawn
+// it on the next write. Retain(nil) is therefore a no-op.
+func (c *triggerCoalescer) Retain(current []string) {
+	if len(current) == 0 {
+		return
+	}
+	keep := make(map[string]struct{}, len(current))
+	for _, node := range current {
+		keep[node] = struct{}{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	for node, nt := range c.perNode {
+		if _, ok := keep[node]; ok {
+			continue
+		}
+		close(nt.done)
+		delete(c.perNode, node)
 	}
 }
 
