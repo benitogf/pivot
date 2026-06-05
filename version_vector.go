@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"sync/atomic"
 
 	"github.com/benitogf/ooo/storage"
 )
@@ -182,7 +181,7 @@ type VVManager struct {
 	vectors  map[string]VersionVector // keyPath -> version vector
 	storage  storage.Database
 	nodeID   string // ID of this node ("leader" for pivot, node path for nodes)
-	shutdown int32  // atomic flag to prevent writes during shutdown
+	shutdown bool   // guarded by mu; prevents writes during shutdown
 }
 
 // NewVVManager creates a new version vector manager.
@@ -291,8 +290,10 @@ func (m *VVManager) loadFromStorage(baseKey string) {
 // saveToStorage persists a version vector to storage.
 // Caller must hold m.mu.
 func (m *VVManager) saveToStorage(baseKey string) {
-	// Check shutdown flag to avoid racing with storage.Close()
-	if atomic.LoadInt32(&m.shutdown) != 0 {
+	// Check shutdown flag to avoid racing with storage.Close(). Both this read
+	// and Shutdown's write happen under m.mu (saveToStorage's callers hold it),
+	// so the mutex alone serializes them — no atomic needed.
+	if m.shutdown {
 		return
 	}
 	if m.storage == nil || !m.storage.Active() {
@@ -312,11 +313,12 @@ func (m *VVManager) saveToStorage(baseKey string) {
 }
 
 // Shutdown marks the manager as shutting down to prevent storage writes.
-// Should be called before closing the storage.
-// Acquires the mutex to ensure any in-progress saveToStorage completes first.
+// Should be called before closing the storage. Acquiring the mutex both
+// ensures any in-progress saveToStorage completes first and publishes the flag
+// to the next saveToStorage (which reads it under the same mutex).
 func (m *VVManager) Shutdown() {
 	m.mu.Lock()
-	atomic.StoreInt32(&m.shutdown, 1)
+	m.shutdown = true
 	m.mu.Unlock()
 }
 
