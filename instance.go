@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,8 @@ type Instance struct {
 	healthMu       sync.RWMutex                  // Protects PivotHealth map
 	extraNodeURLMu sync.RWMutex                  // Protects ExtraNodeURLs
 	shutdown       int32                         // Atomic flag to prevent access during shutdown
+	ctx            context.Context               // Instance lifetime; cancelled by Shutdown to unblock in-flight leader HTTP calls
+	cancel         context.CancelFunc            // Cancels ctx; set in Setup, invoked by Shutdown
 }
 
 // AddExtraNodeURL adds a node URL to receive sync notifications (for cluster leader servers).
@@ -62,9 +65,14 @@ func (i *Instance) GetExtraNodeURLs() []string {
 	return result
 }
 
-// Shutdown marks the instance as shutting down to prevent access during close.
+// Shutdown marks the instance as shutting down to prevent access during close,
+// and cancels the instance context so any in-flight leader HTTP calls return
+// promptly instead of waiting out the client timeout.
 func (i *Instance) Shutdown() {
 	atomic.StoreInt32(&i.shutdown, 1)
+	if i.cancel != nil {
+		i.cancel()
+	}
 }
 
 // IsShutdown returns true if the instance is shutting down.

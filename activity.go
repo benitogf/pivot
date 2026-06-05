@@ -3,6 +3,7 @@ package pivot
 import (
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strconv"
 
 	"github.com/benitogf/ooo/key"
@@ -86,7 +87,11 @@ func checkPivotActivity(opts ClientOpts, key string) (ActivityEntry, error) {
 
 func checkLeaderActivity(opts ClientOpts, key string) (ActivityEntry, error) {
 	var activity ActivityEntry
-	resp, err := opts.Client.Get(opts.URL(RoutePrefix + "/activity/" + key))
+	req, err := http.NewRequestWithContext(opts.reqContext(), http.MethodGet, opts.URL(RoutePrefix+"/activity/"+key), nil)
+	if err != nil {
+		return activity, err
+	}
+	resp, err := opts.Client.Do(req)
 	if err != nil {
 		return activity, err
 	}

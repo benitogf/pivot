@@ -507,10 +507,13 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 	for _, k := range keys {
 		keyPaths = append(keyPaths, k.Path)
 	}
+	instanceCtx, instanceCancel := context.WithCancel(context.Background())
 	instance := &Instance{
 		ClusterURL:    pivotURL,
 		SyncedKeys:    keyPaths,
 		ExtraNodeURLs: config.ExtraNodeURLs,
+		ctx:           instanceCtx,
+		cancel:        instanceCancel,
 	}
 	instance.nodesCache = newNodesCache(server, config.NodesKey, instance.IsShutdown)
 
@@ -530,7 +533,7 @@ func Setup(server *ooo.Server, config Config) *ooo.Server {
 
 	// Create syncer pool for keys that need outbound sync
 	// Keys with Local=true or where server IS pivot won't have syncers
-	pool := newSyncerPool(client, keys, pivotURL, config.SSL, vvManager)
+	pool := newSyncerPool(instanceCtx, client, keys, pivotURL, config.SSL, vvManager)
 
 	// Create node health tracker
 	// NodeHealth is needed if server is pivot for ANY key (pure pivot or mixed role)
