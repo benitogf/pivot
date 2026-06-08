@@ -1202,17 +1202,15 @@ type StorageSyncCallback func(event storage.Event)
 // false and the callback runs its full path — that's how the callback
 // remains the source of truth for direct writes.
 // Two independent consumers recognize a handler-driven write, mirroring
-// pullTracker: the watch goroutine (Consume, to skip its bump+fanout)
-// and AfterWrite (ConsumeBumpSkip, to skip its synchronous bump because
-// the handler bumps explicitly). Each drains its own counter; a single
-// counter peeked by one and consumed by the other left a stale mark
-// whenever the watch goroutine never ran (a pivot-synced key in
-// NoBroadcastKeys, or a storage error before dispatch), which then
-// swallowed a later direct write's legitimate bump.
+// pullTracker: the watch goroutine (Consume, to skip fanout) and the VV
+// bump path (ConsumeBumpFallback). If AfterWriteOp is installed, it consumes
+// the fallback marker and bumps before storage callbacks can observe the write.
+// If no hook is installed, the handler consumes the still-present marker
+// after the write and performs the fallback bump.
 type HandlerWriteTracker struct {
 	mu          sync.Mutex
 	pending     map[string]int // consumed by the watch goroutine (fanout-skip)
-	bumpPending map[string]int // consumed by AfterWrite (bump-skip)
+	bumpPending map[string]int // consumed by AfterWriteOp or handler fallback
 }
 
 // NewHandlerWriteTracker creates an empty tracker.
@@ -1269,12 +1267,11 @@ func (t *HandlerWriteTracker) Consume(key string) bool {
 	return true
 }
 
-// ConsumeBumpSkip returns true and decrements the bump-skip count if a
-// mark is present (i.e. a handler will bump the VV for this write, so
-// AfterWrite must skip). Consumed by bumpVVForLocalWrite. Replaces the
-// earlier non-consuming Has peek — see the type doc for why consuming
-// matters.
-func (t *HandlerWriteTracker) ConsumeBumpSkip(key string) bool {
+// ConsumeBumpFallback returns true and decrements the fallback-bump count if a
+// handler mark is present. AfterWriteOp consumes this marker when it owns
+// the successful-write bump; the handler consumes it only when no hook ran.
+// Earlier non-consuming peeks leaked stale markers, so this must consume.
+func (t *HandlerWriteTracker) ConsumeBumpFallback(key string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.bumpPending[key] == 0 {

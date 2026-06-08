@@ -37,7 +37,7 @@ type Instance struct {
 	ExtraNodeURLs  []string                      // Additional node URLs (can be modified after Setup)
 	VVManager      *VVManager                    // Version vector manager (for both pivot and node servers)
 	configKeys     []Key                         // Configured keys from Setup; needed by the synchronous AfterWrite VV bump to find which base path scope to increment
-	handlerTracker *HandlerWriteTracker          // Same tracker SyncCallback consumes from; AfterWrite peeks it (non-consuming) to skip its bump when a handler will bump explicitly
+	handlerTracker *HandlerWriteTracker          // Same tracker SyncCallback consumes from; AfterWriteOp consumes handler fallback markers before bumping
 	attachedDBs    sync.Map                      // set of storage.Database -> struct{}; AfterWrite-driven sync bump is wired for these, so makeStorageSync's async bump must skip them to avoid double-counting
 	syncerPool     *syncerPool                   // Internal syncer pool for node servers (for testing hooks)
 	nodesCache     *nodesCache                   // Cache for NodesKey address list, invalidated by storage events
@@ -245,7 +245,7 @@ func (i *Instance) IsAttached(db storage.Database) bool {
 // pushed write as VVEqual — a permanent node↔pivot divergence. Consuming only
 // the mark matching this write's own operation closes that cross-op steal.
 //
-// Four cases skip the bump:
+// Three cases skip the bump:
 //
 //   - eventKey is a pivot-internal key (delete tombstones, VV storage,
 //     health, etc.) — these are pivot's own bookkeeping, not application
@@ -260,13 +260,12 @@ func (i *Instance) IsAttached(db storage.Database) bool {
 //     is merged into local via vvManager.set later; bumping our own
 //     counter on top would double-count.
 //
-//   - a handler has marked the key (HandlerWriteTracker.Has) — handlers
-//     bump explicitly after SetWithMeta returns, so AfterWrite would
-//     duplicate. The watch goroutine still Consumes the mark to gate
-//     the rest of SyncCallback; we only peek here.
+// Handler writes also bump here, synchronously. The hook consumes the
+// handler's fallback marker so the handler knows not to bump again after
+// SetWithMeta/Del returns.
 //
-// Direct user writes (db.Set / db.SetWithMeta on an attached storage)
-// hit none of these cases and bump here, synchronously.
+// Direct user writes (db.Set / db.SetWithMeta on an attached storage) hit none
+// of the skip cases and bump here, synchronously.
 func (i *Instance) bumpVVForLocalWrite(eventKey string, op string) {
 	if i.VVManager == nil {
 		return
@@ -274,8 +273,8 @@ func (i *Instance) bumpVVForLocalWrite(eventKey string, op string) {
 	if strings.HasPrefix(eventKey, StoragePrefix) {
 		return
 	}
-	if i.handlerTracker != nil && i.handlerTracker.ConsumeBumpSkip(eventKey) {
-		return
+	if i.handlerTracker != nil {
+		i.handlerTracker.ConsumeBumpFallback(eventKey)
 	}
 	var matched Key
 	found := false

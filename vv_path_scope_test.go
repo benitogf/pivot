@@ -117,6 +117,53 @@ func TestCallbackIncrementsAtPathScope(t *testing.T) {
 		"storage callback must increment path-scope VV on direct writes")
 }
 
+// TestAttachedHandlerAfterWriteObservesSynchronousVVBump pins the handler
+// hook-ordering contract pivot relies on for external storages. A caller
+// waiting on its AfterWrite callback must observe the VV bump already applied;
+// otherwise tests and peer pushes can see a committed write with an empty VV.
+func TestAttachedHandlerAfterWriteObservesSynchronousVVBump(t *testing.T) {
+	monotonic.Init()
+	dataDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	vvDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
+	require.NoError(t, vvDB.Start(storage.Options{}))
+	defer vvDB.Close()
+
+	vvm := NewVVManager(vvDB, LeaderID)
+	tracker := NewHandlerWriteTracker()
+	observedVV := make(chan VersionVector, 1)
+	instance := &Instance{
+		VVManager:      vvm,
+		configKeys:     []Key{{Path: "policies", Database: dataDB}},
+		handlerTracker: tracker,
+		SyncCallback:   func(storage.Event) {},
+	}
+
+	require.NoError(t, instance.Attach(dataDB, storage.Options{
+		AfterWrite: func(eventKey string) {
+			if eventKey == "policies" {
+				observedVV <- vvm.Get("policies")
+			}
+		},
+	}))
+	defer dataDB.Close()
+
+	handler := Set(dataDB, "policies", tracker, vvm, nil)
+	body := strings.NewReader(`{"created":1,"updated":1,"index":"policies","path":"policies","data":"eyJ2IjoicGhhc2UtMSJ9"}`)
+	req := httptest.NewRequest("POST", "/_pivot/pivot/policies", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler(w, req)
+	require.Equal(t, 200, w.Code)
+
+	select {
+	case vv := <-observedVV:
+		require.Equal(t, int64(1), vv[LeaderID],
+			"AfterWrite must not fire before the synchronous VV bump; got %v", vv)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for AfterWrite callback")
+	}
+}
+
 // TestHandlerIncrementMatchesActivityScope pins the symmetry: every
 // handler-driven write produces a VV that Activity exposes 1:1. If a
 // future change re-introduces an item-scope increment, OR if the

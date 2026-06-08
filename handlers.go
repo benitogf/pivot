@@ -91,10 +91,18 @@ func GetSingle(db storage.Database, path string) func(w http.ResponseWriter, r *
 // peer woken by the trigger sees the bumped VV, not a stale one.
 type PostWriteFunc func(itemKey, op, originatorPeer string)
 
+func handlerNeedsFallbackVVBump(handlerTracker *HandlerWriteTracker, itemKey string) bool {
+	if handlerTracker == nil {
+		return true
+	}
+	return handlerTracker.ConsumeBumpFallback(itemKey)
+}
+
 // Set set data on the pivot instance
-// handlerTracker records "a handler will own the post-write work for this
-// key" so the async storage callback skips its bump+fanout for this event;
-// the handler does both, in order, after the storage write succeeds.
+// handlerTracker records "a handler will own the post-write fanout for this
+// key" so the async storage callback skips its fanout for this event.
+// Attached storages bump through AfterWriteOp; unattached storages fall back
+// to the handler after the storage write succeeds.
 // vvManager is the version vector manager for pivot servers (nil for nodes).
 // postWrite, if non-nil, runs synchronously after a successful VV bump to
 // fan out the change to peers. May be nil in tests that don't need fanout.
@@ -163,7 +171,9 @@ func Set(db storage.Database, path string, handlerTracker *HandlerWriteTracker, 
 		// complete BEFORE we trigger peers — otherwise a peer woken by
 		// the trigger could read /activity and see the pre-bump VV.
 		if vvManager != nil {
-			vvManager.increment(path)
+			if handlerNeedsFallbackVVBump(handlerTracker, itemKey) {
+				vvManager.increment(path)
+			}
 			// Merge-on-receive: integrate the originator's peer counters
 			// into local VV. Without this, each node's VV is just
 			// {"my-id": counter} and cross-node Compare always returns
@@ -254,7 +264,9 @@ func Delete(db storage.Database, path string, handlerTracker *HandlerWriteTracke
 		// reads a fresh VV. Merge-on-receive integrates the originator's
 		// peer counters into local VV.
 		if vvManager != nil {
-			vvManager.increment(path)
+			if handlerNeedsFallbackVVBump(handlerTracker, itemKey) {
+				vvManager.increment(path)
+			}
 			if peerVV, ok := decodeVVHeader(r.Header.Get(VVHeader)); ok {
 				vvManager.set(path, peerVV)
 			}

@@ -477,7 +477,7 @@ func TestDeleteHappyPathStillCommitsBoth(t *testing.T) {
 	require.Equal(t, deleteTS, strings.TrimSpace(string(tomb.Data)), "tombstone payload must be the delete timestamp")
 }
 
-// bumpPendingLen mirrors pendingLen for the bump-skip counter so tests
+// bumpPendingLen mirrors pendingLen for the fallback-bump counter so tests
 // can assert it drains independently.
 func (t *HandlerWriteTracker) bumpPendingLen() int {
 	t.mu.Lock()
@@ -486,11 +486,10 @@ func (t *HandlerWriteTracker) bumpPendingLen() int {
 }
 
 // TestHandlerWriteTracker_DualCounterConsumeSemantics pins that Mark
-// sets BOTH the fanout-skip (pending) and bump-skip (bumpPending)
+// sets BOTH the fanout-skip (pending) and fallback-bump (bumpPending)
 // counters, and each is consumed by exactly one consumer without
-// depriving the other. The earlier Has() peek was non-consuming, so a
-// stale mark could silently swallow a later direct write's VV bump when
-// the watch goroutine never ran to drain it.
+// depriving the other. The fallback marker is consumed so the handler
+// can tell whether AfterWriteOp already performed the VV bump.
 func TestHandlerWriteTracker_DualCounterConsumeSemantics(t *testing.T) {
 	tr := NewHandlerWriteTracker()
 	const k = "things/abc"
@@ -498,18 +497,17 @@ func TestHandlerWriteTracker_DualCounterConsumeSemantics(t *testing.T) {
 	// Mark once: both counters carry the key.
 	tr.Mark(k)
 	require.Equal(t, 1, tr.pendingLen(), "Mark must set fanout-skip counter")
-	require.Equal(t, 1, tr.bumpPendingLen(), "Mark must set bump-skip counter")
+	require.Equal(t, 1, tr.bumpPendingLen(), "Mark must set fallback-bump counter")
 
-	// AfterWrite consumes its own counter. The watch goroutine's
+	// AfterWriteOp consumes its own counter. The watch goroutine's
 	// counter is untouched — the two consumers don't deprive each other.
-	require.True(t, tr.ConsumeBumpSkip(k), "first ConsumeBumpSkip sees the mark")
-	require.Equal(t, 0, tr.bumpPendingLen(), "ConsumeBumpSkip drains bump-skip counter")
+	require.True(t, tr.ConsumeBumpFallback(k), "first ConsumeBumpFallback sees the mark")
+	require.Equal(t, 0, tr.bumpPendingLen(), "ConsumeBumpFallback drains fallback-bump counter")
 	require.Equal(t, 1, tr.pendingLen(), "fanout-skip counter unaffected by bump consume")
 
-	// Consuming, not peeking: a second consume returns false. This is
-	// the property that prevents a stale mark from swallowing a later
-	// direct write's bump.
-	require.False(t, tr.ConsumeBumpSkip(k), "second ConsumeBumpSkip must return false (consumed, not peeked)")
+	// Consuming, not peeking: a second consume returns false. This tells
+	// the handler no fallback bump is needed.
+	require.False(t, tr.ConsumeBumpFallback(k), "second ConsumeBumpFallback must return false")
 
 	// Watch goroutine consumes its counter independently.
 	require.True(t, tr.Consume(k), "Consume sees the fanout-skip mark")
@@ -519,8 +517,7 @@ func TestHandlerWriteTracker_DualCounterConsumeSemantics(t *testing.T) {
 
 // TestHandlerWriteTracker_UnmarkClearsBothCounters pins that the error
 // path (handler bails after Mark but before the storage write fires an
-// event) drains BOTH counters — otherwise a leaked bump-skip mark would
-// swallow a later direct write's VV bump for the same key.
+// event) drains BOTH counters.
 func TestHandlerWriteTracker_UnmarkClearsBothCounters(t *testing.T) {
 	tr := NewHandlerWriteTracker()
 	const k = "things/abc"
@@ -528,10 +525,10 @@ func TestHandlerWriteTracker_UnmarkClearsBothCounters(t *testing.T) {
 	tr.Mark(k)
 	tr.Unmark(k)
 	require.Equal(t, 0, tr.pendingLen(), "Unmark must clear fanout-skip counter")
-	require.Equal(t, 0, tr.bumpPendingLen(), "Unmark must clear bump-skip counter")
+	require.Equal(t, 0, tr.bumpPendingLen(), "Unmark must clear fallback-bump counter")
 
 	// After Unmark, neither consumer sees a mark — a subsequent direct
 	// write to the same key will correctly run its full path.
-	require.False(t, tr.ConsumeBumpSkip(k), "no bump-skip mark after Unmark")
+	require.False(t, tr.ConsumeBumpFallback(k), "no fallback-bump mark after Unmark")
 	require.False(t, tr.Consume(k), "no fanout-skip mark after Unmark")
 }

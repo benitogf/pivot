@@ -619,10 +619,10 @@ func SetupWithError(server *ooo.Server, config Config) (*ooo.Server, error) {
 
 	// Handler-write tracker is created on every server. The Set/Delete
 	// handlers Mark before each storage write so the async storage event
-	// callback knows to skip its own bump+fanout for handler-driven events.
+	// callback knows to skip its own fanout for handler-driven events.
 	handlerTracker := NewHandlerWriteTracker()
-	// AfterWrite (sync-bump path) needs to peek the same tracker so it
-	// skips its bump when a handler will bump explicitly post-SetWithMeta.
+	// AfterWriteOp consumes the same tracker's fallback-bump marker so the
+	// handler can tell whether the successful-write hook already bumped.
 	instance.handlerTracker = handlerTracker
 	// AfterWrite also matches eventKey against the configured Keys to find
 	// the base path scope to increment.
@@ -738,12 +738,12 @@ func SetupWithError(server *ooo.Server, config Config) (*ooo.Server, error) {
 	// synchronous VV bump on the writer's goroutine, closing the
 	// VV-lag race where /activity could return a pre-bump VV between
 	// a write committing and the watch goroutine processing the event.
-	// The op-aware hook lets bumpVVForLocalWrite consume only the
-	// bump-skip mark matching the write's operation (set vs del), so a
-	// pulled delete's mark can't suppress a concurrent local set's bump.
+	// The op-aware hook lets bumpVVForLocalWrite consume only the pull mark
+	// matching the write's operation (set vs del), so a pulled delete's mark
+	// can't suppress a concurrent local set's bump.
 	// instance.bumpVVForLocalWrite handles internal-prefix skip,
 	// configured-key matching, pull-driven skip via the pullTracker
-	// consume, and handler-write skip via the HandlerWriteTracker peek.
+	// consume, and handler fallback-marker consumption via HandlerWriteTracker.
 	server.AfterWriteOp = instance.bumpVVForLocalWrite
 	// Record server.Storage as sync-bump-installed so makeStorageSync's
 	// async-path bump skips events from it (the AfterWrite above already
