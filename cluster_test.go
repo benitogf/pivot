@@ -84,7 +84,15 @@ func Authorize(t *testing.T, server *ooo.Server, account string) string {
 }
 
 // FakeServer creates a server using storage-level synchronization via pivot.Setup.
-func FakeServer(t *testing.T, clusterURL string) *ooo.Server {
+//
+// onPolicyWrite (if non-nil) fires once per committed write to the "policies"
+// key on this server's auth storage. Policies are served through custom HTTP
+// routes, not a websocket-broadcast path, so unlike things/settings/items they
+// deliver nothing to a subscription — the storage write is the only
+// deterministic completion signal a test can wait on. Bookkeeping writes
+// (the StoragePrefix tombstone) are excluded so the count stays exactly one
+// per logical policies mutation per side.
+func FakeServer(t *testing.T, clusterURL string, onPolicyWrite func()) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -128,10 +136,17 @@ func FakeServer(t *testing.T, clusterURL string) *ooo.Server {
 	// Setup pivot - modifies server (routes, OnStorageEvent, BeforeRead)
 	pivot.Setup(server, config)
 
-	// Attach the external auth storage for pivot synchronization. No AfterWrite
-	// is needed here: tests synchronize on observed state convergence (see
-	// requireConverged), not on storage-callback counts.
-	err := pivot.GetInstance(server).Attach(authStorage)
+	// Attach the external auth storage for pivot synchronization. The AfterWrite
+	// signals committed "policies" writes so a test can wait on them
+	// deterministically — policies have no websocket subscription to count
+	// deliveries on (custom HTTP routes), so the storage write is the signal.
+	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{
+		AfterWrite: func(key string) {
+			if key == "policies" && onPolicyWrite != nil {
+				onPolicyWrite()
+			}
+		},
+	})
 	require.NoError(t, err)
 
 	server.OpenFilter("things/*")
@@ -182,32 +197,6 @@ func FakeServer(t *testing.T, clusterURL string) *ooo.Server {
 	return server
 }
 
-// requireConverged polls cond until it holds or the deadline elapses, failing
-// the test with msg if it never converges. This replaces the old exact-count
-// WaitGroup synchronization: the number of async events (websocket deliveries,
-// storage AfterWrite callbacks) per logical operation is NOT deterministic in a
-// cross-cluster sync (coalescing, push-vs-pull, duplicate deliveries, and
-// delete-of-absent no-ops that emit no event), so counting them is inherently
-// flaky and a missed count hangs to the package deadline. Waiting for the
-// observable end-state instead is robust and fails fast with a clear message.
-func requireConverged(t *testing.T, msg string, cond func() bool, diag ...func() string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if cond() {
-			return
-		}
-		if time.Now().After(deadline) {
-			extra := ""
-			if len(diag) > 0 && diag[0] != nil {
-				extra = " | " + diag[0]()
-			}
-			t.Fatalf("convergence timeout: %s%s", msg, extra)
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
 // settingsPresent reports whether "settings" currently reads successfully on the
 // given side (non-failing — safe to call from a polling loop).
 func (ops *syncTestOps) settingsPresent(fromPivot bool) bool {
@@ -225,58 +214,6 @@ func (ops *syncTestOps) settingsPresent(fromPivot bool) bool {
 	}
 	_, err := ooo.Get[Settings](server, "settings")
 	return err == nil
-}
-
-// tryGetItem reads an item by full key on the given side without failing the
-// test (returns ok=false on any error). Diagnostic only.
-func (ops *syncTestOps) tryGetItem(fromPivot bool, fullKey string) (Item, bool) {
-	if ops.useRemote {
-		cfg := ops.nodeCfg
-		if fromPivot {
-			cfg = ops.pivotCfg
-		}
-		r, err := ooio.RemoteGet[Item](cfg, fullKey)
-		if err != nil {
-			return Item{}, false
-		}
-		return r.Data, true
-	}
-	server := ops.nodeServer
-	if fromPivot {
-		server = ops.pivotServer
-	}
-	r, err := ooo.Get[Item](server, fullKey)
-	if err != nil {
-		return Item{}, false
-	}
-	return r.Data, true
-}
-
-// tryGetThing reads things/<id> on the given side without failing the test
-// (returns ok=false on any error). Used for diagnostics that distinguish a sync
-// failure (storage missing the value) from a websocket-delivery gap (storage
-// has it but the subscription slice is stale).
-func (ops *syncTestOps) tryGetThing(fromPivot bool, id string) (Thing, bool) {
-	if ops.useRemote {
-		cfg := ops.nodeCfg
-		if fromPivot {
-			cfg = ops.pivotCfg
-		}
-		r, err := ooio.RemoteGet[Thing](cfg, "things/"+id)
-		if err != nil {
-			return Thing{}, false
-		}
-		return r.Data, true
-	}
-	server := ops.nodeServer
-	if fromPivot {
-		server = ops.pivotServer
-	}
-	r, err := ooo.Get[Thing](server, "things/"+id)
-	if err != nil {
-		return Thing{}, false
-	}
-	return r.Data, true
 }
 
 // policiesValue returns the parsed policies and whether GET /policies returned
@@ -598,9 +535,17 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	var pivotSpecialItems, nodeSpecialItems []client.Meta[Item]
 	var mu sync.Mutex
 
-	pivotServer := FakeServer(t, "")
+	// policyWrites counts committed "policies" writes across both servers.
+	// Policies have no websocket subscription (custom HTTP routes), so the
+	// storage write — wired via FakeServer's onPolicyWrite — is the
+	// deterministic completion signal. Each policies mutation writes once per
+	// side, so the policies steps below arm policyWrites.Add(2).
+	var policyWrites sync.WaitGroup
+	onPolicyWrite := func() { policyWrites.Done() }
+
+	pivotServer := FakeServer(t, "", onPolicyWrite)
 	defer pivotServer.Close(os.Interrupt)
-	nodeServer := FakeServer(t, pivotServer.Address)
+	nodeServer := FakeServer(t, pivotServer.Address, onPolicyWrite)
 	defer nodeServer.Close(os.Interrupt)
 
 	ops := &syncTestOps{
@@ -631,29 +576,45 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	ctx := t.Context()
 
 	// Subscribe to things, settings, and items on both servers. Each OnMessage
-	// records the latest delivered state under mu; the test then waits for that
-	// state to CONVERGE (requireConverged) rather than counting per-operation
-	// deliveries — the number of ws events per logical op is not deterministic
-	// across the cluster (coalescing, push-vs-pull, delete-of-absent no-ops), so
-	// counting them is what made the old test flaky.
+	// records the latest delivered state and signals a WaitGroup — both under mu.
 	//
-	// An establishment barrier IS still required before the first write: a
-	// subscription delivers an empty initial snapshot at connect, and a write
-	// that broadcasts before the subscription is fully live is missed and never
-	// re-delivered, leaving its slice permanently stale. wsReady waits for each
-	// sub's initial snapshot — a deterministic count of 8, independent of any
-	// test write — so every sub is live before writes begin. Each established()
-	// closure fires its Done exactly once (on the sub's first delivery).
+	// Two deterministic barriers replace the old convergence polling:
+	//
+	//   - wsReady (count 8): a subscription's FIRST delivery is its empty
+	//     initial snapshot at connect. A write that broadcasts before a
+	//     subscription is live is missed and never re-delivered, so every sub
+	//     must be live before the first write. The count is exactly 8 — one per
+	//     subscription, independent of any test write.
+	//
+	//   - deliv: every SUBSEQUENT delivery (one caused by a test operation).
+	//     With the version-vector fix in this branch, each logical mutation
+	//     produces exactly one delivery per subscribed side — the duplicate
+	//     push-vs-pull deliveries that once made counts non-deterministic are
+	//     gone. So each operation below arms deliv.Add(2) (the pivot sub + the
+	//     node sub), triggers, and Waits. Counts are exact; a wrong count
+	//     surfaces as a hung Wait — the signal to fix the count, per
+	//     /testing-go-backend-async (no sleeps, no polling, no time.After).
+	//
+	// delivered() returns a per-subscription closure (invoked under mu) that
+	// routes the first delivery to wsReady and every later one to deliv.
 	var wsReady sync.WaitGroup
 	wsReady.Add(8)
-	established := func() func() {
-		var once sync.Once
-		return func() { once.Do(wsReady.Done) }
+	var deliv sync.WaitGroup
+	delivered := func() func() {
+		established := false
+		return func() {
+			if established {
+				deliv.Done()
+				return
+			}
+			established = true
+			wsReady.Done()
+		}
 	}
-	estPivotThings, estNodeThings := established(), established()
-	estNodeSettings, estPivotSettings := established(), established()
-	estPivotItems, estNodeItems := established(), established()
-	estPivotSpecial, estNodeSpecial := established(), established()
+	onPivotThings, onNodeThings := delivered(), delivered()
+	onNodeSettings, onPivotSettings := delivered(), delivered()
+	onPivotItems, onNodeItems := delivered(), delivered()
+	onPivotSpecial, onNodeSpecial := delivered(), delivered()
 
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -663,8 +624,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) {
 		mu.Lock()
 		pivotThings = data
+		onPivotThings()
 		mu.Unlock()
-		estPivotThings()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:    ctx,
@@ -673,8 +634,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 		client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) {
 			mu.Lock()
 			nodeThings = data
+			onNodeThings()
 			mu.Unlock()
-			estNodeThings()
 		}})
 	go client.Subscribe(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -684,8 +645,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		nodeSettings = []client.Meta[Settings]{data}
+		onNodeSettings()
 		mu.Unlock()
-		estNodeSettings()
 	}})
 	go client.Subscribe(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -695,8 +656,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		pivotSettings = []client.Meta[Settings]{data}
+		onPivotSettings()
 		mu.Unlock()
-		estPivotSettings()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -706,8 +667,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		pivotItems = data
+		onPivotItems()
 		mu.Unlock()
-		estPivotItems()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -717,8 +678,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		nodeItems = data
+		onNodeItems()
 		mu.Unlock()
-		estNodeItems()
 	}})
 	// Multi-glob subscription with special characters in the path
 	// segments — covers `-` in cat-1, `.` in sub.v2, and (via the leaf
@@ -731,8 +692,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat-1/sub.v2/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		pivotSpecialItems = data
+		onPivotSpecial()
 		mu.Unlock()
-		estPivotSpecial()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -742,57 +703,37 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat-1/sub.v2/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		nodeSpecialItems = data
+		onNodeSpecial()
 		mu.Unlock()
-		estNodeSpecial()
 	}})
 
 	// Wait for every subscription's initial snapshot so all subs are live
-	// before the first write (closes the connect→broadcast race above).
-	wsEstablished := make(chan struct{})
-	go func() {
-		wsReady.Wait()
-		close(wsEstablished)
-	}()
-	select {
-	case <-wsEstablished:
-	case <-time.After(20 * time.Second):
-		t.Fatal("subscriptions did not deliver initial snapshots within 20s")
-	}
+	// before the first write (closes the connect→broadcast race above). A
+	// plain WaitGroup of a known count — no timeout wrapper.
+	wsReady.Wait()
 
-	// diagThings reports, on a convergence timeout, the websocket-slice view vs.
-	// the authoritative storage view — so a sync failure (storage wrong) is
-	// distinguishable from a websocket-delivery gap (storage right, slice stale).
-	diagThings := func(id string) string {
-		mu.Lock()
-		var pIdx, nIdx []string
-		for _, m := range pivotThings {
-			pIdx = append(pIdx, m.Index)
-		}
-		for _, m := range nodeThings {
-			nIdx = append(nIdx, m.Index)
-		}
-		mu.Unlock()
-		pGet, nGet := "absent", "absent"
-		if _, ok := ops.tryGetThing(true, id); ok {
-			pGet = "present"
-		}
-		if _, ok := ops.tryGetThing(false, id); ok {
-			nGet = "present"
-		}
-		return fmt.Sprintf("things slice pivot=%v node=%v; storage[%s] pivot=%s node=%s", pIdx, nIdx, id, pGet, nGet)
+	// converged asserts the post-operation state holds. It runs AFTER the
+	// operation's deliv.Wait()/policyWrites.Wait() returns, so the deliveries it
+	// checks have already arrived — it verifies the delivered CONTENT (value,
+	// length), not a race. cond locks mu itself where it reads shared slices.
+	converged := func(msg string, cond func() bool) {
+		t.Helper()
+		require.True(t, cond(), msg)
 	}
 
 	// Get node address for Thing creation
 	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
 	nodePortInt, _ := strconv.Atoi(nodePort)
 
-	// Push thing to pivot - converges on both servers' things/* subscriptions.
+	// Push thing to pivot - one delivery to each things/* sub (pivot + node).
+	deliv.Add(2)
 	thingID := ops.pushThing(t, true, Thing{IP: nodeIP, Port: nodePortInt, On: false})
-	requireConverged(t, "push thing to pivot should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("push thing to pivot should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotThings) == 1 && len(nodeThings) == 1
-	}, func() string { return diagThings(thingID) })
+	})
 
 	mu.Lock()
 	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing")
@@ -817,9 +758,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 		return false, false
 	}
 
-	// Modify thing on pivot - both subs should converge to On=true.
+	// Modify thing on pivot - one delivery to each sub, both reach On=true.
+	deliv.Add(2)
 	ops.setThing(t, true, thingID, Thing{IP: nodeIP, Port: nodePortInt, On: true})
-	requireConverged(t, "thing On=true update should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("thing On=true update should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		_, pon := thingOn(pivotThings, thingID)
@@ -833,18 +776,22 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	nodeThing = ops.getThing(t, false, thingID)
 	require.Equal(t, true, nodeThing.On)
 
-	// Set settings on node - converges to DayEpoch=1 on both subs.
+	// Set settings on node - one delivery to each settings sub (DayEpoch=1).
+	deliv.Add(2)
 	ops.setSettings(t, false, Settings{DayEpoch: 1})
-	requireConverged(t, "settings=1 should sync to node+pivot", func() bool {
+	deliv.Wait()
+	converged("settings=1 should sync to node+pivot", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(nodeSettings) > 0 && nodeSettings[0].Data.DayEpoch == 1 &&
 			len(pivotSettings) > 0 && pivotSettings[0].Data.DayEpoch == 1
 	})
 
-	// Set settings on pivot - converges to DayEpoch=9 on both subs.
+	// Set settings on pivot - one delivery to each settings sub (DayEpoch=9).
+	deliv.Add(2)
 	ops.setSettings(t, true, Settings{DayEpoch: 9})
-	requireConverged(t, "settings=9 should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("settings=9 should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotSettings) > 0 && pivotSettings[0].Data.DayEpoch == 9 &&
@@ -857,17 +804,21 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	nodeSettingsObj := ops.getSettings(t, false)
 	require.Equal(t, 9, nodeSettingsObj.DayEpoch)
 
-	// Push a second thing to pivot - converges to 2 things on both.
+	// Push a second thing to pivot - one delivery to each sub (now 2 things).
+	deliv.Add(2)
 	thingID2 := ops.pushThing(t, true, Thing{IP: "10.0.0.1", Port: 0, On: true})
-	requireConverged(t, "second thing should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("second thing should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotThings) == 2 && len(nodeThings) == 2
 	})
 
-	// Delete from pivot - converges back to 1 thing (thingID) on both.
+	// Delete from pivot - one delivery to each sub (back to 1 thing, thingID).
+	deliv.Add(2)
 	ops.deleteThing(t, true, thingID2)
-	requireConverged(t, "thingID2 delete should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("thingID2 delete should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotThings) == 1 && pivotThings[0].Index == thingID &&
@@ -885,30 +836,36 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, thingID, nodeThings[0].Index)
 	mu.Unlock()
 
-	// Push a third thing to node - converges to 2 things on both.
+	// Push a third thing to node - one delivery to each sub (now 2 things).
+	deliv.Add(2)
 	thingID3 := ops.pushThing(t, false, Thing{IP: "172.16.0.1", Port: 0, On: false})
-	requireConverged(t, "third thing (node push) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("third thing (node push) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotThings) == 2 && len(nodeThings) == 2
 	})
 
-	// Delete from node - converges back to 1 thing (thingID) on both.
+	// Delete from node - one delivery to each sub (back to 1 thing, thingID).
+	deliv.Add(2)
 	ops.deleteThing(t, false, thingID3)
-	requireConverged(t, "thingID3 delete (node) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("thingID3 delete (node) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotThings) == 1 && pivotThings[0].Index == thingID &&
 			len(nodeThings) == 1 && nodeThings[0].Index == thingID
-	}, func() string { return diagThings(thingID3) })
+	})
 
 	// Verify deletion
 	ops.getThingExpectError(t, false, thingID3, "thingID3 should be deleted from node")
 	ops.getThingExpectError(t, true, thingID3, "thingID3 should be deleted from pivot after sync")
 
-	// Update thing on node - converges to On=false on both subs.
+	// Update thing on node - one delivery to each sub, both reach On=false.
+	deliv.Add(2)
 	ops.setThing(t, false, thingID, Thing{IP: nodeIP, Port: nodePortInt, On: false})
-	requireConverged(t, "thing On=false update (node) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("thing On=false update (node) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		pf, pon := thingOn(pivotThings, thingID)
@@ -922,9 +879,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, nodePortInt, pivotThing.Port)
 	require.Equal(t, false, pivotThing.On)
 
-	// Delete settings from node - converges to absent on both sides.
+	// Delete settings from node - one delivery to each sub (now absent).
+	deliv.Add(2)
 	ops.deleteSettings(t, false)
-	requireConverged(t, "settings delete (node) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("settings delete (node) should sync to pivot+node", func() bool {
 		return !ops.settingsPresent(false) && !ops.settingsPresent(true)
 	})
 
@@ -932,9 +891,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	ops.getSettingsExpectError(t, false, "settings should be deleted from node")
 	ops.getSettingsExpectError(t, true, "settings should be deleted from pivot after sync")
 
-	// Set settings on pivot after delete - converges to DayEpoch=42 on both.
+	// Set settings on pivot after delete - one delivery to each sub (DayEpoch=42).
+	deliv.Add(2)
 	ops.setSettings(t, true, Settings{DayEpoch: 42})
-	requireConverged(t, "settings=42 should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("settings=42 should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotSettings) > 0 && pivotSettings[0].Data.DayEpoch == 42 &&
@@ -945,9 +906,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	nodeSettingsObj = ops.getSettings(t, false)
 	require.Equal(t, 42, nodeSettingsObj.DayEpoch)
 
-	// Delete settings from pivot - converges to absent on both sides.
+	// Delete settings from pivot - one delivery to each sub (now absent).
+	deliv.Add(2)
 	ops.deleteSettings(t, true)
-	requireConverged(t, "settings delete (pivot) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("settings delete (pivot) should sync to pivot+node", func() bool {
 		return !ops.settingsPresent(true) && !ops.settingsPresent(false)
 	})
 
@@ -969,9 +932,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 		return !ok
 	}
 
-	// Set policies on pivot - converges on both sides.
+	// Set policies on pivot - one authStorage write per side (no ws sub).
+	policyWrites.Add(2)
 	ops.setPolicies(t, true, Policies{MaxRetries: 3, Allowed: []string{"read", "write"}})
-	requireConverged(t, "policies(set,pivot) should sync to pivot+node", func() bool {
+	policyWrites.Wait()
+	converged("policies(set,pivot) should sync to pivot+node", func() bool {
 		return policiesMaxRetries(true, 3) && policiesMaxRetries(false, 3)
 	})
 
@@ -983,9 +948,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, 3, nodePolicies.MaxRetries)
 	require.Equal(t, []string{"read", "write"}, nodePolicies.Allowed)
 
-	// Update policies on node - converges on both sides.
+	// Update policies on node - one authStorage write per side.
+	policyWrites.Add(2)
 	ops.setPolicies(t, false, Policies{MaxRetries: 5, Allowed: []string{"admin"}})
-	requireConverged(t, "policies(update,node) should sync to pivot+node", func() bool {
+	policyWrites.Wait()
+	converged("policies(update,node) should sync to pivot+node", func() bool {
 		return policiesMaxRetries(true, 5) && policiesMaxRetries(false, 5)
 	})
 
@@ -997,9 +964,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, 5, nodePolicies.MaxRetries)
 	require.Equal(t, []string{"admin"}, nodePolicies.Allowed)
 
-	// Delete policies from pivot - converges to absent on both sides.
+	// Delete policies from pivot - one authStorage write per side (now absent).
+	policyWrites.Add(2)
 	ops.deletePolicies(t, true)
-	requireConverged(t, "policies(delete,pivot) should sync to pivot+node", func() bool {
+	policyWrites.Wait()
+	converged("policies(delete,pivot) should sync to pivot+node", func() bool {
 		return policiesAbsent(true) && policiesAbsent(false)
 	})
 
@@ -1007,14 +976,12 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	ops.getPoliciesExpectError(t, true, "policies should be deleted from pivot")
 	ops.getPoliciesExpectError(t, false, "policies should be deleted from node after sync")
 
-	// Set policies on node after delete - converges on both sides.
+	// Set policies on node after delete - one authStorage write per side.
+	policyWrites.Add(2)
 	ops.setPolicies(t, false, Policies{MaxRetries: 10, Allowed: []string{"guest"}})
-	requireConverged(t, "policies(set-after-delete,node) should sync to pivot+node", func() bool {
+	policyWrites.Wait()
+	converged("policies(set-after-delete,node) should sync to pivot+node", func() bool {
 		return policiesMaxRetries(true, 10) && policiesMaxRetries(false, 10)
-	}, func() string {
-		p, pok := ops.policiesValue(true)
-		n, nok := ops.policiesValue(false)
-		return fmt.Sprintf("pivot{ok=%v mr=%d} node{ok=%v mr=%d}", pok, p.MaxRetries, nok, n.MaxRetries)
 	})
 
 	// Verify policies synced to pivot
@@ -1022,9 +989,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, 10, pivotPolicies.MaxRetries)
 	require.Equal(t, []string{"guest"}, pivotPolicies.Allowed)
 
-	// Delete policies from node - converges to absent on both sides.
+	// Delete policies from node - one authStorage write per side (now absent).
+	policyWrites.Add(2)
 	ops.deletePolicies(t, false)
-	requireConverged(t, "policies(delete,node) should sync to pivot+node", func() bool {
+	policyWrites.Wait()
+	converged("policies(delete,node) should sync to pivot+node", func() bool {
 		return policiesAbsent(false) && policiesAbsent(true)
 	})
 
@@ -1046,37 +1015,36 @@ func testClusterSync(t *testing.T, useRemote bool) {
 		return false
 	}
 
-	// Push item to pivot - converges to 1 item ("p1") on both.
+	// Push item to pivot - one delivery to each items sub (now 1 item "p1").
+	deliv.Add(2)
 	itemID := ops.pushItem(t, true, "items/cat/sub/*", Item{Name: "p1", Value: 1})
-	requireConverged(t, "item p1 (pivot push) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("item p1 (pivot push) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotItems) == 1 && pivotItems[0].Data.Name == "p1" &&
 			len(nodeItems) == 1 && nodeItems[0].Data.Name == "p1"
 	})
 
-	// Push item from node - converges to 2 items on both.
+	// Push item from node - one delivery to each items sub (now 2 items).
+	deliv.Add(2)
 	itemID2 := ops.pushItem(t, false, "items/cat/sub/*", Item{Name: "p2", Value: 2})
-	requireConverged(t, "item p2 (node push) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("item p2 (node push) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotItems) == 2 && len(nodeItems) == 2
 	})
 
-	// Update item on pivot - converges to the new name on both.
+	// Update item on pivot - one delivery to each items sub (new name).
+	deliv.Add(2)
 	ops.setItem(t, true, itemID, Item{Name: "p1-updated", Value: 10})
-	requireConverged(t, "item p1 update (pivot) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("item p1 update (pivot) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return itemNamed(pivotItems, key.LastIndex(itemID), "p1-updated") &&
 			itemNamed(nodeItems, key.LastIndex(itemID), "p1-updated")
-	}, func() string {
-		mu.Lock()
-		pn, nn := itemNamed(pivotItems, key.LastIndex(itemID), "p1-updated"), itemNamed(nodeItems, key.LastIndex(itemID), "p1-updated")
-		mu.Unlock()
-		pv, _ := ops.tryGetItem(true, itemID)
-		nv, _ := ops.tryGetItem(false, itemID)
-		return fmt.Sprintf("slice pivot=%v node=%v; storage pivot.name=%q node.name=%q", pn, nn, pv.Name, nv.Name)
 	})
 
 	mu.Lock()
@@ -1096,9 +1064,11 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 	mu.Unlock()
 
-	// Update item from node - converges to the new name on both.
+	// Update item from node - one delivery to each items sub (new name).
+	deliv.Add(2)
 	ops.setItem(t, false, itemID2, Item{Name: "p2-updated", Value: 20})
-	requireConverged(t, "item p2 update (node) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("item p2 update (node) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return itemNamed(pivotItems, key.LastIndex(itemID2), "p2-updated") &&
@@ -1122,18 +1092,22 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 	mu.Unlock()
 
-	// Delete item from pivot - converges to 1 item ("p2-updated") on both.
+	// Delete item from pivot - one delivery to each sub (now 1 item "p2-updated").
+	deliv.Add(2)
 	ops.deleteItem(t, true, itemID)
-	requireConverged(t, "item p1 delete (pivot) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("item p1 delete (pivot) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotItems) == 1 && pivotItems[0].Data.Name == "p2-updated" &&
 			len(nodeItems) == 1 && nodeItems[0].Data.Name == "p2-updated"
 	})
 
-	// Delete item from node - converges to 0 items on both.
+	// Delete item from node - one delivery to each items sub (now 0 items).
+	deliv.Add(2)
 	ops.deleteItem(t, false, itemID2)
-	requireConverged(t, "item p2 delete (node) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("item p2 delete (node) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotItems) == 0 && len(nodeItems) == 0
@@ -1169,15 +1143,20 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	// triggered node pulls via /pivot/things which serves entries whose
 	// indexes now legally contain hyphens, dots, and underscores).
 	for _, id := range specialIDs {
+		// things/<special-id> writes land on the things/* subs (pivot + node).
+		deliv.Add(2)
 		ops.setThing(t, true, id, Thing{IP: "10.1.1.1", Port: 0, On: true})
-		requireConverged(t, fmt.Sprintf("things/%s (pivot set) should sync to pivot+node", id), func() bool {
+		deliv.Wait()
+		converged(fmt.Sprintf("things/%s (pivot set) should sync to pivot+node", id), func() bool {
 			mu.Lock()
 			defer mu.Unlock()
 			return findThing(pivotThings, id) && findThing(nodeThings, id)
 		})
 
+		deliv.Add(2)
 		ops.deleteThing(t, true, id)
-		requireConverged(t, fmt.Sprintf("things/%s delete should sync to pivot+node", id), func() bool {
+		deliv.Wait()
+		converged(fmt.Sprintf("things/%s delete should sync to pivot+node", id), func() bool {
 			mu.Lock()
 			defer mu.Unlock()
 			return !findThing(pivotThings, id) && !findThing(nodeThings, id)
@@ -1192,8 +1171,10 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	specialItemKey := "items/cat-1/sub.v2/file_name"
 
 	// Pivot-side set: covers /pivot fanout → node pull on a special path.
+	deliv.Add(2)
 	ops.setItem(t, true, specialItemKey, Item{Name: "special-1", Value: 100})
-	requireConverged(t, "special item (pivot set) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("special item (pivot set) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotSpecialItems) == 1 && pivotSpecialItems[0].Data.Name == "special-1" &&
@@ -1204,8 +1185,10 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	// node→leader POST URL /pivot/items/cat-1/sub.v2/file_name. The pivot
 	// Set handler accepts the path, writes locally, and the node sees the
 	// confirmation via its WS sub.
+	deliv.Add(2)
 	ops.setItem(t, false, specialItemKey, Item{Name: "special-2", Value: 200})
-	requireConverged(t, "special item (node update) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("special item (node update) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotSpecialItems) == 1 && pivotSpecialItems[0].Data.Name == "special-2" &&
@@ -1214,8 +1197,10 @@ func testClusterSync(t *testing.T, useRemote bool) {
 
 	// Node-side delete: exercises the widened {index} regex on the DELETE
 	// route too (/pivot/<base>/{index}/{time}).
+	deliv.Add(2)
 	ops.deleteItem(t, false, specialItemKey)
-	requireConverged(t, "special item (node delete) should sync to pivot+node", func() bool {
+	deliv.Wait()
+	converged("special item (node delete) should sync to pivot+node", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		return len(pivotSpecialItems) == 0 && len(nodeSpecialItems) == 0
