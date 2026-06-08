@@ -69,6 +69,21 @@ func TestClockDriftScenario(t *testing.T) {
 	require.NotNil(t, pivotInstance.VVManager)
 	require.NotNil(t, nodeInstance.VVManager)
 
+	// The pivot Set handler increments its VV counter AFTER db.SetWithMeta
+	// returns — i.e. after the storage AfterWrite that drives PivotWg.Done().
+	// Waiting on PivotWg alone proves the pushed data landed, not that the
+	// counter bump did, so reading the VV right after PivotWg.Wait() races the
+	// bump (empty/stale leader counter). pivotBump fires once per leader-counter
+	// increment for "policies"; pairing Add(1)/Wait() with each push makes the
+	// counter reads below deterministic. Disarmed before phase 4, whose
+	// pivot-side write bumps via a path this test does not assert on.
+	var pivotBump sync.WaitGroup
+	pivotInstance.VVManager.SetBumpObserver(func(baseKey string) {
+		if baseKey == "policies" {
+			pivotBump.Done()
+		}
+	})
+
 	sixHours := int64(6 * 60 * 60 * 1000000000) // 6 hours in nanoseconds
 	now := time.Now().UnixNano()
 	futureTimestamp := now + sixHours
@@ -86,10 +101,12 @@ func TestClockDriftScenario(t *testing.T) {
 	// in the wire-format body.
 	servers.NodeWg.Add(1)
 	servers.PivotWg.Add(1)
+	pivotBump.Add(1)
 	_, err := servers.NodePolicies.SetWithMeta("policies", futureBytes, futureTimestamp, futureTimestamp)
 	require.NoError(t, err)
 	servers.NodeWg.Wait()
 	servers.PivotWg.Wait()
+	pivotBump.Wait()
 
 	// Phase 1 must reach pivot with the future Updated intact.
 	phase1Obj, err := servers.PivotPolicies.Get("policies")
@@ -122,10 +139,12 @@ func TestClockDriftScenario(t *testing.T) {
 	// Updated.
 	servers.NodeWg.Add(1)
 	servers.PivotWg.Add(1)
+	pivotBump.Add(1)
 	_, err = servers.NodePolicies.SetWithMeta("policies", currentBytes, currentTimestamp, currentTimestamp)
 	require.NoError(t, err)
 	servers.NodeWg.Wait()
 	servers.PivotWg.Wait()
+	pivotBump.Wait()
 
 	// === Phase 3: Verify VV prevents the "future" data from winning ===
 	t.Log("Phase 3: Verifying Version Vector prevents future-timestamp overwrite")
@@ -148,6 +167,14 @@ func TestClockDriftScenario(t *testing.T) {
 
 	// === Phase 4: Simulate reverse sync (pivot -> node) to ensure no regression ===
 	t.Log("Phase 4: Verify pivot -> node sync also respects VV")
+
+	// Phase 4 writes to pivot directly (HTTP POST on its own storage), which
+	// bumps the pivot VV via the AfterWriteOp path rather than the Set handler.
+	// This test makes no VV-counter assertions past here, so disarm the observer
+	// — leaving it armed would Done() pivotBump with no matching Add(). The
+	// disarm happens-after phase 2's pivotBump.Wait(), so no in-flight bump is
+	// lost, and SetBumpObserver serialises with increment under the VV mutex.
+	pivotInstance.VVManager.SetBumpObserver(nil)
 
 	// Write on pivot via HTTP, then manually trigger node sync
 	// (Pivot doesn't auto-sync to node since node isn't registered).
