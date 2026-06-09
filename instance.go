@@ -227,11 +227,23 @@ func (i *Instance) IsAttached(db storage.Database) bool {
 	return ok
 }
 
-// bumpVVForLocalWrite is the synchronous VV bump invoked from
-// AfterWrite. It runs inside storage.SetWithMeta / Set / Del, before
+// bumpVVForLocalWrite is the synchronous VV bump invoked from ooo's
+// AfterWriteOp. It runs inside storage.SetWithMeta / Set / Del, before
 // the call returns, so by the time the caller continues the local VV
 // reflects this write — no async-callback lag, no window where a pull
 // tick can fire and clobber the not-yet-counted write.
+//
+// op ("set" or "del") comes from ooo's AfterWriteOp hook and selects which
+// pull bump-skip mark to consume. This MUST be operation-specific: the pull
+// path sets bumpSkipSet for pulled sets and bumpSkipDelete for pulled deletes,
+// each meant to suppress the bump of that one pulled write. A pulled delete's
+// mark is set just before its storage write but outside the per-key write
+// lock, so a concurrent LOCAL set on the same key can run its AfterWriteOp in
+// the window between. If that local set consumed the delete's mark (the old
+// op-unaware `consumeBumpSkipSet() || consumeBumpSkipDelete()`), the local
+// set's bump was skipped, its VV never advanced, and the peer rejected the
+// pushed write as VVEqual — a permanent node↔pivot divergence. Consuming only
+// the mark matching this write's own operation closes that cross-op steal.
 //
 // Four cases skip the bump:
 //
@@ -255,7 +267,7 @@ func (i *Instance) IsAttached(db storage.Database) bool {
 //
 // Direct user writes (db.Set / db.SetWithMeta on an attached storage)
 // hit none of these cases and bump here, synchronously.
-func (i *Instance) bumpVVForLocalWrite(eventKey string) {
+func (i *Instance) bumpVVForLocalWrite(eventKey string, op string) {
 	if i.VVManager == nil {
 		return
 	}
@@ -286,7 +298,16 @@ func (i *Instance) bumpVVForLocalWrite(eventKey string) {
 		effectiveURL := matched.EffectiveClusterURL(i.ClusterURL)
 		if effectiveURL != "" {
 			if s := i.syncerPool.syncers[effectiveURL]; s != nil {
-				if s.tracker.consumeBumpSkipSet(eventKey) || s.tracker.consumeBumpSkipDelete(eventKey) {
+				// Consume ONLY the mark for this write's own operation — never
+				// cross-op — so a pulled delete's mark can't suppress a local
+				// set's bump (and vice versa).
+				var pullDriven bool
+				if op == "del" {
+					pullDriven = s.tracker.consumeBumpSkipDelete(eventKey)
+				} else {
+					pullDriven = s.tracker.consumeBumpSkipSet(eventKey)
+				}
+				if pullDriven {
 					return
 				}
 			}
@@ -336,12 +357,14 @@ func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) e
 		}
 	}
 	opts.BeforeRead = beforeRead
-	opts.AfterWrite = func(eventKey string) {
-		i.bumpVVForLocalWrite(eventKey)
-		if userAfterWrite != nil {
-			userAfterWrite(eventKey)
-		}
+	// VV bump via the op-aware hook so it consumes only the bump-skip mark
+	// matching the write's operation (see bumpVVForLocalWrite). ooo fires
+	// AfterWriteOp before AfterWrite, so the bump still lands before a
+	// caller-supplied AfterWrite observes the post-bump VV.
+	opts.AfterWriteOp = func(eventKey string, op string) {
+		i.bumpVVForLocalWrite(eventKey, op)
 	}
+	opts.AfterWrite = userAfterWrite
 
 	// Record this storage as having sync-bump wired so the async
 	// SyncCallback path can skip its own bump for events from this DB.

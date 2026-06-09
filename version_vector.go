@@ -182,6 +182,13 @@ type VVManager struct {
 	storage  storage.Database
 	nodeID   string // ID of this node ("leader" for pivot, node path for nodes)
 	shutdown bool   // guarded by mu; prevents writes during shutdown
+	// onBump, when non-nil, fires (without m.mu held) after this node's own
+	// counter has been incremented and persisted — once per increment, never
+	// on a merge. Test-only synchronisation hook: the Set/Delete handlers bump
+	// the counter AFTER db.SetWithMeta returns (and thus after the storage
+	// AfterWrite that tests wait on), so a test that reads the VV right after
+	// the storage write races the bump. nil in production. See SetBumpObserver.
+	onBump func(baseKey string)
 }
 
 // NewVVManager creates a new version vector manager.
@@ -224,7 +231,6 @@ func (m *VVManager) increment(keyPath string) {
 	baseKey := normalizeKeyPath(keyPath)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Node servers create their VVManager with nodeID="" during Setup and only
 	// call SetNodeID once server.Address is known (inside OnStart). The TCP
@@ -233,6 +239,7 @@ func (m *VVManager) increment(keyPath string) {
 	// ever increments and live in storage forever. Skip and log loudly so the
 	// regression surfaces if a caller starts incrementing pre-SetNodeID.
 	if m.nodeID == "" {
+		m.mu.Unlock()
 		log.Printf("[pivot] VVManager.increment skipped for %q: nodeID not set yet", keyPath)
 		return
 	}
@@ -246,6 +253,14 @@ func (m *VVManager) increment(keyPath string) {
 	m.vectors[baseKey][m.nodeID]++
 
 	m.saveToStorage(baseKey)
+	// Capture under the lock, fire after releasing it: the observer must not
+	// be able to re-enter VVManager under m.mu, and the bump is already
+	// durable by here.
+	cb := m.onBump
+	m.mu.Unlock()
+	if cb != nil {
+		cb(baseKey)
+	}
 }
 
 // set merges a remote version vector into the local one to ensure
@@ -319,6 +334,21 @@ func (m *VVManager) saveToStorage(baseKey string) {
 func (m *VVManager) Shutdown() {
 	m.mu.Lock()
 	m.shutdown = true
+	m.mu.Unlock()
+}
+
+// SetBumpObserver installs a callback fired after each successful counter
+// increment+persist, for any key (pass nil to clear). It exists so async tests
+// can deterministically synchronise on the pivot's post-write VV bump: the
+// Set/Delete handlers increment the counter after the storage write — and thus
+// after the storage AfterWrite a test waits on — so reading the VV immediately
+// after the write races the bump. The callback fires once per increment and
+// never on a merge, so the count is one per write that advances this node's own
+// counter regardless of code path. Production never sets it. Safe to call from
+// another goroutine; serialised with increment via m.mu.
+func (m *VVManager) SetBumpObserver(cb func(baseKey string)) {
+	m.mu.Lock()
+	m.onBump = cb
 	m.mu.Unlock()
 }
 

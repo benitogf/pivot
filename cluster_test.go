@@ -84,17 +84,15 @@ func Authorize(t *testing.T, server *ooo.Server, account string) string {
 }
 
 // FakeServer creates a server using storage-level synchronization via pivot.Setup.
-// Returns the server and a WaitGroup controlled by storage AfterWrite callbacks.
-func FakeServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) {
-	wg := &sync.WaitGroup{}
-
-	afterWrite := func(key string) {
-		if strings.HasPrefix(key, "pivot/") {
-			return
-		}
-		t.Logf("[server] storage write: %s", key)
-		wg.Done()
-	}
+//
+// onPolicyWrite (if non-nil) fires once per committed write to the "policies"
+// key on this server's auth storage. Policies are served through custom HTTP
+// routes, not a websocket-broadcast path, so unlike things/settings/items they
+// deliver nothing to a subscription — the storage write is the only
+// deterministic completion signal a test can wait on. Bookkeeping writes
+// (the StoragePrefix tombstone) are excluded so the count stays exactly one
+// per logical policies mutation per side.
+func FakeServer(t *testing.T, clusterURL string, onPolicyWrite func()) *ooo.Server {
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
@@ -138,9 +136,17 @@ func FakeServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) 
 	// Setup pivot - modifies server (routes, OnStorageEvent, BeforeRead)
 	pivot.Setup(server, config)
 
-	// Use Attach for simplified external storage setup with AfterWrite callback
-	// Only authStorage needs AfterWrite - things/* uses server.Storage which is started by server.Start()
-	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{AfterWrite: afterWrite})
+	// Attach the external auth storage for pivot synchronization. The AfterWrite
+	// signals committed "policies" writes so a test can wait on them
+	// deterministically — policies have no websocket subscription to count
+	// deliveries on (custom HTTP routes), so the storage write is the signal.
+	err := pivot.GetInstance(server).Attach(authStorage, storage.Options{
+		AfterWrite: func(key string) {
+			if key == "policies" && onPolicyWrite != nil {
+				onPolicyWrite()
+			}
+		},
+	})
 	require.NoError(t, err)
 
 	server.OpenFilter("things/*")
@@ -188,7 +194,48 @@ func FakeServer(t *testing.T, clusterURL string) (*ooo.Server, *sync.WaitGroup) 
 	}).Methods(http.MethodGet, http.MethodPost, http.MethodDelete)
 
 	server.Start("localhost:0")
-	return server, wg
+	return server
+}
+
+// settingsPresent reports whether "settings" currently reads successfully on the
+// given side (non-failing — safe to call from a polling loop).
+func (ops *syncTestOps) settingsPresent(fromPivot bool) bool {
+	if ops.useRemote {
+		cfg := ops.nodeCfg
+		if fromPivot {
+			cfg = ops.pivotCfg
+		}
+		_, err := ooio.RemoteGet[Settings](cfg, "settings")
+		return err == nil
+	}
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	_, err := ooo.Get[Settings](server, "settings")
+	return err == nil
+}
+
+// policiesValue returns the parsed policies and whether GET /policies returned
+// 200 on the given side (non-failing — safe to call from a polling loop).
+func (ops *syncTestOps) policiesValue(fromPivot bool) (Policies, bool) {
+	var p Policies
+	server := ops.nodeServer
+	if fromPivot {
+		server = ops.pivotServer
+	}
+	resp, err := server.Client.Get("http://" + server.Address + "/policies")
+	if err != nil {
+		return p, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return p, false
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return p, false
+	}
+	return p, true
 }
 
 // syncTestOps provides operations that can be local or remote based on the useRemote flag
@@ -196,8 +243,6 @@ type syncTestOps struct {
 	useRemote   bool
 	pivotServer *ooo.Server
 	nodeServer  *ooo.Server
-	pivotWg     *sync.WaitGroup
-	nodeWg      *sync.WaitGroup
 	pivotCfg    ooio.RemoteConfig
 	nodeCfg     ooio.RemoteConfig
 }
@@ -480,7 +525,6 @@ func (ops *syncTestOps) deleteItem(t *testing.T, fromPivot bool, key string) {
 }
 
 func testClusterSync(t *testing.T, useRemote bool) {
-	var wsWg sync.WaitGroup
 	var pivotThings, nodeThings []client.Meta[Thing]
 	var pivotSettings, nodeSettings []client.Meta[Settings]
 	var pivotItems, nodeItems []client.Meta[Item]
@@ -491,33 +535,36 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	var pivotSpecialItems, nodeSpecialItems []client.Meta[Item]
 	var mu sync.Mutex
 
-	pivotServer, pivotWg := FakeServer(t, "")
+	// policyWrites counts committed "policies" writes across both servers.
+	// Policies have no websocket subscription (custom HTTP routes), so the
+	// storage write — wired via FakeServer's onPolicyWrite — is the
+	// deterministic completion signal. Each policies mutation writes once per
+	// side, so the policies steps below arm policyWrites.Add(2).
+	var policyWrites sync.WaitGroup
+	onPolicyWrite := func() { policyWrites.Done() }
+
+	pivotServer := FakeServer(t, "", onPolicyWrite)
 	defer pivotServer.Close(os.Interrupt)
-	nodeServer, nodeWg := FakeServer(t, pivotServer.Address)
+	nodeServer := FakeServer(t, pivotServer.Address, onPolicyWrite)
 	defer nodeServer.Close(os.Interrupt)
 
 	ops := &syncTestOps{
 		useRemote:   useRemote,
 		pivotServer: pivotServer,
 		nodeServer:  nodeServer,
-		pivotWg:     pivotWg,
-		nodeWg:      nodeWg,
 	}
 	if useRemote {
 		ops.pivotCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: pivotServer.Address}
 		ops.nodeCfg = ooio.RemoteConfig{Client: &http.Client{Timeout: 500 * time.Millisecond}, Host: nodeServer.Address}
 	}
 
-	// Register and authorize users
-	pivotWg.Add(1)
+	// Register a user on the pivot and authorize on the node. Both are
+	// synchronous HTTP calls (Authorize triggers pivot's sync-on-read to pull
+	// users/root onto the node), so no extra wait is needed before proceeding.
 	token := RegisterUser(t, pivotServer, "root")
 	require.NotEqual(t, "", token)
-	pivotWg.Wait()
-
-	nodeWg.Add(1)
 	token = Authorize(t, nodeServer, "root")
 	require.NotEqual(t, "", token)
-	nodeWg.Wait()
 
 	authHeader := http.Header{}
 	authHeader.Set("Authorization", "Bearer "+token)
@@ -527,11 +574,48 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 
 	ctx := t.Context()
-	// 6 base subscriptions + 2 for the special-character item path = 8
-	// initial messages before any test write fires.
-	wsWg.Add(8)
 
-	// Subscribe to things, settings, and items on both servers
+	// Subscribe to things, settings, and items on both servers. Each OnMessage
+	// records the latest delivered state and signals a WaitGroup — both under mu.
+	//
+	// Two deterministic barriers replace the old convergence polling:
+	//
+	//   - wsReady (count 8): a subscription's FIRST delivery is its empty
+	//     initial snapshot at connect. A write that broadcasts before a
+	//     subscription is live is missed and never re-delivered, so every sub
+	//     must be live before the first write. The count is exactly 8 — one per
+	//     subscription, independent of any test write.
+	//
+	//   - deliv: every SUBSEQUENT delivery (one caused by a test operation).
+	//     With the version-vector fix in this branch, each logical mutation
+	//     produces exactly one delivery per subscribed side — the duplicate
+	//     push-vs-pull deliveries that once made counts non-deterministic are
+	//     gone. So each operation below arms deliv.Add(2) (the pivot sub + the
+	//     node sub), triggers, and Waits. Counts are exact; a wrong count
+	//     surfaces as a hung Wait — the signal to fix the count, per
+	//     /testing-go-backend-async (no sleeps, no polling, no time.After).
+	//
+	// delivered() returns a per-subscription closure (invoked under mu) that
+	// routes the first delivery to wsReady and every later one to deliv.
+	var wsReady sync.WaitGroup
+	wsReady.Add(8)
+	var deliv sync.WaitGroup
+	delivered := func() func() {
+		established := false
+		return func() {
+			if established {
+				deliv.Done()
+				return
+			}
+			established = true
+			wsReady.Done()
+		}
+	}
+	onPivotThings, onNodeThings := delivered(), delivered()
+	onNodeSettings, onPivotSettings := delivered(), delivered()
+	onPivotItems, onNodeItems := delivered(), delivered()
+	onPivotSpecial, onNodeSpecial := delivered(), delivered()
+
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
 		Server:  client.Server{Protocol: "ws", Host: pivotServer.Address},
@@ -540,8 +624,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "things/*", client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) {
 		mu.Lock()
 		pivotThings = data
+		onPivotThings()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:    ctx,
@@ -550,8 +634,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 		client.SubscribeListEvents[Thing]{OnMessage: func(data []client.Meta[Thing]) {
 			mu.Lock()
 			nodeThings = data
+			onNodeThings()
 			mu.Unlock()
-			wsWg.Done()
 		}})
 	go client.Subscribe(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -561,8 +645,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		nodeSettings = []client.Meta[Settings]{data}
+		onNodeSettings()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 	go client.Subscribe(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -572,8 +656,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "settings", client.SubscribeEvents[Settings]{OnMessage: func(data client.Meta[Settings]) {
 		mu.Lock()
 		pivotSettings = []client.Meta[Settings]{data}
+		onPivotSettings()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -583,8 +667,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		pivotItems = data
+		onPivotItems()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -594,8 +678,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat/sub/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		nodeItems = data
+		onNodeItems()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 	// Multi-glob subscription with special characters in the path
 	// segments — covers `-` in cat-1, `.` in sub.v2, and (via the leaf
@@ -608,8 +692,8 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat-1/sub.v2/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		pivotSpecialItems = data
+		onPivotSpecial()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 	go client.SubscribeList(client.SubscribeConfig{
 		Ctx:     ctx,
@@ -619,26 +703,37 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}, "items/cat-1/sub.v2/*", client.SubscribeListEvents[Item]{OnMessage: func(data []client.Meta[Item]) {
 		mu.Lock()
 		nodeSpecialItems = data
+		onNodeSpecial()
 		mu.Unlock()
-		wsWg.Done()
 	}})
 
-	wsWg.Wait()
+	// Wait for every subscription's initial snapshot so all subs are live
+	// before the first write (closes the connect→broadcast race above). A
+	// plain WaitGroup of a known count — no timeout wrapper.
+	wsReady.Wait()
 
-	// Verify initial state
-	mu.Lock()
-	require.Equal(t, 0, len(pivotThings))
-	require.Equal(t, 0, len(nodeThings))
-	mu.Unlock()
+	// converged asserts the post-operation state holds. It runs AFTER the
+	// operation's deliv.Wait()/policyWrites.Wait() returns, so the deliveries it
+	// checks have already arrived — it verifies the delivered CONTENT (value,
+	// length), not a race. cond locks mu itself where it reads shared slices.
+	converged := func(msg string, cond func() bool) {
+		t.Helper()
+		require.True(t, cond(), msg)
+	}
 
 	// Get node address for Thing creation
 	nodeIP, nodePort, _ := net.SplitHostPort(nodeServer.Address)
 	nodePortInt, _ := strconv.Atoi(nodePort)
 
-	// Push thing to pivot - expect 2 ws events (pivot + node via TriggerNodeSync)
-	wsWg.Add(2)
+	// Push thing to pivot - one delivery to each things/* sub (pivot + node).
+	deliv.Add(2)
 	thingID := ops.pushThing(t, true, Thing{IP: nodeIP, Port: nodePortInt, On: false})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("push thing to pivot should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotThings) == 1 && len(nodeThings) == 1
+	})
 
 	mu.Lock()
 	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing")
@@ -651,10 +746,29 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	nodeThing := ops.getThing(t, false, thingID)
 	require.Equal(t, false, nodeThing.On)
 
-	// Modify thing on pivot - expect 2 ws events
-	wsWg.Add(2)
+	// thingOn finds a thing by id in a subscription snapshot, returning whether
+	// it is present and its On flag. Used to wait for an update (which doesn't
+	// change the list length) to converge through the websocket sub.
+	thingOn := func(list []client.Meta[Thing], id string) (found, on bool) {
+		for _, m := range list {
+			if m.Index == id {
+				return true, m.Data.On
+			}
+		}
+		return false, false
+	}
+
+	// Modify thing on pivot - one delivery to each sub, both reach On=true.
+	deliv.Add(2)
 	ops.setThing(t, true, thingID, Thing{IP: nodeIP, Port: nodePortInt, On: true})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("thing On=true update should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		_, pon := thingOn(pivotThings, thingID)
+		_, non := thingOn(nodeThings, thingID)
+		return pon && non
+	})
 
 	// Verify update
 	updatedThing := ops.getThing(t, true, thingID)
@@ -662,20 +776,27 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	nodeThing = ops.getThing(t, false, thingID)
 	require.Equal(t, true, nodeThing.On)
 
-	// Set settings on node - expect 2 ws events
-	wsWg.Add(2)
+	// Set settings on node - one delivery to each settings sub (DayEpoch=1).
+	deliv.Add(2)
 	ops.setSettings(t, false, Settings{DayEpoch: 1})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("settings=1 should sync to node+pivot", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(nodeSettings) > 0 && nodeSettings[0].Data.DayEpoch == 1 &&
+			len(pivotSettings) > 0 && pivotSettings[0].Data.DayEpoch == 1
+	})
 
-	mu.Lock()
-	require.Equal(t, 1, nodeSettings[0].Data.DayEpoch)
-	require.Equal(t, 1, pivotSettings[0].Data.DayEpoch)
-	mu.Unlock()
-
-	// Set settings on pivot - expect 2 ws events
-	wsWg.Add(2)
+	// Set settings on pivot - one delivery to each settings sub (DayEpoch=9).
+	deliv.Add(2)
 	ops.setSettings(t, true, Settings{DayEpoch: 9})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("settings=9 should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotSettings) > 0 && pivotSettings[0].Data.DayEpoch == 9 &&
+			len(nodeSettings) > 0 && nodeSettings[0].Data.DayEpoch == 9
+	})
 
 	// Verify settings
 	pivotSettingsObj := ops.getSettings(t, true)
@@ -683,20 +804,26 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	nodeSettingsObj := ops.getSettings(t, false)
 	require.Equal(t, 9, nodeSettingsObj.DayEpoch)
 
-	// Push a second thing to pivot
-	wsWg.Add(2)
+	// Push a second thing to pivot - one delivery to each sub (now 2 things).
+	deliv.Add(2)
 	thingID2 := ops.pushThing(t, true, Thing{IP: "10.0.0.1", Port: 0, On: true})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("second thing should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotThings) == 2 && len(nodeThings) == 2
+	})
 
-	mu.Lock()
-	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things")
-	require.Equal(t, 2, len(nodeThings), "node should have 2 things")
-	mu.Unlock()
-
-	// Delete from pivot - expect 2 ws events
-	wsWg.Add(2)
+	// Delete from pivot - one delivery to each sub (back to 1 thing, thingID).
+	deliv.Add(2)
 	ops.deleteThing(t, true, thingID2)
-	wsWg.Wait()
+	deliv.Wait()
+	converged("thingID2 delete should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotThings) == 1 && pivotThings[0].Index == thingID &&
+			len(nodeThings) == 1 && nodeThings[0].Index == thingID
+	})
 
 	// Verify deletion
 	ops.getThingExpectError(t, true, thingID2, "thingID2 should be deleted from pivot")
@@ -709,34 +836,42 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, thingID, nodeThings[0].Index)
 	mu.Unlock()
 
-	// Push a third thing to node
-	wsWg.Add(2)
+	// Push a third thing to node - one delivery to each sub (now 2 things).
+	deliv.Add(2)
 	thingID3 := ops.pushThing(t, false, Thing{IP: "172.16.0.1", Port: 0, On: false})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("third thing (node push) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotThings) == 2 && len(nodeThings) == 2
+	})
 
-	mu.Lock()
-	require.Equal(t, 2, len(pivotThings), "pivot should have 2 things after node push")
-	require.Equal(t, 2, len(nodeThings), "node should have 2 things after node push")
-	mu.Unlock()
-
-	// Delete from node - expect 2 ws events
-	wsWg.Add(2)
+	// Delete from node - one delivery to each sub (back to 1 thing, thingID).
+	deliv.Add(2)
 	ops.deleteThing(t, false, thingID3)
-	wsWg.Wait()
+	deliv.Wait()
+	converged("thingID3 delete (node) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotThings) == 1 && pivotThings[0].Index == thingID &&
+			len(nodeThings) == 1 && nodeThings[0].Index == thingID
+	})
 
 	// Verify deletion
 	ops.getThingExpectError(t, false, thingID3, "thingID3 should be deleted from node")
 	ops.getThingExpectError(t, true, thingID3, "thingID3 should be deleted from pivot after sync")
 
-	mu.Lock()
-	require.Equal(t, 1, len(pivotThings), "pivot should have 1 thing after node delete")
-	require.Equal(t, 1, len(nodeThings), "node should have 1 thing after node delete")
-	mu.Unlock()
-
-	// Update thing on node - expect 2 ws events
-	wsWg.Add(2)
+	// Update thing on node - one delivery to each sub, both reach On=false.
+	deliv.Add(2)
 	ops.setThing(t, false, thingID, Thing{IP: nodeIP, Port: nodePortInt, On: false})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("thing On=false update (node) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		pf, pon := thingOn(pivotThings, thingID)
+		nf, non := thingOn(nodeThings, thingID)
+		return pf && !pon && nf && !non
+	})
 
 	// Verify update synced to pivot
 	pivotThing := ops.getThing(t, true, thingID)
@@ -744,28 +879,40 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, nodePortInt, pivotThing.Port)
 	require.Equal(t, false, pivotThing.On)
 
-	// Delete settings from node - expect 2 ws events
-	wsWg.Add(2)
+	// Delete settings from node - one delivery to each sub (now absent).
+	deliv.Add(2)
 	ops.deleteSettings(t, false)
-	wsWg.Wait()
+	deliv.Wait()
+	converged("settings delete (node) should sync to pivot+node", func() bool {
+		return !ops.settingsPresent(false) && !ops.settingsPresent(true)
+	})
 
 	// Verify settings deleted
 	ops.getSettingsExpectError(t, false, "settings should be deleted from node")
 	ops.getSettingsExpectError(t, true, "settings should be deleted from pivot after sync")
 
-	// Set settings on pivot after delete - expect 2 ws events
-	wsWg.Add(2)
+	// Set settings on pivot after delete - one delivery to each sub (DayEpoch=42).
+	deliv.Add(2)
 	ops.setSettings(t, true, Settings{DayEpoch: 42})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("settings=42 should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotSettings) > 0 && pivotSettings[0].Data.DayEpoch == 42 &&
+			len(nodeSettings) > 0 && nodeSettings[0].Data.DayEpoch == 42
+	})
 
 	// Verify settings synced
 	nodeSettingsObj = ops.getSettings(t, false)
 	require.Equal(t, 42, nodeSettingsObj.DayEpoch)
 
-	// Delete settings from pivot - expect 2 ws events
-	wsWg.Add(2)
+	// Delete settings from pivot - one delivery to each sub (now absent).
+	deliv.Add(2)
 	ops.deleteSettings(t, true)
-	wsWg.Wait()
+	deliv.Wait()
+	converged("settings delete (pivot) should sync to pivot+node", func() bool {
+		return !ops.settingsPresent(true) && !ops.settingsPresent(false)
+	})
 
 	// Verify settings deleted
 	ops.getSettingsExpectError(t, true, "settings should be deleted from pivot")
@@ -773,12 +920,25 @@ func testClusterSync(t *testing.T, useRemote bool) {
 
 	// === Policies sync tests (stored in authStorage, not server.Storage) ===
 
-	// Set policies on pivot - expect sync to node via authStorage AfterWrite callback
-	pivotWg.Add(1)
-	nodeWg.Add(1)
+	// policiesMaxRetries reports whether GET /policies on the given side returns
+	// 200 with the expected MaxRetries (each step below uses a distinct value,
+	// so this uniquely identifies that the synced version has landed).
+	policiesMaxRetries := func(fromPivot bool, want int) bool {
+		p, ok := ops.policiesValue(fromPivot)
+		return ok && p.MaxRetries == want
+	}
+	policiesAbsent := func(fromPivot bool) bool {
+		_, ok := ops.policiesValue(fromPivot)
+		return !ok
+	}
+
+	// Set policies on pivot - one authStorage write per side (no ws sub).
+	policyWrites.Add(2)
 	ops.setPolicies(t, true, Policies{MaxRetries: 3, Allowed: []string{"read", "write"}})
-	pivotWg.Wait()
-	nodeWg.Wait()
+	policyWrites.Wait()
+	converged("policies(set,pivot) should sync to pivot+node", func() bool {
+		return policiesMaxRetries(true, 3) && policiesMaxRetries(false, 3)
+	})
 
 	// Verify policies synced to node
 	pivotPolicies := ops.getPolicies(t, true)
@@ -788,12 +948,13 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, 3, nodePolicies.MaxRetries)
 	require.Equal(t, []string{"read", "write"}, nodePolicies.Allowed)
 
-	// Update policies on node - expect sync to pivot
-	nodeWg.Add(1)
-	pivotWg.Add(1)
+	// Update policies on node - one authStorage write per side.
+	policyWrites.Add(2)
 	ops.setPolicies(t, false, Policies{MaxRetries: 5, Allowed: []string{"admin"}})
-	nodeWg.Wait()
-	pivotWg.Wait()
+	policyWrites.Wait()
+	converged("policies(update,node) should sync to pivot+node", func() bool {
+		return policiesMaxRetries(true, 5) && policiesMaxRetries(false, 5)
+	})
 
 	// Verify policies synced to pivot
 	pivotPolicies = ops.getPolicies(t, true)
@@ -803,35 +964,38 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	require.Equal(t, 5, nodePolicies.MaxRetries)
 	require.Equal(t, []string{"admin"}, nodePolicies.Allowed)
 
-	// Delete policies from pivot - expect sync to node
-	pivotWg.Add(1)
-	nodeWg.Add(1)
+	// Delete policies from pivot - one authStorage write per side (now absent).
+	policyWrites.Add(2)
 	ops.deletePolicies(t, true)
-	pivotWg.Wait()
-	nodeWg.Wait()
+	policyWrites.Wait()
+	converged("policies(delete,pivot) should sync to pivot+node", func() bool {
+		return policiesAbsent(true) && policiesAbsent(false)
+	})
 
 	// Verify policies deleted from both
 	ops.getPoliciesExpectError(t, true, "policies should be deleted from pivot")
 	ops.getPoliciesExpectError(t, false, "policies should be deleted from node after sync")
 
-	// Set policies on node after delete - expect sync to pivot
-	nodeWg.Add(1)
-	pivotWg.Add(1)
+	// Set policies on node after delete - one authStorage write per side.
+	policyWrites.Add(2)
 	ops.setPolicies(t, false, Policies{MaxRetries: 10, Allowed: []string{"guest"}})
-	nodeWg.Wait()
-	pivotWg.Wait()
+	policyWrites.Wait()
+	converged("policies(set-after-delete,node) should sync to pivot+node", func() bool {
+		return policiesMaxRetries(true, 10) && policiesMaxRetries(false, 10)
+	})
 
 	// Verify policies synced to pivot
 	pivotPolicies = ops.getPolicies(t, true)
 	require.Equal(t, 10, pivotPolicies.MaxRetries)
 	require.Equal(t, []string{"guest"}, pivotPolicies.Allowed)
 
-	// Delete policies from node - expect sync to pivot
-	nodeWg.Add(1)
-	pivotWg.Add(1)
+	// Delete policies from node - one authStorage write per side (now absent).
+	policyWrites.Add(2)
 	ops.deletePolicies(t, false)
-	nodeWg.Wait()
-	pivotWg.Wait()
+	policyWrites.Wait()
+	converged("policies(delete,node) should sync to pivot+node", func() bool {
+		return policiesAbsent(false) && policiesAbsent(true)
+	})
 
 	// Verify policies deleted from both
 	ops.getPoliciesExpectError(t, false, "policies should be deleted from node")
@@ -839,37 +1003,53 @@ func testClusterSync(t *testing.T, useRemote bool) {
 
 	// === Multi-glob sync tests (items/*/*/*) ===
 
-	// Push item to pivot - expect 2 ws events (pivot + node via TriggerNodeSync)
-	wsWg.Add(2)
+	// itemNamed reports whether an items subscription snapshot contains an item
+	// with the given leaf index and name — used to wait for an item update (no
+	// length change) to converge through the websocket sub.
+	itemNamed := func(list []client.Meta[Item], leaf, name string) bool {
+		for _, m := range list {
+			if m.Index == leaf && m.Data.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Push item to pivot - one delivery to each items sub (now 1 item "p1").
+	deliv.Add(2)
 	itemID := ops.pushItem(t, true, "items/cat/sub/*", Item{Name: "p1", Value: 1})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("item p1 (pivot push) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotItems) == 1 && pivotItems[0].Data.Name == "p1" &&
+			len(nodeItems) == 1 && nodeItems[0].Data.Name == "p1"
+	})
 
-	mu.Lock()
-	require.Equal(t, 1, len(pivotItems), "pivot should have 1 item")
-	require.Equal(t, "p1", pivotItems[0].Data.Name)
-	require.Equal(t, 1, len(nodeItems), "node should have 1 item")
-	require.Equal(t, "p1", nodeItems[0].Data.Name)
-	mu.Unlock()
-
-	// Push item from node - expect 2 ws events (node + pivot via node→pivot sync)
-	wsWg.Add(2)
+	// Push item from node - one delivery to each items sub (now 2 items).
+	deliv.Add(2)
 	itemID2 := ops.pushItem(t, false, "items/cat/sub/*", Item{Name: "p2", Value: 2})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("item p2 (node push) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotItems) == 2 && len(nodeItems) == 2
+	})
 
-	mu.Lock()
-	require.Equal(t, 2, len(pivotItems), "pivot should have 2 items after node push")
-	require.Equal(t, 2, len(nodeItems), "node should have 2 items after node push")
-	mu.Unlock()
-
-	// Update item on pivot - expect 2 ws events (pivot + node)
-	wsWg.Add(2)
+	// Update item on pivot - one delivery to each items sub (new name).
+	deliv.Add(2)
 	ops.setItem(t, true, itemID, Item{Name: "p1-updated", Value: 10})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("item p1 update (pivot) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return itemNamed(pivotItems, key.LastIndex(itemID), "p1-updated") &&
+			itemNamed(nodeItems, key.LastIndex(itemID), "p1-updated")
+	})
 
 	mu.Lock()
 	require.Equal(t, 2, len(pivotItems), "pivot should still have 2 items after update")
 	require.Equal(t, 2, len(nodeItems), "node should still have 2 items after update")
-	// Find the updated item
 	for _, item := range pivotItems {
 		if item.Index == key.LastIndex(itemID) {
 			require.Equal(t, "p1-updated", item.Data.Name)
@@ -884,10 +1064,16 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 	mu.Unlock()
 
-	// Update item from node - expect 2 ws events (node + pivot)
-	wsWg.Add(2)
+	// Update item from node - one delivery to each items sub (new name).
+	deliv.Add(2)
 	ops.setItem(t, false, itemID2, Item{Name: "p2-updated", Value: 20})
-	wsWg.Wait()
+	deliv.Wait()
+	converged("item p2 update (node) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return itemNamed(pivotItems, key.LastIndex(itemID2), "p2-updated") &&
+			itemNamed(nodeItems, key.LastIndex(itemID2), "p2-updated")
+	})
 
 	mu.Lock()
 	require.Equal(t, 2, len(pivotItems), "pivot should still have 2 items after node update")
@@ -906,27 +1092,26 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	}
 	mu.Unlock()
 
-	// Delete item from pivot - expect 2 ws events
-	wsWg.Add(2)
+	// Delete item from pivot - one delivery to each sub (now 1 item "p2-updated").
+	deliv.Add(2)
 	ops.deleteItem(t, true, itemID)
-	wsWg.Wait()
+	deliv.Wait()
+	converged("item p1 delete (pivot) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotItems) == 1 && pivotItems[0].Data.Name == "p2-updated" &&
+			len(nodeItems) == 1 && nodeItems[0].Data.Name == "p2-updated"
+	})
 
-	mu.Lock()
-	require.Equal(t, 1, len(pivotItems), "pivot should have 1 item after delete")
-	require.Equal(t, "p2-updated", pivotItems[0].Data.Name)
-	require.Equal(t, 1, len(nodeItems), "node should have 1 item after delete")
-	require.Equal(t, "p2-updated", nodeItems[0].Data.Name)
-	mu.Unlock()
-
-	// Delete item from node - expect 2 ws events
-	wsWg.Add(2)
+	// Delete item from node - one delivery to each items sub (now 0 items).
+	deliv.Add(2)
 	ops.deleteItem(t, false, itemID2)
-	wsWg.Wait()
-
-	mu.Lock()
-	require.Equal(t, 0, len(pivotItems), "pivot should have 0 items after node delete")
-	require.Equal(t, 0, len(nodeItems), "node should have 0 items after node delete")
-	mu.Unlock()
+	deliv.Wait()
+	converged("item p2 delete (node) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotItems) == 0 && len(nodeItems) == 0
+	})
 
 	// === Special-character key sync tests ===
 	// The ooo dependency (PR #73) widens key.IsValid to admit hyphens,
@@ -958,66 +1143,68 @@ func testClusterSync(t *testing.T, useRemote bool) {
 	// triggered node pulls via /pivot/things which serves entries whose
 	// indexes now legally contain hyphens, dots, and underscores).
 	for _, id := range specialIDs {
-		wsWg.Add(2)
+		// things/<special-id> writes land on the things/* subs (pivot + node).
+		deliv.Add(2)
 		ops.setThing(t, true, id, Thing{IP: "10.1.1.1", Port: 0, On: true})
-		wsWg.Wait()
-		mu.Lock()
-		require.True(t, findThing(pivotThings, id), "pivot sub should see things/%s after pivot-side set", id)
-		require.True(t, findThing(nodeThings, id), "node sub should see things/%s after sync from pivot", id)
-		mu.Unlock()
+		deliv.Wait()
+		converged(fmt.Sprintf("things/%s (pivot set) should sync to pivot+node", id), func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return findThing(pivotThings, id) && findThing(nodeThings, id)
+		})
 
-		wsWg.Add(2)
+		deliv.Add(2)
 		ops.deleteThing(t, true, id)
-		wsWg.Wait()
-		mu.Lock()
-		require.False(t, findThing(pivotThings, id), "pivot sub should NOT see things/%s after delete", id)
-		require.False(t, findThing(nodeThings, id), "node sub should NOT see things/%s after sync of delete", id)
-		mu.Unlock()
+		deliv.Wait()
+		converged(fmt.Sprintf("things/%s delete should sync to pivot+node", id), func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return !findThing(pivotThings, id) && !findThing(nodeThings, id)
+		})
 	}
 
 	// Multi-glob with special characters in the path AND the leaf key.
 	// The subscription pattern itself contains `-` (cat-1) and `.` (sub.v2);
 	// the leaf key (file_name) carries `_`. All three new characters are
-	// exercised at once. Unlike things/* — which carries tombstone activity
-	// from earlier cycles — this path starts clean, so a node-direction
-	// write can be paired with the cross-server pivot write deterministically
-	// (Add(2) = one node WS + one pivot WS). That gives node→pivot URL
-	// coverage of the widened /pivot/<base>/{index} regex without racing
-	// against stale tombstone state.
+	// exercised at once, giving node→pivot URL coverage of the widened
+	// /pivot/<base>/{index} regex.
 	specialItemKey := "items/cat-1/sub.v2/file_name"
 
 	// Pivot-side set: covers /pivot fanout → node pull on a special path.
-	wsWg.Add(2)
+	deliv.Add(2)
 	ops.setItem(t, true, specialItemKey, Item{Name: "special-1", Value: 100})
-	wsWg.Wait()
-	mu.Lock()
-	require.Equal(t, 1, len(pivotSpecialItems), "pivot's special-path sub should see the new item")
-	require.Equal(t, "special-1", pivotSpecialItems[0].Data.Name)
-	require.Equal(t, 1, len(nodeSpecialItems), "node's special-path sub should see the synced item")
-	require.Equal(t, "special-1", nodeSpecialItems[0].Data.Name)
-	mu.Unlock()
+	deliv.Wait()
+	converged("special item (pivot set) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotSpecialItems) == 1 && pivotSpecialItems[0].Data.Name == "special-1" &&
+			len(nodeSpecialItems) == 1 && nodeSpecialItems[0].Data.Name == "special-1"
+	})
 
 	// Node-side update: exercises pivot's widened {index} regex via the
 	// node→leader POST URL /pivot/items/cat-1/sub.v2/file_name. The pivot
 	// Set handler accepts the path, writes locally, and the node sees the
 	// confirmation via its WS sub.
-	wsWg.Add(2)
+	deliv.Add(2)
 	ops.setItem(t, false, specialItemKey, Item{Name: "special-2", Value: 200})
-	wsWg.Wait()
-	mu.Lock()
-	require.Equal(t, "special-2", pivotSpecialItems[0].Data.Name, "pivot should see the node-side update")
-	require.Equal(t, "special-2", nodeSpecialItems[0].Data.Name)
-	mu.Unlock()
+	deliv.Wait()
+	converged("special item (node update) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotSpecialItems) == 1 && pivotSpecialItems[0].Data.Name == "special-2" &&
+			len(nodeSpecialItems) == 1 && nodeSpecialItems[0].Data.Name == "special-2"
+	})
 
 	// Node-side delete: exercises the widened {index} regex on the DELETE
 	// route too (/pivot/<base>/{index}/{time}).
-	wsWg.Add(2)
+	deliv.Add(2)
 	ops.deleteItem(t, false, specialItemKey)
-	wsWg.Wait()
-	mu.Lock()
-	require.Equal(t, 0, len(pivotSpecialItems), "pivot's special-path sub should be empty after node-side delete")
-	require.Equal(t, 0, len(nodeSpecialItems), "node's special-path sub should be empty after node-side delete")
-	mu.Unlock()
+	deliv.Wait()
+	converged("special item (node delete) should sync to pivot+node", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pivotSpecialItems) == 0 && len(nodeSpecialItems) == 0
+	})
 }
 
 func TestClusterSyncLocal(t *testing.T) {
