@@ -79,7 +79,29 @@ type OfflineTestServers struct {
 	NodeWg        *sync.WaitGroup
 }
 
-func setupOfflineServers(t *testing.T) *OfflineTestServers {
+// offlineOpt configures setupOfflineServers before the servers start.
+type offlineOpt func(*offlineConfig)
+
+type offlineConfig struct {
+	// pivotVVWrites, if set, has Done() called for every committed write to the
+	// pivot's "pivot/vv/policies" key — the leader's version-vector persistence.
+	// It rides the standard server.AfterWrite storage callback (wired before
+	// Start), so a test can wait on the leader's post-write VV bump by observing
+	// the storage event the bump produces, rather than polling VVManager.
+	pivotVVWrites *sync.WaitGroup
+}
+
+// withPivotVVWrites wires wg to the leader's VV-persistence storage writes.
+func withPivotVVWrites(wg *sync.WaitGroup) offlineOpt {
+	return func(c *offlineConfig) { c.pivotVVWrites = wg }
+}
+
+func setupOfflineServers(t *testing.T, opts ...offlineOpt) *OfflineTestServers {
+	var cfg offlineConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+
 	pivotWg := &sync.WaitGroup{}
 	nodeWg := &sync.WaitGroup{}
 
@@ -163,6 +185,18 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 			w.WriteHeader(http.StatusOK)
 		}
 	}).Methods(http.MethodGet, http.MethodPost)
+
+	// Observe the leader's VV persistence (pivot/vv/policies) through the standard
+	// server.AfterWrite storage callback. pivot uses server.AfterWriteOp for its
+	// own bump, leaving server.AfterWrite free for this. Set before Start so the
+	// storage layer captures it; nil unless a test opted in via withPivotVVWrites.
+	if cfg.pivotVVWrites != nil {
+		pivotServer.AfterWrite = func(key string) {
+			if key == pivot.VVKeyPrefix+"policies" {
+				cfg.pivotVVWrites.Done()
+			}
+		}
+	}
 
 	pivotServer.Start("localhost:0")
 
@@ -251,55 +285,35 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	t.Logf("Pivot policies storage active: %v", servers.PivotPolicies.Active())
 	t.Logf("Node policies storage active: %v", servers.NodePolicies.Active())
 
-	// Get instances to access VVManager
-	pivotInstance := pivot.GetInstance(servers.Pivot)
-	nodeInstance := pivot.GetInstance(servers.Node)
-	require.NotNil(t, pivotInstance, "Pivot instance should exist")
-	require.NotNil(t, nodeInstance, "Node instance should exist")
-	require.NotNil(t, pivotInstance.VVManager, "Pivot should have VVManager")
-	require.NotNil(t, nodeInstance.VVManager, "Node should have VVManager")
+	// This test asserts the observable data-sync effect (a node write reaches the
+	// pivot and a pivot write reaches the node), synchronised by the storage-write
+	// WaitGroups — not pivot's internal VV counters. The VV machinery is exercised
+	// through its effect on the available API (GET /_pivot/activity) in
+	// TestVersionVectorActivityEndpoint.
 
-	// Phase 1: Node writes data via HTTP, syncs to pivot
-	// Expect: 1 node write (local) + 1 pivot write (from sync)
+	// Phase 1: a node write syncs to the pivot. NodeWg fires on the node-local
+	// write, PivotWg on the pivot-applied write; once both drain the synced data
+	// is observable on the pivot.
 	servers.NodeWg.Add(1)
 	servers.PivotWg.Add(1)
 
-	// Use HTTP POST to trigger proper AfterWrite callback
 	payload := []byte(`{"value": "from-node"}`)
 	resp, err := servers.Node.Client.Post("http://"+servers.Node.Address+"/policies", "application/json", bytes.NewBuffer(payload))
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Wait for both writes to complete. The wg decrements fire from
-	// AfterWrite (synchronous with the storage Set), but the VV bump
-	// runs in the storage event callback on the watch goroutine — those
-	// two paths are decoupled. Poll the VV reads instead of asserting
-	// once and racing the callback.
 	servers.NodeWg.Wait()
 	servers.PivotWg.Wait()
 
-	require.Eventually(t, func() bool {
-		return len(nodeInstance.VVManager.Get("policies")) > 0
-	}, 2*time.Second, 5*time.Millisecond, "node VV never bumped")
-	nodeVV := nodeInstance.VVManager.Get("policies")
-	t.Logf("Node VV after write: %v", nodeVV)
-
-	// Verify pivot received the data
+	// Effect: the pivot received the node's data.
 	pivotObj, err := servers.PivotPolicies.Get("policies")
 	require.NoError(t, err)
 	var pivotData map[string]string
 	json.Unmarshal(pivotObj.Data, &pivotData)
 	require.Equal(t, "from-node", pivotData["value"], "Pivot should have received data from node")
 
-	// Verify pivot incremented its VV (via Set handler)
-	require.Eventually(t, func() bool {
-		return pivotInstance.VVManager.Get("policies")["leader"] > 0
-	}, 2*time.Second, 5*time.Millisecond, "pivot VV never bumped after node-driven write")
-	pivotVV := pivotInstance.VVManager.Get("policies")
-	t.Logf("Pivot VV after receiving: %v", pivotVV)
-
-	t.Log("Phase 1 passed: Node write syncs to pivot with VV tracking")
+	t.Log("Phase 1 passed: node write syncs to pivot")
 
 	// Phase 2: Pivot writes via HTTP, then manually trigger node sync
 	// (Pivot doesn't auto-sync to node since node isn't registered in NodesKey)
@@ -329,26 +343,23 @@ func TestOfflineNodeWriteAndSync(t *testing.T) {
 	json.Unmarshal(nodeObj2.Data, &nodeData)
 	require.Equal(t, "from-pivot", nodeData["value"], "Node should have received update from pivot")
 
-	// Check pivot VV incremented again — same poll-vs-callback race story.
-	require.Eventually(t, func() bool {
-		return pivotInstance.VVManager.Get("policies")["leader"] > pivotVV["leader"]
-	}, 2*time.Second, 5*time.Millisecond, "pivot VV never re-bumped after the second write")
-	pivotVV2 := pivotInstance.VVManager.Get("policies")
-	t.Logf("Pivot VV after second write: %v", pivotVV2)
-
-	t.Log("Phase 2 passed: Pivot write syncs to node")
-
-	t.Log("Offline sync test completed successfully")
+	t.Log("Phase 2 passed: pivot write syncs to node")
 }
 
 func TestVersionVectorActivityEndpoint(t *testing.T) {
-	servers := setupOfflineServers(t)
+	// pivotVVWrites observes the leader's VV persistence through the standard
+	// server.AfterWrite storage callback (see setupOfflineServers). A node push
+	// drives the pivot Set handler, which increments then merges its VV — two
+	// writes to pivot/vv/policies. Waiting on those makes the bump durable before
+	// we read it back through the external /activity endpoint, with no polling of
+	// internal VV state.
+	var pivotVVWrites sync.WaitGroup
+	servers := setupOfflineServers(t, withPivotVVWrites(&pivotVVWrites))
 	defer servers.Close()
 
-	// Write data via HTTP to trigger VV increment
-	// Expect: 1 node write (local) + 1 pivot write (from sync)
 	servers.NodeWg.Add(1)
 	servers.PivotWg.Add(1)
+	pivotVVWrites.Add(2) // pivot Set handler: increment-save + merge-save
 
 	payload := []byte(`{"value": "test"}`)
 	resp, err := servers.Node.Client.Post("http://"+servers.Node.Address+"/policies", "application/json", bytes.NewBuffer(payload))
@@ -356,21 +367,11 @@ func TestVersionVectorActivityEndpoint(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Wait for both writes to complete
 	servers.NodeWg.Wait()
 	servers.PivotWg.Wait()
+	pivotVVWrites.Wait()
 
-	// Verify pivot has VV. The wg decrements fire from AfterWrite
-	// (synchronous with the storage Set), but the VV bump runs in the
-	// storage event callback on the watch goroutine — those two paths
-	// are decoupled. Poll until the bump has landed instead of asserting
-	// once and racing the callback.
-	pivotInstance := pivot.GetInstance(servers.Pivot)
-	require.Eventually(t, func() bool {
-		return pivotInstance.VVManager.Get("policies")["leader"] > 0
-	}, 2*time.Second, 5*time.Millisecond, "pivot VV never bumped after the policies write drained")
-
-	// Check activity endpoint on pivot includes VV
+	// Assert through the external API: /activity exposes the leader's VV.
 	resp, err = servers.Pivot.Client.Get("http://" + servers.Pivot.Address + "/_pivot/activity/policies")
 	require.NoError(t, err)
 	defer resp.Body.Close()

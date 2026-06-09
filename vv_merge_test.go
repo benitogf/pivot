@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/benitogf/ooo/meta"
 	"github.com/benitogf/ooo/monotonic"
@@ -169,11 +168,13 @@ func TestQueuedOpCarriesQueueTimeVV(t *testing.T) {
 		mu       struct{ sync.Mutex }
 		received []recv
 	)
+	var delivered sync.WaitGroup // Done() per inbound POST — the deterministic drain signal
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		received = append(received, recv{key: r.URL.Path, vv: r.Header.Get(VVHeader)})
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)
+		delivered.Done()
 	}))
 	defer srv.Close()
 
@@ -193,15 +194,12 @@ func TestQueuedOpCarriesQueueTimeVV(t *testing.T) {
 	pool.syncers[srv.URL[len("http://"):]].QueueOrSendSet("things/b",
 		meta.Object{Created: 2, Updated: 2, Index: "b", Path: "things/b", Data: []byte(`{}`)})
 
-	// Drain by setting the node addr — the queue runs through sendToLeader
-	// with op.vv as the header value.
+	// Drain by setting the node addr — the queue runs through sendToLeader with
+	// op.vv as the header value. Each delivered op fires the mock leader's
+	// handler Done(); waiting on the two is deterministic, no polling.
+	delivered.Add(2)
 	pool.SetNodeAddr("10.0.0.1:9000")
-
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(received) == 2
-	}, time.Second, 5*time.Millisecond, "queue never drained both ops")
+	delivered.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -51,6 +51,40 @@ func VersionTestServer(t *testing.T, clusterURL string) *ooo.Server {
 	return server
 }
 
+// awaitPivotStatus subscribes to the node's pivot/status feed — the external
+// cluster-status API the UI consumes — and returns the first status whose pivot
+// protocol has been detected. The background health check broadcasts pivot/status
+// on every status change (pivot.go), so this is the event-driven, deterministic
+// replacement for polling GetPivotInfo while that check runs. sync.Once is the
+// sanctioned pattern here: pivot/status is an unbounded broadcast stream and we
+// want the first delivery that satisfies the condition.
+func awaitPivotStatus(t *testing.T, nodeServer *ooo.Server) ui.PivotInfo {
+	t.Helper()
+	var done sync.WaitGroup
+	done.Add(1)
+	var once sync.Once
+	var mu sync.Mutex
+	var got ui.PivotInfo
+	go client.Subscribe(client.SubscribeConfig{
+		Ctx:     t.Context(),
+		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
+		Silence: true,
+	}, "pivot/status", client.SubscribeEvents[ui.PivotInfo]{
+		OnMessage: func(m client.Meta[ui.PivotInfo]) {
+			mu.Lock()
+			got = m.Data
+			mu.Unlock()
+			if m.Data.PivotProtocol != "unknown" {
+				once.Do(done.Done)
+			}
+		},
+	})
+	done.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	return got
+}
+
 func TestE2E_VersionSync_CompatibleServers(t *testing.T) {
 	t.Parallel()
 	// This test verifies that compatible servers can detect each other's version
@@ -247,18 +281,9 @@ func TestE2E_VersionSync_NodeDetectsPivotProtocol(t *testing.T) {
 	nodeServer := VersionTestServer(t, "http://"+pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
-	// Poll until health check detects pivot protocol (initial check runs async)
-	var nodeInfo *ui.PivotInfo
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		nodeInfo = pivot.GetPivotInfo(nodeServer)()
-		if nodeInfo != nil && nodeInfo.PivotProtocol != "unknown" {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	require.NotNil(t, nodeInfo)
+	// Wait (event-driven) for the health check to detect the pivot's protocol,
+	// observed through the node's pivot/status feed.
+	nodeInfo := awaitPivotStatus(t, nodeServer)
 	require.Equal(t, "node", nodeInfo.Role)
 	require.Equal(t, "http://"+pivotServer.Address, nodeInfo.PivotIP)
 	require.Equal(t, pivot.ProtocolVersion, nodeInfo.PivotProtocol, "node should detect pivot's protocol version")
@@ -285,18 +310,9 @@ func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
 	nodeServer := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
 	defer nodeServer.Close(os.Interrupt)
 
-	// Poll until health check detects pivot protocol
-	var nodeInfo *ui.PivotInfo
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		nodeInfo = pivot.GetPivotInfo(nodeServer)()
-		if nodeInfo != nil && nodeInfo.PivotProtocol != "unknown" {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	require.NotNil(t, nodeInfo)
+	// Wait (event-driven) for the health check to detect the (incompatible)
+	// pivot protocol, observed through the node's pivot/status feed.
+	nodeInfo := awaitPivotStatus(t, nodeServer)
 	require.Equal(t, "node", nodeInfo.Role)
 	require.Equal(t, "1.0", nodeInfo.PivotProtocol, "node should detect pivot's protocol version 1.0")
 	require.False(t, nodeInfo.PivotCompatible, "node should report pivot as incompatible")
