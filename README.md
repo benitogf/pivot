@@ -16,6 +16,31 @@ the write path.
 
 ---
 
+## Motivation and target use case
+
+Pivot exists for distributed, physical-site systems where edge stations run a live
+workflow and stopping that workflow is worse than temporarily serving stale or
+locally-divergent state. A station should keep operating if the site network drops,
+if the central server is restarting, or if another station is unhealthy.
+
+The intended shape is narrow:
+
+- A central server carries site-wide state and coordinates synchronization.
+- Each station keeps the state it needs to work offline: local configuration,
+  station-scoped records, operator/user records, and shared site settings.
+- Stations may update their own station-scoped state while disconnected, but they
+  do not edit other stations' station-scoped state.
+- Shared/global settings converge from the central server once connectivity returns.
+
+That ownership model is why pivot does not try to be a general CRDT system. The
+common path is not "many peers concurrently edit the same document and every intent
+must merge"; it is "each station owns its local slice, needs a cached copy of shared
+state, and must never stop accepting local progress." When the ownership rule is
+broken and true concurrency happens, pivot chooses a deterministic winner instead
+of preserving both edits for application-level merge.
+
+---
+
 ## CAP positioning
 
 > The CAP theorem says you can have only two of: **C**onsistency (serializability),
@@ -112,8 +137,9 @@ A node that missed a fan-out — it was offline, or just joined — converges th
 three non-periodic paths, not a polling loop:
 
 - **Sync-on-read.** A read of a synced key on a node fires a `BeforeRead` hook that
-  pulls that key from the leader first (`TryPullKey`), so a read never returns
-  stale data the leader already moved past.
+  attempts to pull that key from the leader first (`TryPullKey`). If the leader is
+  reachable and no sync is already in progress, this reduces stale reads; it is not
+  a linearizable-read guarantee.
 - **On start.** With `AutoSyncOnStart` enabled, a node does a full bidirectional
   sync with the leader when it boots.
 - **Re-trigger.** The leader's fan-out re-nudges nodes on every leader write.
@@ -299,8 +325,9 @@ that comes back is marked healthy again.
   during a propagation window or partition.
 - **The leader is the tiebreaker.** Concurrency is resolved by the leader winning the
   reconciliation, so a write made against a node during a partition can lose to a
-  concurrent leader write once they reconnect. (It is not lost silently — the node
-  re-pushes after its next write — but it does not win that round.)
+  concurrent leader write once they reconnect. Pivot does not keep a conflict record
+  or merge both values; if that data must be preserved, model it as
+  owned/non-concurrent state or use a system with explicit conflict handling.
 - **Leader is a fan-out hub, not a quorum.** There's no consensus or automatic
   leader election; the leader is a configured role.
 
@@ -308,27 +335,33 @@ that comes back is marked healthy again.
 
 ## Comparison with similar tools
 
-Pivot occupies a narrow niche: **AP, leader/follower, version-vector-ordered,
-leader-convergent synchronization of ooo document/KV state, as an embedded Go library
-over HTTP.** Most adjacent tools sit somewhere else on the consistency / merge /
-transport axes.
+The comparison target is the combined ooo/pivot requirement, not just "sync data":
+embedded keyed state, direct HTTP reads/writes, WebSocket subscriptions that browser
+clients can consume, offline station writes, and causal ordering that does not trust
+wall-clock timestamps.
 
-| Tool | Consistency | Conflict handling | Shape | vs pivot |
-|------|-------------|-------------------|-------|----------|
-| **pivot** | AP (eventual) | VV-ordered; leader wins true concurrency (last-sync-wins) | Embedded Go lib, HTTP, leader/follower | — |
-| **rqlite / dqlite** | CP (Raft) | Linearizable; no conflicts by design | Distributed SQLite (server / C lib) | Choose these for correctness-critical SQL with failover; they trade availability under partition for consistency, which pivot deliberately keeps. ([rqlite FAQ](https://rqlite.io/docs/faq/), [dqlite](https://github.com/canonical/dqlite)) |
-| **Litestream** | Single-writer + async backup | n/a (no multi-writer) | SQLite WAL → object storage | Disaster-recovery/replica, not multi-node live sync; a lost primary restores from backup rather than failing over. ([Litestream alternatives](https://litestream.io/alternatives/)) |
-| **CouchDB / PouchDB** | AP (multi-master, eventual) | MVCC revision trees; **app resolves** conflicts | Standalone DB + JS client, HTTP replication | Closest in spirit (HTTP, AP, multi-master). pivot resolves conflicts *automatically* (VV order, leader wins concurrency) instead of surfacing revision conflicts for the app to merge, and embeds in ooo rather than being a separate database. ([CouchDB consistency](https://docs.couchdb.org/en/stable/intro/consistency.html)) |
-| **ElectricSQL / PowerSync** | Local-first sync engines | LWW by default (Electric), custom server-side (PowerSync) | Postgres ⇆ client SQLite | Full-stack local-first frameworks with a separate client DB and a Postgres backend; pivot is ooo-to-ooo, server-side, with no separate client store. ([Electric vs PowerSync](https://powersync.com/blog/electricsql-vs-powersync)) |
-| **Automerge / Yjs (CRDTs)** | Strong eventual (SEC) | Mathematically auto-merging | Embedded CRDT libraries | CRDTs *merge* concurrent edits (no data loss) at the cost of complexity, data-type constraints, and metadata overhead; pivot picks a winner instead of merging — simpler, but lossy on true concurrency. ([CRDT field guide](https://www.iankduncan.com/engineering/2025-11-27-crdt-dictionary/)) |
-| **etcd / ZooKeeper** | CP (consensus) | Linearizable | Coordination service | Built for config/locks/leader-election with strong consistency, not high-write-availability data sync. |
+Yes, this is reinventing part of a wheel. That has a real maintenance cost: pivot
+owns its protocol, conflict policy, health checks, retry behavior, route surface, and
+edge cases around deletes and clock drift. The question is whether an existing wheel
+meets the same constraints with less total system complexity.
 
-**When pivot is the right call:** you already run ooo, you want each node to keep
-writing through a partition, and leader-convergent resolution (causal VV ordering so
-clock skew can't corrupt state; the leader wins genuine concurrency) is acceptable
-conflict handling. **When it isn't:** you need linearizable reads (→ rqlite/etcd), or
-you need concurrent edits *merged* rather than one-wins (→ CRDTs).
+| Solution | Offline writes | Ordering / conflicts | Browser-readable realtime surface | Infrastructure and fit |
+|----------|----------------|----------------------|-----------------------------------|------------------------|
+| **ooo + pivot** | Yes. A node accepts writes while the leader is unreachable. | Version vectors order causally-related writes without trusting clocks. True concurrency is lossy: the leader wins and pivot does not preserve a conflict record. | Yes. ooo exposes REST reads/writes and WebSocket subscriptions to keys/lists, with JSON Patch updates. ([ooo](https://github.com/benitogf/ooo)) | Embedded Go library over ooo storage. Best fit when the data is small/medium operational state, most mutable keys have one station owner, and adding a separate database/cache/sync service would become the hot path. |
+| **Cloud Firestore** | Yes on web/mobile SDKs. Cached data can be read, written, listened to, and synced later. | Not causal conflict preservation. Firestore documents same-document offline conflicts as last-write-wins; transactions fail offline. | Yes. Browser SDKs expose realtime listeners with `onSnapshot`. | Strong off-the-shelf replacement if a managed cloud document database, SDK-local cache, Firebase security model, and LWW conflicts are acceptable. ([offline](https://firebase.google.com/docs/firestore/manage-data/enable-offline), [listeners](https://firebase.google.com/docs/firestore/query-data/listen)) |
+| **CouchDB / PouchDB** | Yes. PouchDB can write locally and replicate with CouchDB later. | MVCC revision trees preserve conflicts for application resolution; this avoids clock-based overwrite but requires conflict handling. | Partly. PouchDB has browser-local reads and changes/replication feeds, but it is a database replication model rather than ooo-style key WebSocket streams. | Real replacement candidate if a separate document database and explicit conflict resolution are acceptable. ([CouchDB consistency](https://docs.couchdb.org/en/stable/intro/consistency.html)) |
+| **PowerSync** | Yes. Local SQLite writes are queued and uploaded later. | Causal+ checkpoints and FIFO upload queues avoid clock-based client ordering; backend code still owns validation and conflict handling. | Partly. Clients read reactive local SQLite and receive sync checkpoints. It is not a generic REST/WS state server; every browser/device must run the SDK/local store. | Serious replacement candidate if the architecture can become central DB + PowerSync service + local SQLite clients + synchronous backend write handling. ([consistency](https://docs.powersync.com/architecture/consistency), [writes](https://docs.powersync.com/handling-writes/writing-client-changes)) |
+| **Electric + PGlite / TanStack DB** | Not as a complete off-the-shelf answer today. The PGlite sync plugin says local writes and conflict resolution are not supported yet; TanStack DB can add optimistic write handling above that. | Server-to-client ordering follows Postgres/change-stream order. Offline write ordering/conflicts depend on the write layer you build or adopt. | Partly. Electric is designed for realtime partial replication to clients over HTTP, not an ooo-style REST/WS state server. | Good read-side realtime sync for Postgres-backed apps; incomplete for the hard offline-write requirement unless you add a write queue/conflict layer. ([PGlite sync](https://pglite.dev/docs/sync), [Electric Sync](https://electric-sql.com/sync)) |
+| **Replicache** | Yes. Mutations run locally and sync later. | Client mutation IDs/order and server replay avoid clock-based client mutation ordering; server mutators decide the canonical result. | Partly. Browser UIs subscribe to local Replicache state; server "pokes" for realtime pulls require endpoints you implement. | Good library, but not an off-the-shelf backend: you build push, pull, poke, auth, and persistence integration. It replaces the state model with client KV + mutators. ([docs](https://doc.replicache.dev/)) |
+| **Zero** | No for the hard case. It queues briefly while reconnecting, but rejects writes once disconnected. | Server-authoritative sync; not aimed at long offline mutation queues. | Yes for online browser sync. | Reject for this use case unless offline writes are no longer required. ([offline writes](https://zero.rocicorp.dev/docs/connection)) |
+| **Supabase Realtime / Postgres changes** | No by itself. Postgres is online-first; offline writes require a separate local store and upload queue. | Postgres gives transaction/commit ordering online; offline conflict semantics are yours to build. | Yes. Supabase Realtime exposes Postgres changes over WebSocket. | Useful if SQL is primary and offline writes are out of scope, or when paired with PowerSync/Electric/another local-first layer. Alone, it adds exactly the extra local cache/sync layer pivot avoids. ([protocol](https://supabase.com/docs/guides/realtime/protocol)) |
+| **rqlite / dqlite** | No, not in the AP sense. Writes go through a Raft leader/quorum; a partitioned station cannot keep committing independent local writes. | Yes, via Raft log order, stronger than pivot. | No built-in browser object/list subscription surface comparable to ooo; you would add an API and push layer. | Correct choice for strongly consistent SQL; wrong if "local progress must not stop" is non-negotiable. ([rqlite FAQ](https://rqlite.io/docs/faq/), [dqlite replication](https://canonical.com/dqlite/docs/explanation/replication)) |
+| **Automerge / Yjs** | Yes. CRDT edits can be made offline and merged later. | Yes. CRDT updates are causally mergeable and preserve concurrent intent. | Not by itself. You need a provider/server/backend such as y-websocket, Hocuspocus, Liveblocks, Automerge Repo, etc. | Best fit when the same logical value is edited concurrently and both intents must survive. Overkill for station-owned settings; not off-the-shelf unless paired with a managed/provider layer. ([Automerge](https://automerge.org/), [Yjs](https://docs.yjs.dev/)) |
+| **Litestream / backup replicas** | No. They protect one primary database; they do not make disconnected stations active writers. | WAL/frame order for restore, not multi-writer conflict ordering. | No. | Use for disaster recovery, not active-active station operation. ([how it works](https://litestream.io/how-it-works/)) |
 
-> On the LWW-vs-CRDT question, the local-first community's rough consensus is that
-> last-write-wins is sufficient for the large majority of shared-state apps, with
-> CRDTs reserved for genuinely collaborative merge cases. ([ElectricSQL vs PowerSync vs Zero](https://trybuildpilot.com/648-electric-sql-vs-powersync-vs-zero-2026), [conflict-resolution tradeoffs](https://medium.com/@priyasrivastava18official/system-design-pattern-from-chaos-to-consistency-the-art-of-conflict-resolution-in-distributed-9d631028bdb4))
+**When pivot is the right call:** you need embedded operational state with direct
+REST/WebSocket access, each station must keep writing through a partition, mutable
+keys are mostly station-owned, and leader-convergent conflict loss is acceptable.
+**When it isn't:** use Firestore/CouchDB/PowerSync if adopting their data model and
+infrastructure is acceptable, use Raft-backed SQL if consistency matters more than
+offline writes, or use CRDTs if concurrent edits to the same value must merge.
