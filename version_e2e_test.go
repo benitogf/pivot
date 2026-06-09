@@ -51,38 +51,29 @@ func VersionTestServer(t *testing.T, clusterURL string) *ooo.Server {
 	return server
 }
 
-// awaitPivotStatus subscribes to the node's pivot/status feed — the external
-// cluster-status API the UI consumes — and returns the first status whose pivot
-// protocol has been detected. The background health check broadcasts pivot/status
-// on every status change (pivot.go), so this is the event-driven, deterministic
-// replacement for polling GetPivotInfo while that check runs. sync.Once is the
-// sanctioned pattern here: pivot/status is an unbounded broadcast stream and we
-// want the first delivery that satisfies the condition.
-func awaitPivotStatus(t *testing.T, nodeServer *ooo.Server) ui.PivotInfo {
+// awaitDetectedProtocol reads the node's detected pivot protocol until it leaves
+// "unknown" or the deadline elapses.
+//
+// This deliberately polls rather than subscribing to an event. Protocol detection
+// is a LEVEL produced by an async background health check, not a reliably
+// observable edge: the node broadcasts pivot/status only on a status *change*, so
+// the single unknown→detected transition can be missed in a subscriber's connect
+// window (initial snapshot still "unknown", the one change broadcast lost), after
+// which no further broadcast ever arrives and a subscribe-and-wait hangs. Reading
+// the current level is the robust tool — /testing-go-backend-async's "wait on a
+// callback" guidance assumes a discrete completion event, which a background
+// level-detector with a change-only broadcast does not provide.
+func awaitDetectedProtocol(t *testing.T, nodeServer *ooo.Server) *ui.PivotInfo {
 	t.Helper()
-	var done sync.WaitGroup
-	done.Add(1)
-	var once sync.Once
-	var mu sync.Mutex
-	var got ui.PivotInfo
-	go client.Subscribe(client.SubscribeConfig{
-		Ctx:     t.Context(),
-		Server:  client.Server{Protocol: "ws", Host: nodeServer.Address},
-		Silence: true,
-	}, "pivot/status", client.SubscribeEvents[ui.PivotInfo]{
-		OnMessage: func(m client.Meta[ui.PivotInfo]) {
-			mu.Lock()
-			got = m.Data
-			mu.Unlock()
-			if m.Data.PivotProtocol != "unknown" {
-				once.Do(done.Done)
-			}
-		},
-	})
-	done.Wait()
-	mu.Lock()
-	defer mu.Unlock()
-	return got
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if info := pivot.GetPivotInfo(nodeServer)(); info != nil && info.PivotProtocol != "unknown" {
+			return info
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("health check did not detect the pivot protocol within 5s")
+	return nil
 }
 
 func TestE2E_VersionSync_CompatibleServers(t *testing.T) {
@@ -283,7 +274,7 @@ func TestE2E_VersionSync_NodeDetectsPivotProtocol(t *testing.T) {
 
 	// Wait (event-driven) for the health check to detect the pivot's protocol,
 	// observed through the node's pivot/status feed.
-	nodeInfo := awaitPivotStatus(t, nodeServer)
+	nodeInfo := awaitDetectedProtocol(t, nodeServer)
 	require.Equal(t, "node", nodeInfo.Role)
 	require.Equal(t, "http://"+pivotServer.Address, nodeInfo.PivotIP)
 	require.Equal(t, pivot.ProtocolVersion, nodeInfo.PivotProtocol, "node should detect pivot's protocol version")
@@ -312,7 +303,7 @@ func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
 
 	// Wait (event-driven) for the health check to detect the (incompatible)
 	// pivot protocol, observed through the node's pivot/status feed.
-	nodeInfo := awaitPivotStatus(t, nodeServer)
+	nodeInfo := awaitDetectedProtocol(t, nodeServer)
 	require.Equal(t, "node", nodeInfo.Role)
 	require.Equal(t, "1.0", nodeInfo.PivotProtocol, "node should detect pivot's protocol version 1.0")
 	require.False(t, nodeInfo.PivotCompatible, "node should report pivot as incompatible")
