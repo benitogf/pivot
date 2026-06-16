@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/benitogf/go-json"
 	"github.com/benitogf/ooo"
 	ooio "github.com/benitogf/ooo/io"
 	"github.com/benitogf/ooo/storage"
 	"github.com/benitogf/pivot"
-	"github.com/benitogf/go-json"
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/require"
 )
@@ -380,7 +380,6 @@ func MultiClusterAuthServer(t *testing.T, deviceClusterURL string, afterAuthWrit
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = clusterTestClient()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	// Create separate storage for users and policies (external storage pattern)
 	authStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
@@ -437,7 +436,6 @@ func MultiClusterDevicePivot(t *testing.T, afterDeviceWrite func(key string)) *o
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = clusterTestClient()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys: []pivot.Key{
@@ -475,7 +473,6 @@ func MultiClusterNodeDevice(t *testing.T, authServerURL string, deviceClusterURL
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = clusterTestClient()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	// Create separate storage for users and policies
 	authStorage := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})

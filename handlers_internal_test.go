@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
@@ -61,7 +62,7 @@ func TestDeleteTombstoneAtomicity(t *testing.T) {
 	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, real.Start(storage.Options{}))
 	defer real.Close()
-	storage.WatchWithCallback(real, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), real, func(storage.Event) {})
 
 	itemKey := "things/abc"
 	tombstoneKey := StoragePrefix + "things"
@@ -129,7 +130,7 @@ func TestSetVVIncrementsExactlyOnce(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
@@ -176,7 +177,7 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:             keys,
 		ConfigClusterURL: "127.0.0.1:8000", // non-empty -> node mode
 		GetNodes:         func() []string { return nil },
@@ -220,7 +221,7 @@ func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
@@ -267,7 +268,7 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
@@ -323,7 +324,7 @@ func TestSetPostWriteSeesBumpedVV(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	tracker := NewHandlerWriteTracker()
 	vvm := NewVVManager(db, "leader")
@@ -358,7 +359,7 @@ func TestSetVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, real.Start(storage.Options{}))
 	defer real.Close()
-	storage.WatchWithCallback(real, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), real, func(storage.Event) {})
 
 	failing := &failingItemStorage{
 		Database:    real,
@@ -407,7 +408,7 @@ func TestDeleteVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, real.Start(storage.Options{}))
 	defer real.Close()
-	storage.WatchWithCallback(real, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), real, func(storage.Event) {})
 
 	itemKey := "things/abc"
 	tombstoneKey := StoragePrefix + "things"
@@ -448,7 +449,7 @@ func TestDeleteHappyPathStillCommitsBoth(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	itemKey := "things/abc"
 	tombstoneKey := StoragePrefix + "things"

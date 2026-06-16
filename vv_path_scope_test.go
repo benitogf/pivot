@@ -15,6 +15,7 @@ package pivot
 // share state.
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -45,7 +46,7 @@ func TestActivityExposesVVAfterGlobWrite(t *testing.T) {
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
@@ -97,7 +98,7 @@ func TestCallbackIncrementsAtPathScope(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:     keys,
 		GetNodes: func() []string { return nil },
 		Instance: instance,
@@ -133,7 +134,7 @@ func TestHandlerIncrementMatchesActivityScope(t *testing.T) {
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(db, makeStorageSync(StorageSyncConfig{
+	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,

@@ -321,7 +321,7 @@ func (i *Instance) bumpVVForLocalWrite(eventKey string, op string) {
 // This is a convenience method that replaces the manual setup:
 //
 //	db.Start(storage.Options{BeforeRead: instance.BeforeRead})
-//	storage.WatchWithCallback(db, instance.SyncCallback)
+//	storage.WatchWithCallback(instance.ctx, db, instance.SyncCallback)
 //
 // Optional storageOpts can be provided to pass additional storage options (e.g., AfterWrite for testing).
 //
@@ -396,7 +396,7 @@ func (i *Instance) Attach(db storage.Database, storageOpts ...storage.Options) e
 			return err
 		}
 	}
-	storage.WatchWithCallback(db, i.SyncCallback)
+	storage.WatchWithCallback(i.ctx, db, i.SyncCallback)
 	return nil
 }
 

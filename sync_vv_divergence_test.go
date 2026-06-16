@@ -13,6 +13,7 @@ package pivot
 // (backward compatibility with old peers).
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -60,7 +61,7 @@ func TestSyncDetectsVVDivergenceOnEqualLastEntryPullCase(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	collidedTS := int64(1_700_000_000_000_000_000)
 	// Seed a single local item so checkActivity returns collidedTS.
@@ -117,7 +118,7 @@ func TestSyncDetectsVVDivergenceOnEqualLastEntryPushCase(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	collidedTS := int64(1_700_000_000_000_000_000)
 	obj := meta.Object{Created: collidedTS, Updated: collidedTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"local"}`)}
@@ -172,7 +173,7 @@ func TestSyncPushDirectionPushesWhenItemTimestampsAllow(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	leaderTS := int64(1_700_000_000_000_000_000)
 	localTS := leaderTS + 1_000_000 // strictly newer item
@@ -210,7 +211,7 @@ func TestSyncSkipsWhenVVsAreEqual(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	collidedTS := int64(1_700_000_000_000_000_000)
 	vvm := NewVVManager(localDB, "127.0.0.1:9000")
@@ -253,7 +254,7 @@ func TestSyncConcurrentVVsLogsAndPullsLeader(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	collidedTS := int64(1_700_000_000_000_000_000)
 	obj := meta.Object{Created: collidedTS, Updated: collidedTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"local"}`)}
@@ -309,7 +310,7 @@ func TestSyncFallsBackToLastEntryWhenLeaderHasNoVV(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	leaderTS := int64(1_700_000_000_000_000_500)
 	leaderItem := meta.Object{Created: leaderTS, Updated: leaderTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"from-leader"}`)}
@@ -343,7 +344,7 @@ func TestSyncFallsBackToLastEntryWhenLocalHasNoVV(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	leaderTS := int64(1_700_000_000_000_000_500)
 	leaderItem := meta.Object{Created: leaderTS, Updated: leaderTS, Index: "x", Path: "things/x", Data: []byte(`{"v":"from-leader"}`)}
