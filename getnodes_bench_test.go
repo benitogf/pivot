@@ -66,7 +66,7 @@ func seedNodes(t testing.TB, s *ooo.Server, n int, extraSettingsKB int) {
 // on the GetNodes call and does not spin up health-check goroutines etc.
 func newBenchInstance(s *ooo.Server, nodesKey string) *Instance {
 	inst := &Instance{}
-	inst.nodesCache = newNodesCache(s, nodesKey, inst.IsShutdown)
+	inst.nodesCache = newNodesCache(s, nodesKey, "", inst.IsShutdown)
 	return inst
 }
 
@@ -81,7 +81,7 @@ func BenchmarkGetNodesFresh(b *testing.B) {
 				defer s.Storage.Close()
 				seedNodes(b, s, n, kb)
 				inst := newBenchInstance(s, "nodes/*")
-				get := makeGetNodes(s, "nodes/*", inst)
+				get := makeGetNodes(s, "nodes/*", "", inst)
 
 				b.ReportAllocs()
 				b.ResetTimer()

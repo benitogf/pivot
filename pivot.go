@@ -51,6 +51,14 @@ type Config struct {
 	SSL                 bool          // If true, use HTTPS instead of HTTP for all requests. Default false.
 	HealthCheckInterval time.Duration // Interval for health checks. Default 3s.
 	SyncRetryInterval   time.Duration // Initial backoff for sync retries. Default 1s.
+	// NodeHostField, when non-empty, is the JSON field name in a NodesKey entry
+	// whose value is used as the dial host (combined with the entry's port)
+	// instead of the "ip" field. Empty (default) preserves the historical
+	// ip:port behavior exactly. Use it to dial nodes by a DNS name so a
+	// name-only TLS leaf (no IP SAN) validates under standard hostname
+	// verification. Resolution is per-entry: an entry missing/blank in this
+	// field falls back to its ip, so a mixed fleet stays reachable.
+	NodeHostField string
 }
 
 // Scheme returns "https" if SSL is enabled, "http" otherwise.
@@ -86,19 +94,28 @@ type getNodes func() []string
 // GetNodes is the exported type for node discovery functions (backward compatibility)
 type GetNodes func() []string
 
-// parseNodeAddr extracts "ip:port" from a node entry's JSON data.
+// parseNodeAddr extracts "host:port" from a node entry's JSON data.
 // Returns "" if either field is missing or invalid. Accepts lower/upper case
-// keys and int/float64/string port encodings.
-func parseNodeAddr(data []byte) string {
+// keys and int/float64/string port encodings. When hostField is non-empty and
+// the entry carries a non-blank value under it, that value is used as the host
+// (e.g. a DNS name for name-based TLS); otherwise it falls back to the ip field.
+func parseNodeAddr(data []byte, hostField string) string {
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return ""
 	}
 	var ip string
-	if v, ok := raw["ip"].(string); ok {
-		ip = v
-	} else if v, ok := raw["IP"].(string); ok {
-		ip = v
+	if hostField != "" {
+		if v, ok := raw[hostField].(string); ok {
+			ip = v
+		}
+	}
+	if ip == "" {
+		if v, ok := raw["ip"].(string); ok {
+			ip = v
+		} else if v, ok := raw["IP"].(string); ok {
+			ip = v
+		}
 	}
 	var port int
 	for _, k := range [2]string{"port", "Port"} {
@@ -128,18 +145,20 @@ func parseNodeAddr(data []byte) string {
 type nodesCache struct {
 	server     *ooo.Server
 	nodesKey   string
+	hostField  string
 	isShutdown func() bool
 
 	mu      sync.RWMutex
 	loaded  bool
-	entries map[string]string // obj.Index -> "ip:port"
+	entries map[string]string // obj.Index -> "host:port"
 	slice   []string          // immutable after rebuild; callers must not mutate
 }
 
-func newNodesCache(server *ooo.Server, nodesKey string, isShutdown func() bool) *nodesCache {
+func newNodesCache(server *ooo.Server, nodesKey, hostField string, isShutdown func() bool) *nodesCache {
 	return &nodesCache{
 		server:     server,
 		nodesKey:   nodesKey,
+		hostField:  hostField,
 		isShutdown: isShutdown,
 	}
 }
@@ -180,7 +199,7 @@ func (c *nodesCache) loadLocked() {
 		return
 	}
 	for _, obj := range objs {
-		if addr := parseNodeAddr(obj.Data); addr != "" {
+		if addr := parseNodeAddr(obj.Data, c.hostField); addr != "" {
 			c.entries[obj.Index] = addr
 		}
 	}
@@ -210,7 +229,7 @@ func (c *nodesCache) update(event storage.Event) {
 		delete(c.entries, idx)
 		c.rebuildSliceLocked()
 	case "set":
-		newAddr := parseNodeAddr(event.Object.Data)
+		newAddr := parseNodeAddr(event.Object.Data, c.hostField)
 		prev, had := c.entries[idx]
 		if had && newAddr == prev {
 			// Settings-only change — ip:port unchanged, nothing to do.
@@ -274,7 +293,7 @@ func buildKeys(server *ooo.Server, config Config) []Key {
 // storage on every call. This preserves synchronous read-after-write semantics
 // for external consumers (e.g., the UI, GetPivotInfo) who expect a node that
 // was just registered to appear immediately.
-func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNodes {
+func makeGetNodes(server *ooo.Server, nodesKey, hostField string, instance *Instance) getNodes {
 	return func() []string {
 		if instance.IsShutdown() {
 			return nil
@@ -296,7 +315,7 @@ func makeGetNodes(server *ooo.Server, nodesKey string, instance *Instance) getNo
 		result := make([]string, 0, len(extras)+len(objs))
 		result = append(result, extras...)
 		for _, obj := range objs {
-			if addr := parseNodeAddr(obj.Data); addr != "" {
+			if addr := parseNodeAddr(obj.Data, hostField); addr != "" {
 				result = append(result, addr)
 			}
 		}
@@ -530,9 +549,9 @@ func SetupWithError(server *ooo.Server, config Config) (*ooo.Server, error) {
 		ctx:           instanceCtx,
 		cancel:        instanceCancel,
 	}
-	instance.nodesCache = newNodesCache(server, config.NodesKey, instance.IsShutdown)
+	instance.nodesCache = newNodesCache(server, config.NodesKey, config.NodeHostField, instance.IsShutdown)
 
-	getNodes := makeGetNodes(server, config.NodesKey, instance)
+	getNodes := makeGetNodes(server, config.NodesKey, config.NodeHostField, instance)
 	getNodesCached := makeGetNodesCached(instance)
 
 	// Construct VVManager first so the syncer pool can read local VVs
