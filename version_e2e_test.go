@@ -34,7 +34,6 @@ func VersionTestServer(t *testing.T, clusterURL string) *ooo.Server {
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{Timeout: 500 * time.Millisecond}
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:                []pivot.Key{{Path: "items/*"}},

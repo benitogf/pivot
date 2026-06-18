@@ -91,7 +91,6 @@ func setupGlobServers(t *testing.T) *globServers {
 	pivotServer.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	pivotServer.Router = mux.NewRouter()
 	pivotServer.Client = mkClient()
-	pivotServer.Audit = func(r *http.Request) bool { return true }
 	pivot.Setup(pivotServer, pivot.Config{
 		Keys:       []pivot.Key{{Path: "things/*", Database: pivotThings}},
 		ClusterURL: "",
@@ -107,7 +106,6 @@ func setupGlobServers(t *testing.T) *globServers {
 	nodeServer.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	nodeServer.Router = mux.NewRouter()
 	nodeServer.Client = mkClient()
-	nodeServer.Audit = func(r *http.Request) bool { return true }
 	pivot.Setup(nodeServer, pivot.Config{
 		Keys:                []pivot.Key{{Path: "things/*", Database: nodeThings}},
 		ClusterURL:          pivotServer.Address,

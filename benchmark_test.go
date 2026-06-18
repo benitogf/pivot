@@ -30,7 +30,6 @@ func createBenchServer() *ooo.Server {
 			DisableKeepAlives: true,
 		},
 	}
-	server.Audit = func(r *http.Request) bool { return true }
 	server.OpenFilter("things/*")
 	server.OpenFilter("settings")
 	server.Start("localhost:0")
@@ -56,7 +55,6 @@ func createBenchPivotServer() *ooo.Server {
 	server.Static = true
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:       []pivot.Key{{Path: "settings"}},
@@ -79,7 +77,6 @@ func createBenchNodeServer(pivotAddress string) *ooo.Server {
 	server.Static = true
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:                []pivot.Key{{Path: "settings"}},
@@ -268,7 +265,6 @@ func createBenchPivotServerWithWaiter(waiter *eventWaiter) *ooo.Server {
 	server.Static = true
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:       []pivot.Key{{Path: "settings"}},
@@ -302,7 +298,6 @@ func createBenchNodeServerWithWaiter(pivotAddress string, waiter *eventWaiter) *
 	server.Static = true
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:                []pivot.Key{{Path: "settings"}},

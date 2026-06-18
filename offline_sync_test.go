@@ -121,7 +121,6 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 			DisableKeepAlives: true,
 		},
 	}
-	pivotServer.Audit = func(r *http.Request) bool { return true }
 
 	// Configure pivot with policies using SEPARATE storage
 	pivotConfig := pivot.Config{
@@ -182,7 +181,6 @@ func setupOfflineServers(t *testing.T) *OfflineTestServers {
 			DisableKeepAlives: true,
 		},
 	}
-	nodeServer.Audit = func(r *http.Request) bool { return true }
 
 	// Configure node with policies using SEPARATE storage
 	nodeConfig := pivot.Config{

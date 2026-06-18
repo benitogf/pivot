@@ -279,7 +279,6 @@ func setupClobberServers(t *testing.T) *clobberServers {
 	pivotServer.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	pivotServer.Router = mux.NewRouter()
 	pivotServer.Client = mkClient()
-	pivotServer.Audit = func(r *http.Request) bool { return true }
 
 	pivot.Setup(pivotServer, pivot.Config{
 		Keys:       []pivot.Key{{Path: "policies", Database: pivotPoliciesStorage}},
@@ -298,7 +297,6 @@ func setupClobberServers(t *testing.T) *clobberServers {
 	nodeServer.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	nodeServer.Router = mux.NewRouter()
 	nodeServer.Client = mkClient()
-	nodeServer.Audit = func(r *http.Request) bool { return true }
 
 	pivot.Setup(nodeServer, pivot.Config{
 		Keys:                []pivot.Key{{Path: "policies", Database: nodePoliciesStorage}},

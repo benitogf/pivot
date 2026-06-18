@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,7 +18,7 @@ func TestGlobPullUsesVVAuthorityWhenTimestampsDisagree(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	// Local has a future timestamp with stale payload.
 	_, err := localDB.SetWithMeta("things/x", []byte(`{"v":"stale-local"}`), 9_999, 9_999)
@@ -71,7 +72,7 @@ func TestGlobPushUsesVVAuthorityWhenTimestampsDisagree(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	// Local has causally newer data but smaller wall-clock timestamp.
 	_, err := localDB.SetWithMeta("things/x", []byte(`{"v":"local-causally-newer"}`), 100, 100)
