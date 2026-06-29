@@ -272,8 +272,9 @@ func TestE2E_VersionSync_NodeDetectsPivotProtocol(t *testing.T) {
 	nodeServer := VersionTestServer(t, "http://"+pivotServer.Address)
 	defer nodeServer.Close(os.Interrupt)
 
-	// Wait (event-driven) for the health check to detect the pivot's protocol,
-	// observed through the node's pivot/status feed.
+	// Bounded poll of the node's detected protocol level until it leaves
+	// "unknown" (see awaitDetectedProtocol for why this polls rather than
+	// subscribes).
 	nodeInfo := awaitDetectedProtocol(t, nodeServer)
 	require.Equal(t, "node", nodeInfo.Role)
 	require.Equal(t, "http://"+pivotServer.Address, nodeInfo.PivotIP)
@@ -301,8 +302,9 @@ func TestE2E_VersionSync_NodeDetectsIncompatiblePivotProtocol(t *testing.T) {
 	nodeServer := VersionTestServer(t, "http://"+mockPivot.Listener.Addr().String())
 	defer nodeServer.Close(os.Interrupt)
 
-	// Wait (event-driven) for the health check to detect the (incompatible)
-	// pivot protocol, observed through the node's pivot/status feed.
+	// Bounded poll of the node's detected protocol level until it leaves
+	// "unknown" (see awaitDetectedProtocol for why this polls rather than
+	// subscribes).
 	nodeInfo := awaitDetectedProtocol(t, nodeServer)
 	require.Equal(t, "node", nodeInfo.Role)
 	require.Equal(t, "1.0", nodeInfo.PivotProtocol, "node should detect pivot's protocol version 1.0")
