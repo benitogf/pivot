@@ -60,7 +60,6 @@ func benchPivotServer(b *testing.B) (*ooo.Server, storage.Database, func()) {
 			DisableKeepAlives: true,
 		},
 	}
-	server.Audit = func(r *http.Request) bool { return true }
 
 	pivot.Setup(server, pivot.Config{
 		Keys:       []pivot.Key{{Path: "policies", Database: policiesStorage}},

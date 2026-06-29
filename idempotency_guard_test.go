@@ -21,6 +21,7 @@ package pivot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strconv"
@@ -43,7 +44,7 @@ func TestSetGuardSkipsStaleRetry(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	// Seed local with the newer "operator" value. Local VV reflects a
 	// prior synced write from node A (A:2) and the operator's local
@@ -82,7 +83,7 @@ func TestSetGuardSkipsExactRetry(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	_, err := db.SetWithMeta("things/x", []byte(`{"v":"v1"}`), 100, 100)
 	require.NoError(t, err)
@@ -114,7 +115,7 @@ func TestSetGuardAcceptsHigherVV(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	_, err := db.SetWithMeta("things/x", []byte(`{"v":"older"}`), 100, 100)
 	require.NoError(t, err)
@@ -148,7 +149,7 @@ func TestSetGuardProceedsWithoutHeader(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	vvm := NewVVManager(db, "leader")
 	// Seed local VV that *would* dominate if compared.
@@ -183,7 +184,7 @@ func TestSetGuardPreservesClockDriftScenario(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	// Local has the future-timestamped write at A:1. Pivot's local VV
 	// reflects {A:1}.
@@ -229,7 +230,7 @@ func TestSetGuardProceedsOnVVConcurrent(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	_, err := db.SetWithMeta("things/x", []byte(`{"v":"local"}`), 100, 100)
 	require.NoError(t, err)
@@ -273,7 +274,7 @@ func TestSetGuardProceedsOnMalformedHeader(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	vvm := NewVVManager(db, "leader")
 	vvm.set("things/*", VersionVector{"leader": 5}) // would dominate if compared
@@ -303,7 +304,7 @@ func TestDeleteGuardSkipsStaleTombstone(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	_, err := db.SetWithMeta("things/x", []byte(`{"v":"newer"}`), 100, 100)
 	require.NoError(t, err)

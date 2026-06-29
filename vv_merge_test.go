@@ -35,7 +35,7 @@ func TestSetHandlerMergesInboundVV(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	vvm := NewVVManager(db, "leader")
 	handler := Set(db, "things", NewHandlerWriteTracker(), vvm, nil)
@@ -69,7 +69,7 @@ func TestSetHandlerNoMergeWithoutHeader(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	vvm := NewVVManager(db, "leader")
 	handler := Set(db, "things", NewHandlerWriteTracker(), vvm, nil)
@@ -97,7 +97,7 @@ func TestDeleteHandlerMergesInboundVV(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	// Seed an item so Delete has something to remove.
 	_, err := db.SetWithMeta("things/x", []byte(`{"v":"v1"}`), 1, 1)

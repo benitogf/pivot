@@ -96,6 +96,17 @@ func FakeServer(t *testing.T, clusterURL string, onPolicyWrite func()) *ooo.Serv
 	server := &ooo.Server{}
 	server.Silence = true
 	server.Static = true
+	// Lossless watch: never drop a storage→broadcast event under consumer
+	// stall. The default drop-after-timeout is a production write-hang
+	// resilience feature, but in this deterministic test a dropped broadcast
+	// would silently desync a subscriber and surface as a flaky hung Wait. With
+	// it off, every committed write deterministically reaches every live sub —
+	// exactly what the per-operation WaitGroups below assume. OnDroppedEvent is
+	// wired as a guard: it must never fire.
+	server.LosslessWatch = true
+	server.OnDroppedEvent = func(ev storage.Event) {
+		t.Errorf("watch event dropped (key=%q op=%q) — lossless watch should prevent this", ev.Key, ev.Operation)
+	}
 	server.Storage = storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	server.Router = mux.NewRouter()
 	server.Client = &http.Client{
@@ -107,9 +118,6 @@ func FakeServer(t *testing.T, clusterURL string, onPolicyWrite func()) *ooo.Serv
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
 		},
-	}
-	server.Audit = func(r *http.Request) bool {
-		return true
 	}
 
 	// Create auth store

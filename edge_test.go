@@ -167,7 +167,6 @@ func createEdgeTestServer(pivotIP string, nodeStorage storage.Database) (*ooo.Se
 			DisableKeepAlives: true,
 		},
 	}
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:                []pivot.Key{{Path: "settings"}},
@@ -210,7 +209,6 @@ func createEdgeTestServerNoSync(pivotIP string) *ooo.Server {
 			DisableKeepAlives: true,
 		},
 	}
-	server.Audit = func(r *http.Request) bool { return true }
 
 	config := pivot.Config{
 		Keys:                []pivot.Key{{Path: "settings"}},

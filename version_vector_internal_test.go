@@ -7,6 +7,7 @@ package pivot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -43,7 +44,7 @@ func BenchmarkVVManagerIncrement(b *testing.B) {
 	if err := db.Start(storage.Options{}); err != nil {
 		b.Fatal(err)
 	}
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 	b.Cleanup(func() { db.Close() })
 	m := NewVVManager(db, "leader")
 

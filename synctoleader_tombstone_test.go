@@ -12,6 +12,7 @@ package pivot
 // Both must reach the same conclusion.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -27,8 +28,8 @@ import (
 
 func TestSyncToLeaderHonoursTombstone(t *testing.T) {
 	cases := []struct {
-		name        string
-		emitHeader  bool
+		name          string
+		emitHeader    bool
 		serveActivity bool
 	}{
 		{name: "new_leader_with_header", emitHeader: true, serveActivity: false},
@@ -45,7 +46,7 @@ func TestSyncToLeaderHonoursTombstone(t *testing.T) {
 			if err := localDB.Start(storage.Options{}); err != nil {
 				t.Fatal(err)
 			}
-			storage.WatchWithCallback(localDB, func(storage.Event) {})
+			storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 			defer localDB.Close()
 
 			oldTime := time.Now().UTC().Add(-2 * time.Hour).UnixNano()

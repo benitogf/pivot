@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
@@ -27,7 +28,7 @@ import (
 // VV write to StoragePrefix keys don't match the data glob, so they don't
 // inflate the count.
 func watchProcessed(db storage.Database, cb StorageSyncCallback, glob string, wg *sync.WaitGroup) {
-	storage.WatchWithCallback(db, func(e storage.Event) {
+	storage.WatchWithCallback(context.Background(), db, func(e storage.Event) {
 		cb(e)
 		if key.Match(glob, e.Key) {
 			wg.Done()
@@ -70,7 +71,7 @@ func TestDeleteTombstoneAtomicity(t *testing.T) {
 	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, real.Start(storage.Options{}))
 	defer real.Close()
-	storage.WatchWithCallback(real, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), real, func(storage.Event) {})
 
 	itemKey := "things/abc"
 	tombstoneKey := StoragePrefix + "things"
@@ -347,7 +348,7 @@ func TestSetPostWriteSeesBumpedVV(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	tracker := NewHandlerWriteTracker()
 	vvm := NewVVManager(db, "leader")
@@ -382,7 +383,7 @@ func TestSetVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, real.Start(storage.Options{}))
 	defer real.Close()
-	storage.WatchWithCallback(real, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), real, func(storage.Event) {})
 
 	failing := &failingItemStorage{
 		Database:    real,
@@ -431,7 +432,7 @@ func TestDeleteVVDoesNotBumpOnStorageFailure(t *testing.T) {
 	real := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, real.Start(storage.Options{}))
 	defer real.Close()
-	storage.WatchWithCallback(real, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), real, func(storage.Event) {})
 
 	itemKey := "things/abc"
 	tombstoneKey := StoragePrefix + "things"
@@ -472,7 +473,7 @@ func TestDeleteHappyPathStillCommitsBoth(t *testing.T) {
 	db := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, db.Start(storage.Options{}))
 	defer db.Close()
-	storage.WatchWithCallback(db, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), db, func(storage.Event) {})
 
 	itemKey := "things/abc"
 	tombstoneKey := StoragePrefix + "things"

@@ -1,6 +1,7 @@
 package pivot
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +17,7 @@ func TestSingleKeyPullIgnoresSkewedDeleteTimestampWhenVVLess(t *testing.T) {
 	localDB := storage.New(storage.LayeredConfig{Memory: storage.NewMemoryLayer()})
 	require.NoError(t, localDB.Start(storage.Options{}))
 	defer localDB.Close()
-	storage.WatchWithCallback(localDB, func(storage.Event) {})
+	storage.WatchWithCallback(context.Background(), localDB, func(storage.Event) {})
 
 	// Simulate a skewed future tombstone timestamp for this key.
 	_, err := localDB.Set(StoragePrefix+"things/x", []byte("999999999999999999"))

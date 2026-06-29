@@ -207,9 +207,6 @@ func startNodeServerPerKey(globalPivotURL, devicesPivotURL string, nodeStorage s
 			DisableKeepAlives: true,
 		},
 	}
-	server.Audit = func(r *http.Request) bool {
-		return true
-	}
 
 	config := pivot.Config{
 		Keys: []pivot.Key{
@@ -245,9 +242,6 @@ func startPivotServerWithDevices(pivotIP string) *ooo.Server {
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
 		},
-	}
-	server.Audit = func(r *http.Request) bool {
-		return true
 	}
 
 	config := pivot.Config{
@@ -290,9 +284,6 @@ func startPivotServer(pivotIP string) (*ooo.Server, *sync.WaitGroup) {
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
 		},
-	}
-	server.Audit = func(r *http.Request) bool {
-		return true
 	}
 
 	config := pivot.Config{
@@ -345,9 +336,6 @@ func startNodeServer(pivotIP string, nodeStorage storage.Database) (*ooo.Server,
 			MaxConnsPerHost:   3000,
 			DisableKeepAlives: true,
 		},
-	}
-	server.Audit = func(r *http.Request) bool {
-		return true
 	}
 
 	config := pivot.Config{

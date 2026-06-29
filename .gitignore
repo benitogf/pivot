@@ -3,3 +3,4 @@ pivot.test
 test_*
 test/
 *.code-workspace
+.flaky/
