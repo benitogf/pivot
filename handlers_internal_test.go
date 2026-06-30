@@ -7,9 +7,11 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/benitogf/ooo/key"
 	"github.com/benitogf/ooo/meta"
 	"github.com/benitogf/ooo/monotonic"
 	"github.com/benitogf/ooo/storage"
@@ -17,14 +19,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// pendingLen exposes the tracker's pending count for tests that need to
-// wait for the watch goroutine to drain. Lives in the test file so it
-// doesn't leak into the production API surface — production code has no
-// legitimate need to introspect the tracker.
-func (t *HandlerWriteTracker) pendingLen() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.pending)
+// watchProcessed wraps a storage sync callback so wg.Done() fires after the
+// watch goroutine finishes processing each event whose key matches glob. It
+// lets these handler+callback tests wait deterministically for the async
+// callback to drain the writes they care about — the watch goroutine is what
+// could double-bump the VV, so observing its completion is the right signal —
+// without sleeps or polling internal tracker counters. Bumps that persist the
+// VV write to StoragePrefix keys don't match the data glob, so they don't
+// inflate the count.
+func watchProcessed(db storage.Database, cb StorageSyncCallback, glob string, wg *sync.WaitGroup) {
+	storage.WatchWithCallback(context.Background(), db, func(e storage.Event) {
+		cb(e)
+		if key.Match(glob, e.Key) {
+			wg.Done()
+		}
+	})
 }
 
 // failingTombstoneStorage forces Set on the pivot tombstone prefix to fail.
@@ -130,12 +139,13 @@ func TestSetVVIncrementsExactlyOnce(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
 		Instance:       instance,
-	}))
+	}), "things/*", &processed)
 
 	handler := Set(db, "things", tracker, vvm, nil)
 
@@ -149,14 +159,17 @@ func TestSetVVIncrementsExactlyOnce(t *testing.T) {
 		require.Equal(t, 200, w.Code)
 	}
 
+	// Wait for the watch goroutine to process each write before reading the
+	// counter: it is the path that could double-bump, so its completion (not a
+	// sleep) is the deterministic signal that the count has settled.
+	processed.Add(1)
 	doSet("abc")
-	// Settle: callback runs in the watch goroutine, so we need to let any
-	// stray increment race past the handler's own Get before reading.
-	time.Sleep(100 * time.Millisecond)
+	processed.Wait()
 	require.Equal(t, int64(1), vvm.Get("things")["leader"], "first Set must bump leader counter to exactly 1")
 
+	processed.Add(1)
 	doSet("abc")
-	time.Sleep(100 * time.Millisecond)
+	processed.Wait()
 	require.Equal(t, int64(2), vvm.Get("things")["leader"], "second Set must bump leader counter to exactly 2")
 }
 
@@ -177,13 +190,14 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:             keys,
 		ConfigClusterURL: "127.0.0.1:8000", // non-empty -> node mode
 		GetNodes:         func() []string { return nil },
 		HandlerTracker:   tracker,
 		Instance:         instance,
-	}))
+	}), "things/*", &processed)
 
 	handler := Set(db, "things", tracker, vvm, nil)
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
@@ -191,9 +205,10 @@ func TestSetVVIncrementsExactlyOnceNodeRole(t *testing.T) {
 	req = mux.SetURLVars(req, map[string]string{"index": "abc"})
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
+	processed.Add(1)
 	handler(w, req)
 	require.Equal(t, 200, w.Code)
-	time.Sleep(100 * time.Millisecond)
+	processed.Wait() // watch goroutine processed the write (no second bump)
 
 	got := vvm.Get("things")
 	require.Equal(t, int64(1), got["127.0.0.1:9999"],
@@ -221,16 +236,18 @@ func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
 		Instance:       instance,
-	}))
+	}), "things/*", &processed)
 
 	handler := Set(db, "things", tracker, vvm, nil)
 
 	const burst = 10
+	processed.Add(burst)
 	for range burst {
 		body := strings.NewReader(`{"created":0,"updated":0,"index":"abc","path":"things/abc","data":"e30="}`)
 		req := httptest.NewRequest("POST", "/_pivot/pivot/things/abc", body)
@@ -241,10 +258,10 @@ func TestSetVVIncrementsExactlyOnceUnderBurst(t *testing.T) {
 		require.Equal(t, 200, w.Code)
 	}
 
-	// Wait deterministically for the watch goroutine to drain every event;
-	// when tracker.pendingLen() hits zero, every Mark has been Consumed.
-	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, 2*time.Second, 5*time.Millisecond,
-		"watch goroutine never drained all %d events", burst)
+	// Wait for the watch goroutine to process all burst events (each Consumes
+	// one Mark). Its completion is the deterministic signal that every event
+	// drained — no polling of internal tracker state.
+	processed.Wait()
 
 	got := vvm.Get("things")["leader"]
 	require.Equal(t, int64(burst), got,
@@ -268,17 +285,20 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
 		Instance:       instance,
-	}))
+	}), "things/*", &processed)
 
 	// Seed a few items so each Delete actually has something to remove.
 	// Seeding goes through db.SetWithMeta directly (no Mark), so each event
-	// flows through the callback's empty-tracker branch and bumps VV.
+	// flows through the callback's empty-tracker branch and bumps VV once at
+	// path scope. Wait for all seed events to be processed (deterministic).
 	indices := []string{"a", "b", "c"}
+	processed.Add(len(indices))
 	for _, idx := range indices {
 		nowUnix := time.Now().UTC().UnixNano()
 		obj := meta.Object{Created: nowUnix, Updated: nowUnix, Index: idx, Path: "things/" + idx, Data: []byte(`{"v":1}`)}
@@ -287,16 +307,12 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 		_, err = db.SetWithMeta("things/"+idx, body, nowUnix, nowUnix)
 		require.NoError(t, err)
 	}
-	// Wait until the seed VV bumps actually landed via the callback. Each
-	// seed bumps path-scope "things" once (the callback increments at the
-	// matched key's base, not the storage event's full key), so after three
-	// seeds the path-scope leader counter must be 3.
-	require.Eventually(t, func() bool {
-		return vvm.Get("things")["leader"] >= 3
-	}, 2*time.Second, 5*time.Millisecond, "seed VV bumps never landed")
+	processed.Wait()
+	require.Equal(t, int64(len(indices)), vvm.Get("things")["leader"], "each seed must bump path-scope VV exactly once")
 
 	handler := Delete(db, "things", tracker, vvm, nil)
-	for _, idx := range []string{"a", "b", "c"} {
+	processed.Add(len(indices))
+	for _, idx := range indices {
 		ts := strconv.FormatInt(time.Now().UTC().UnixNano(), 10)
 		req := httptest.NewRequest("DELETE", "/_pivot/pivot/things/"+idx+"/"+ts, nil)
 		req = mux.SetURLVars(req, map[string]string{"index": idx, "time": ts})
@@ -304,9 +320,17 @@ func TestDeleteDoesNotLeakHandlerMarks(t *testing.T) {
 		handler(w, req)
 		require.Equal(t, 200, w.Code)
 	}
+	processed.Wait()
 
-	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, 2*time.Second, 5*time.Millisecond,
-		"tracker leaked entries after Deletes drained: Len=%d", tracker.pendingLen())
+	// No leaked handler marks. Post-fix the Delete handler Marks only the item
+	// key (Consumed by the item's del event the watch goroutine just processed),
+	// never the tombstone key. Asserted via the public Consume contract, not an
+	// internal length: a leaked tombstone Mark would make Consume return true,
+	// and any unconsumed item Mark likewise.
+	require.False(t, tracker.Consume(StoragePrefix+"things"), "Delete must not leak a tombstone-key handler mark")
+	for _, idx := range indices {
+		require.False(t, tracker.Consume("things/"+idx), "Delete item Mark must have been consumed by the watch goroutine")
+	}
 }
 
 // TestSetPostWriteSeesBumpedVV pins the in-handler ordering: the post-write
@@ -478,14 +502,6 @@ func TestDeleteHappyPathStillCommitsBoth(t *testing.T) {
 	require.Equal(t, deleteTS, strings.TrimSpace(string(tomb.Data)), "tombstone payload must be the delete timestamp")
 }
 
-// bumpPendingLen mirrors pendingLen for the bump-skip counter so tests
-// can assert it drains independently.
-func (t *HandlerWriteTracker) bumpPendingLen() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.bumpPending)
-}
-
 // TestHandlerWriteTracker_DualCounterConsumeSemantics pins that Mark
 // sets BOTH the fanout-skip (pending) and bump-skip (bumpPending)
 // counters, and each is consumed by exactly one consumer without
@@ -496,25 +512,20 @@ func TestHandlerWriteTracker_DualCounterConsumeSemantics(t *testing.T) {
 	tr := NewHandlerWriteTracker()
 	const k = "things/abc"
 
-	// Mark once: both counters carry the key.
+	// Mark sets both the bump-skip and fanout-skip counters. Assert the contract
+	// through the public consume methods (not an internal length): each counter
+	// is consumable exactly once, and consuming one does not deprive the other.
 	tr.Mark(k)
-	require.Equal(t, 1, tr.pendingLen(), "Mark must set fanout-skip counter")
-	require.Equal(t, 1, tr.bumpPendingLen(), "Mark must set bump-skip counter")
 
-	// AfterWrite consumes its own counter. The watch goroutine's
-	// counter is untouched — the two consumers don't deprive each other.
+	// The bump-skip consumer drains its own counter; consuming, not peeking, so a
+	// second consume returns false — the property that stops a stale mark from
+	// swallowing a later direct write's bump.
 	require.True(t, tr.ConsumeBumpSkip(k), "first ConsumeBumpSkip sees the mark")
-	require.Equal(t, 0, tr.bumpPendingLen(), "ConsumeBumpSkip drains bump-skip counter")
-	require.Equal(t, 1, tr.pendingLen(), "fanout-skip counter unaffected by bump consume")
-
-	// Consuming, not peeking: a second consume returns false. This is
-	// the property that prevents a stale mark from swallowing a later
-	// direct write's bump.
 	require.False(t, tr.ConsumeBumpSkip(k), "second ConsumeBumpSkip must return false (consumed, not peeked)")
 
-	// Watch goroutine consumes its counter independently.
-	require.True(t, tr.Consume(k), "Consume sees the fanout-skip mark")
-	require.Equal(t, 0, tr.pendingLen(), "Consume drains fanout-skip counter")
+	// The fanout-skip mark is still present — the two counters are independent,
+	// so consuming bump-skip above did not drain it.
+	require.True(t, tr.Consume(k), "Consume still sees the fanout-skip mark after the bump-skip consume")
 	require.False(t, tr.Consume(k), "second Consume must return false")
 }
 
@@ -528,11 +539,10 @@ func TestHandlerWriteTracker_UnmarkClearsBothCounters(t *testing.T) {
 
 	tr.Mark(k)
 	tr.Unmark(k)
-	require.Equal(t, 0, tr.pendingLen(), "Unmark must clear fanout-skip counter")
-	require.Equal(t, 0, tr.bumpPendingLen(), "Unmark must clear bump-skip counter")
 
-	// After Unmark, neither consumer sees a mark — a subsequent direct
-	// write to the same key will correctly run its full path.
+	// After Unmark, neither consumer sees a mark — both counters were cleared,
+	// so a subsequent direct write to the same key runs its full path. Asserted
+	// through the public consume contract rather than an internal length.
 	require.False(t, tr.ConsumeBumpSkip(k), "no bump-skip mark after Unmark")
 	require.False(t, tr.Consume(k), "no fanout-skip mark after Unmark")
 }

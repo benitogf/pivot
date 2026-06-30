@@ -15,11 +15,10 @@ package pivot
 // share state.
 
 import (
-	"context"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/benitogf/ooo/monotonic"
 	"github.com/benitogf/ooo/storage"
@@ -46,26 +45,32 @@ func TestActivityExposesVVAfterGlobWrite(t *testing.T) {
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
 		Instance:       instance,
-	}))
+	}), "things/*", &processed)
 
 	// Wire a Set handler the way a glob-path key registers it: path=
 	// "things" (the registered base, with the /* stripped before
 	// mounting) and items go under "things/<index>".
 	setHandler := Set(db, "things", tracker, vvm, nil)
 
-	// Drive a write under the glob.
+	// Drive a write under the glob, then wait for the watch goroutine to process
+	// it. Waiting matters for the double-bump claim below: a regression that let
+	// the callback also bump would only show as leader==2 AFTER the callback ran,
+	// so reading before it processed would race past the bug.
 	body := strings.NewReader(`{"created":0,"updated":0,"index":"x","path":"things/x","data":"e30="}`)
 	req := httptest.NewRequest("POST", "/_pivot/pivot/things/x", body)
 	req = mux.SetURLVars(req, map[string]string{"index": "x"})
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
+	processed.Add(1)
 	setHandler(w, req)
 	require.Equal(t, 200, w.Code)
+	processed.Wait()
 
 	// Stand up the Activity handler the way pivot.go registers it:
 	// the Key.Path is the glob, "things/*". Activity normalizes that
@@ -98,24 +103,23 @@ func TestCallbackIncrementsAtPathScope(t *testing.T) {
 	vvm := NewVVManager(db, "leader")
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:     keys,
 		GetNodes: func() []string { return nil },
 		Instance: instance,
-	}))
+	}), "things/*", &processed)
 
-	// Direct storage write — bypasses the Set handler, so the storage
-	// callback is the one bumping VV.
+	// Direct storage write — bypasses the Set handler, so the storage callback is
+	// the one bumping VV. Wait for the watch goroutine to process that event, then
+	// assert exactly 1 (deterministic — no polling).
+	processed.Add(1)
 	_, err := db.SetWithMeta("things/x", []byte(`{"v":"v1"}`), 1, 1)
 	require.NoError(t, err)
+	processed.Wait()
 
-	// Settle for the watch goroutine. The callback is the only thing
-	// touching VV here, and increments synchronously inside the
-	// goroutine — a small wait is enough.
-	require.Eventually(t, func() bool {
-		return vvm.Get("things/*")["leader"] >= 1
-	}, time.Second, 5*time.Millisecond,
-		"storage callback must increment path-scope VV on direct writes")
+	require.Equal(t, int64(1), vvm.Get("things/*")["leader"],
+		"storage callback must increment path-scope VV exactly once on a direct write")
 }
 
 // TestHandlerIncrementMatchesActivityScope pins the symmetry: every
@@ -134,16 +138,19 @@ func TestHandlerIncrementMatchesActivityScope(t *testing.T) {
 
 	keys := []Key{{Path: "things/*", Database: db}}
 	instance := &Instance{VVManager: vvm}
-	storage.WatchWithCallback(context.Background(), db, makeStorageSync(StorageSyncConfig{
+	var processed sync.WaitGroup
+	watchProcessed(db, makeStorageSync(StorageSyncConfig{
 		Keys:           keys,
 		GetNodes:       func() []string { return nil },
 		HandlerTracker: tracker,
 		Instance:       instance,
-	}))
+	}), "things/*", &processed)
 
 	setHandler := Set(db, "things", tracker, vvm, nil)
 
-	for i, idx := range []string{"a", "b", "c"} {
+	indices := []string{"a", "b", "c"}
+	processed.Add(len(indices))
+	for i, idx := range indices {
 		body := strings.NewReader(`{"created":0,"updated":0,"index":"` + idx + `","path":"things/` + idx + `","data":"e30="}`)
 		req := httptest.NewRequest("POST", "/_pivot/pivot/things/"+idx, body)
 		req = mux.SetURLVars(req, map[string]string{"index": idx})
@@ -153,10 +160,10 @@ func TestHandlerIncrementMatchesActivityScope(t *testing.T) {
 		require.Equal(t, 200, w.Code, "write %d failed", i)
 	}
 
-	// Wait for the watch goroutine to drain. Once tracker is empty, every
-	// handler Mark has been Consumed by the callback (callback skipped
-	// each).
-	require.Eventually(t, func() bool { return tracker.pendingLen() == 0 }, time.Second, 5*time.Millisecond)
+	// Wait for the watch goroutine to process all three writes (it Consumes each
+	// handler Mark and skips its own bump). Its completion is the deterministic
+	// signal — no polling of internal tracker state.
+	processed.Wait()
 
 	// Three writes under the same registered glob path → one VV with
 	// leader counter at 3. Pre-fix each write bumped a separate item-
